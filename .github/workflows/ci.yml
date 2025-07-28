@@ -44,6 +44,13 @@ jobs:
           rustc --version
           cargo --version
 
+      # Install buf
+      - name: Install buf
+        uses: bufbuild/buf-setup-action@v1.24.0
+        with:
+          version: 1.47.2
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: rustfmt
         run: make check-fmt
 
