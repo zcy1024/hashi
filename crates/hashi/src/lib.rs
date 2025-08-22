@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod proto;
 pub mod tls;
 // pub mod tls_rpk;
+pub mod bls;
 
 pub struct Hashi {
     pub server_version: ServerVersion,

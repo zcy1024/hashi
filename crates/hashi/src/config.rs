@@ -1,13 +1,20 @@
 use std::net::SocketAddr;
 
+use sui_crypto::simple::SimpleKeypair;
+
+use crate::bls::Bls12381PrivateKey;
+
 #[derive(Clone, Debug, Default, serde_derive::Deserialize, serde_derive::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol_private_key: Option<String>,
+    pub protocol_private_key: Option<Bls12381PrivateKey>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_private_key: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_private_key: Option<String>,
 
     /// Configure the address to listen on for https
     ///
@@ -45,8 +52,8 @@ impl Config {
         std::fs::write(path, toml).map_err(Into::into)
     }
 
-    pub fn protocol_private_key(&self) -> Result<ed25519_dalek::SigningKey, String> {
-        todo!()
+    pub fn protocol_private_key(&self) -> Option<Bls12381PrivateKey> {
+        self.protocol_private_key.clone()
     }
 
     pub fn tls_private_key(&self) -> Result<ed25519_dalek::SigningKey, anyhow::Error> {
@@ -73,6 +80,33 @@ impl Config {
         let tls_private_key = self.tls_private_key()?;
 
         Ok(ed25519_dalek::VerifyingKey::from(&tls_private_key))
+    }
+
+    pub fn operator_private_key(&self) -> Result<SimpleKeypair, anyhow::Error> {
+        let raw = self
+            .operator_private_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no operator_private_key configured"))?;
+
+        if let Ok(private_key) = std::fs::read(raw) {
+            if let Ok(pk) = SimpleKeypair::from_der(&private_key) {
+                return Ok(pk);
+            }
+
+            if let Some(pk) = std::str::from_utf8(&private_key)
+                .ok()
+                .and_then(|pk| SimpleKeypair::from_pem(pk).ok())
+            {
+                return Ok(pk);
+            }
+        }
+
+        if let Ok(private_key) = SimpleKeypair::from_pem(raw) {
+            return Ok(private_key);
+        }
+
+        // maybe some other format?
+        Err(anyhow::anyhow!("unable to load operator_private_key"))
     }
 
     pub fn https_address(&self) -> SocketAddr {

@@ -39,7 +39,7 @@ const ENotDeletable: u64 = 5;
 const EInvalidKeyLength: u64 = 6;
 
 public struct BlsCommitteeMember has copy, drop, store {
-    sui_address: address,
+    validator_address: address,
     public_key: Element<UncompressedG1>,
     weight: u16,
 }
@@ -88,13 +88,13 @@ public(package) fun new_bls_committee(
 
 /// Constructor for committee member.
 public(package) fun new_bls_committee_member(
-    sui_address: address,
+    validator_address: address,
     public_key: Element<UncompressedG1>,
     weight: u16,
 ): BlsCommitteeMember {
     assert!(weight > 0, EIncorrectCommittee);
     BlsCommitteeMember {
-        sui_address,
+        validator_address,
         public_key,
         weight,
     }
@@ -103,8 +103,8 @@ public(package) fun new_bls_committee_member(
 // === Accessors for BlsCommitteeMember ===
 
 /// Get the node id of the committee member.
-public(package) fun sui_address(self: &BlsCommitteeMember): address {
-    self.sui_address
+public(package) fun validator_address(self: &BlsCommitteeMember): address {
+    self.validator_address
 }
 
 // === Accessors for BlsCommittee ===
@@ -130,25 +130,25 @@ public(package) fun get_idx(self: &BlsCommittee, idx: u64): &BlsCommitteeMember 
 }
 
 /// Checks if the committee contains a given node.
-public(package) fun contains(self: &BlsCommittee, sui_address: &address): bool {
-    self.find_index(sui_address).is_some()
+public(package) fun contains(self: &BlsCommittee, validator_address: &address): bool {
+    self.find_index(validator_address).is_some()
 }
 
 /// Returns the member weight if it is part of the committee or 0 otherwise
-public(package) fun get_member_weight(self: &BlsCommittee, sui_address: &address): u16 {
-    self.find_index(sui_address).map!(|idx| self.members[idx].weight).destroy_or!(0)
+public(package) fun get_member_weight(self: &BlsCommittee, validator_address: &address): u16 {
+    self.find_index(validator_address).map!(|idx| self.members[idx].weight).destroy_or!(0)
 }
 
-/// Finds the index of the member by sui_address
-public(package) fun find_index(self: &BlsCommittee, sui_address: &address): Option<u64> {
-    self.members.find_index!(|member| &member.sui_address == sui_address)
+/// Finds the index of the member by validator_address
+public(package) fun find_index(self: &BlsCommittee, validator_address: &address): Option<u64> {
+    self.members.find_index!(|member| &member.validator_address == validator_address)
 }
 
 /// Returns the members of the committee with their weights.
 public(package) fun to_vec_map(self: &BlsCommittee): VecMap<address, u16> {
     let mut result = vec_map::empty();
     self.members.do_ref!(|member| {
-        result.insert(member.sui_address, member.weight)
+        result.insert(member.validator_address, member.weight)
     });
     result
 }
@@ -380,13 +380,13 @@ public fun verify_certificate(
 
 public(package) fun verify_proof_of_possession(
     epoch: u64,
-    sui_address: &address,
+    validator_address: &address,
     bls_public_key: &vector<u8>,
     proof_of_possession_signature: &vector<u8>,
 ): bool {
     let mut message = vector[];
     message.append(bcs::to_bytes(&epoch));
-    message.append(bcs::to_bytes(sui_address));
+    message.append(bcs::to_bytes(validator_address));
     bls_public_key.do_ref!(|key_byte| message.append(bcs::to_bytes(key_byte)));
 
     bls12381_min_pk_verify(

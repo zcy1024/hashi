@@ -23,6 +23,11 @@ public struct Task<T> has key {
     task: T,
 }
 
+public struct TaskBuffer {
+    id: UID,
+    buffer: ObjectBag,
+}
+
 public struct Withdraw {
     balance: Balance<BTC>,
     dst: BitcoinAddress,
@@ -48,7 +53,3 @@ public struct Settle {
     transaction: String,
 }
 
-public struct TaskBuffer {
-    id: UID,
-    buffer: ObjectBag,
-}

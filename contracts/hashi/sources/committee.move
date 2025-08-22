@@ -10,7 +10,10 @@ use hashi::bls::verify_proof_of_possession;
 
 public struct HashiNodeInfo has copy, drop, store {
     /// Sui Validator Address of this node
-    sui_address: address,
+    validator_address: address,
+
+    /// Sui Address of an operations account 
+    operator_address: address,
 
     /// bls12381 public key to be used in the next epoch.
     ///
