@@ -21,10 +21,9 @@ jobs:
       - name: rustdoc
         run: make doc
 
-      - name: mdbook
-        run: |
-          cargo install mdbook --locked
-          cd design && mdbook build
+      - uses: taiki-e/install-action@mdbook
+      - name: build mdbook
+        run: cd design && mdbook build
 
       - name: stage build artifacts
         run: |
