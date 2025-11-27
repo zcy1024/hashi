@@ -184,7 +184,6 @@ impl DkgManager {
             &self.bls_committee,
             Dkg(DkgMessage {
                 dealer_address: self.address,
-                session_context: self.session_context.clone(),
                 message_hash,
             }),
         );
@@ -354,7 +353,6 @@ impl DkgManager {
             self.address,
             &Dkg(DkgMessage {
                 dealer_address,
-                session_context: self.session_context.clone(),
                 message_hash,
             }),
         );
@@ -689,7 +687,6 @@ mod tests {
         // Create DkgMessage
         let dkg_message = Dkg(DkgMessage {
             dealer_address,
-            session_context: session_context.clone(),
             message_hash,
         });
 
@@ -2375,7 +2372,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer_0_addr, &dealer_0_message).unwrap();
         let dealer_0_dkg_message = Dkg(DkgMessage {
             dealer_address: dealer_0_addr,
-            session_context: session_context.clone(),
             message_hash: dealer_0_message_hash,
         });
 
@@ -2399,7 +2395,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer_1_addr, &dealer_1_message).unwrap();
         let dealer_1_dkg_message = Dkg(DkgMessage {
             dealer_address: dealer_1_addr,
-            session_context: session_context.clone(),
             message_hash: dealer_1_message_hash,
         });
 
@@ -3338,7 +3333,6 @@ mod tests {
         let message_hash = compute_message_hash(session_context, dealer_addr, message).unwrap();
         let dkg_message = Dkg(DkgMessage {
             dealer_address: *dealer_addr,
-            session_context: session_context.clone(),
             message_hash,
         });
 
@@ -3585,7 +3579,6 @@ mod tests {
                     compute_message_hash(&session_context, &dealer1_addr, &msg1).unwrap();
                 let dkg_message = Dkg(DkgMessage {
                     dealer_address: dealer1_addr,
-                    session_context: session_context.clone(),
                     message_hash,
                 });
                 let signature = bls_keys[i].sign(config.epoch, addr, &dkg_message);
@@ -3603,7 +3596,6 @@ mod tests {
                     compute_message_hash(&session_context, &dealer2_addr, &msg2).unwrap();
                 let dkg_message = Dkg(DkgMessage {
                     dealer_address: dealer2_addr,
-                    session_context: session_context.clone(),
                     message_hash,
                 });
                 let signature = bls_keys[i].sign(config.epoch, addr, &dkg_message);
@@ -3729,7 +3721,6 @@ mod tests {
                         compute_message_hash(&session_context, &dealer_addr, msg).unwrap();
                     let dkg_message = Dkg(DkgMessage {
                         dealer_address: dealer_addr,
-                        session_context: session_context.clone(),
                         message_hash,
                     });
                     let signature = bls_keys[i].sign(config.epoch, addr, &dkg_message);
@@ -3821,7 +3812,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer0_addr, &dealer0_message).unwrap();
         let dealer0_dkg_message = Dkg(DkgMessage {
             dealer_address: dealer0_addr,
-            session_context: session_context.clone(),
             message_hash: dealer0_message_hash,
         });
 
@@ -3844,7 +3834,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer1_addr, &dealer1_message).unwrap();
         let dealer1_dkg_message = Dkg(DkgMessage {
             dealer_address: dealer1_addr,
-            session_context: session_context.clone(),
             message_hash: dealer1_message_hash,
         });
 
@@ -4473,7 +4462,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer_addr, dealer_message).unwrap();
         let dkg_message = Dkg(DkgMessage {
             dealer_address: dealer_addr,
-            session_context: session_context.clone(),
             message_hash,
         });
 
@@ -4915,7 +4903,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer_address, dealer_message).unwrap();
         let dkg_message = Dkg(DkgMessage {
             dealer_address,
-            session_context: session_context.clone(),
             message_hash,
         });
 
@@ -4994,7 +4981,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer_address, dealer_message).unwrap();
         let dkg_message = Dkg(DkgMessage {
             dealer_address,
-            session_context: session_context.clone(),
             message_hash,
         });
 
@@ -5071,7 +5057,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer_addr, dealer_message).unwrap();
         let dkg_message = Dkg(DkgMessage {
             dealer_address: dealer_addr,
-            session_context: session_context.clone(),
             message_hash,
         });
 
@@ -5154,7 +5139,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer_addr, dealer_message).unwrap();
         let dkg_message = Dkg(DkgMessage {
             dealer_address: dealer_addr,
-            session_context: session_context.clone(),
             message_hash,
         });
 
@@ -5239,7 +5223,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer_addr, dealer_message).unwrap();
         let dkg_message = Dkg(DkgMessage {
             dealer_address: dealer_addr,
-            session_context: session_context.clone(),
             message_hash,
         });
 
@@ -5359,7 +5342,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer_a_addr, &message_a).unwrap();
         let dkg_message = Dkg(DkgMessage {
             dealer_address: dealer_a_addr,
-            session_context: session_context.clone(),
             message_hash: message_hash_a,
         });
 
@@ -5526,7 +5508,6 @@ mod tests {
         let message_hash = compute_message_hash(session_context, dealer_address, message)?;
         let dkg_message = Dkg(DkgMessage {
             dealer_address: *dealer_address,
-            session_context: session_context.clone(),
             message_hash,
         });
 
@@ -5876,7 +5857,6 @@ mod tests {
             compute_message_hash(&session_context, &dealer_address, &dealer_message).unwrap();
         let dkg_message = Dkg(DkgMessage {
             dealer_address,
-            session_context: session_context.clone(),
             message_hash,
         });
 
