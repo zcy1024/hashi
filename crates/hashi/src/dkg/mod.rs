@@ -1,12 +1,13 @@
 //! Distributed Key Generation (DKG) module
 
+pub mod rpc_proto_conversions;
 pub mod types;
 
 use crate::bls::{BlsCommittee, BlsCommitteeMember, BlsSignatureAggregator};
 use crate::dkg::types::MpcMessageV1::Dkg;
 use crate::dkg::types::{Certificate, DkgDealerMessageHash};
 use crate::storage::PublicMessagesStore;
-use fastcrypto::bls12381::min_pk::BLS12381PublicKey;
+use fastcrypto::bls12381::min_pk::{BLS12381PublicKey, BLS12381Signature};
 use fastcrypto::error::FastCryptoError;
 use fastcrypto::hash::{Blake2b256, HashFunction};
 use fastcrypto_tbls::ecies_v1::PrivateKey;
@@ -194,7 +195,7 @@ impl DkgManager {
             }),
         );
         aggregator
-            .add_signature(my_signature.signature)
+            .add_signature_from(self.address, my_signature.clone())
             .expect("first signature should always be valid");
         // TODO: Send RPCs in parallel
         // TODO: Add timeout and retries handling when adding RPC layer
@@ -215,8 +216,9 @@ impl DkgManager {
                         continue;
                     }
                 };
-                // The signature is verified in the call to `add_signature`
-                if let Err(e) = aggregator.add_signature(response.signature.signature) {
+                if let Err(e) =
+                    aggregator.add_signature_from(*validator_address, response.signature.clone())
+                {
                     tracing::info!("Invalid signature from {:?}: {}", validator_address, e)
                 }
             }
@@ -335,7 +337,7 @@ impl DkgManager {
         &mut self,
         dealer: Address,
         message: &avss::Message,
-    ) -> DkgResult<ValidatorSignature> {
+    ) -> DkgResult<BLS12381Signature> {
         let dealer_session_id = self.session_id.dealer_session_id(&dealer);
         let receiver = avss::Receiver::new(
             self.dkg_config.nodes.clone(),
@@ -357,10 +359,7 @@ impl DkgManager {
                         message_hash,
                     }),
                 );
-                Ok(ValidatorSignature {
-                    validator: self.address,
-                    signature,
-                })
+                Ok(signature.signature().clone())
             }
             avss::ProcessedMessage::Complaint(_) => Err(DkgError::InvalidMessage {
                 sender: dealer,
@@ -627,7 +626,13 @@ mod tests {
         dealer: Address,
     ) -> DkgResult<ValidatorSignature> {
         manager.store_message(dealer, message)?;
-        manager.try_sign_message(dealer, message)
+        let bls_sig = manager.try_sign_message(dealer, message)?;
+        let member_sig =
+            crate::bls::MemberSignature::new(manager.dkg_config.epoch, manager.address, bls_sig);
+        Ok(ValidatorSignature {
+            validator: manager.address,
+            signature: member_sig,
+        })
     }
 
     fn create_test_validator(party_id: u16) -> (Address, Node<EncryptionGroupElement>) {
@@ -3845,8 +3850,7 @@ mod tests {
         );
     }
 
-    // TODO: Is this needed anywhere?
-    #[allow(unused)]
+    #[tokio::test]
     async fn test_handle_send_message_request() {
         // Test that handle_send_message_request works with the new request/response types
         let mut rng = rand::thread_rng();
@@ -3927,8 +3931,8 @@ mod tests {
             .handle_send_message_request(dealer_address, &request)
             .unwrap();
 
-        // Verify we got a valid BLS signature from the receiver
-        assert_eq!(response.signature.validator, receiver_address);
+        // Verify we got a valid BLS signature (non-empty)
+        assert!(!response.signature.as_ref().is_empty());
     }
 
     #[tokio::test]
@@ -5454,8 +5458,8 @@ mod tests {
             .handle_send_message_request(dealer_address, &request)
             .unwrap();
 
-        // Responses should be identical (same validator)
-        assert_eq!(response1.signature.validator, response2.signature.validator);
+        // Responses should be identical (same signature bytes)
+        assert_eq!(response1.signature, response2.signature);
     }
 
     #[tokio::test]
@@ -5475,7 +5479,8 @@ mod tests {
         let response1 = receiver_manager
             .handle_send_message_request(dealer_address, &request1)
             .unwrap();
-        assert_eq!(response1.signature.validator, receiver_manager.address);
+        // Verify we got a valid BLS signature (non-empty)
+        assert!(!response1.signature.as_ref().is_empty());
 
         // Second DIFFERENT message from same dealer (equivocation)
         let dealer_message2 = dealer_manager.create_dealer_message(&mut rng);
