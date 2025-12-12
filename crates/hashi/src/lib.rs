@@ -11,6 +11,12 @@ pub mod proto;
 pub mod storage;
 pub mod tls;
 
+fn init_crypto_provider() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+}
+
 pub struct Hashi {
     pub server_version: ServerVersion,
     pub config: config::Config,
@@ -27,6 +33,7 @@ impl Hashi {
         config: config::Config,
         dkg_manager: Option<dkg::DkgManager>,
     ) -> Arc<Self> {
+        init_crypto_provider();
         let metrics = Arc::new(metrics::Metrics::new_default());
         Arc::new(Self {
             server_version,
@@ -43,6 +50,7 @@ impl Hashi {
         dkg_manager: Option<dkg::DkgManager>,
         registry: &prometheus::Registry,
     ) -> Arc<Self> {
+        init_crypto_provider();
         Arc::new(Self {
             server_version,
             config,
