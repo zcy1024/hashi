@@ -11,13 +11,14 @@ use crate::onchain::types::CommitteeSet;
 use crate::storage::PublicMessagesStore;
 use fastcrypto::bls12381::min_pk::BLS12381Signature;
 use fastcrypto::error::FastCryptoError;
-use fastcrypto::groups::GroupElement;
+use fastcrypto::groups::HashToGroupElement;
 use fastcrypto::hash::{Blake2b256, HashFunction};
 use fastcrypto_tbls::ecies_v1::{PrivateKey, PublicKey};
 use fastcrypto_tbls::nodes::{Node, Nodes, PartyId};
 use fastcrypto_tbls::threshold_schnorr::{avss, complaint};
 use futures::future::join_all;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use sui_sdk_types::Address;
 use types::DkgConfig;
 pub use types::{
@@ -579,9 +580,10 @@ impl DkgManager {
     }
 }
 
-/// TODO: Replace generator with a nothing-up-my-sleeve point with unknown discrete log.
 pub fn fallback_encryption_public_key() -> PublicKey<EncryptionGroupElement> {
-    PublicKey::from(EncryptionGroupElement::generator())
+    static FALLBACK_ENCRYPTION_PK: LazyLock<PublicKey<EncryptionGroupElement>> =
+        LazyLock::new(|| PublicKey::from(EncryptionGroupElement::hash_to_group_element(b"hashi")));
+    FALLBACK_ENCRYPTION_PK.clone()
 }
 
 fn compute_message_hash(message: &avss::Message) -> MessageHash {
