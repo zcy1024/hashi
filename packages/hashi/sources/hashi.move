@@ -8,6 +8,7 @@ use hashi::{
     proposal_set::{Self, ProposalSet},
     treasury::Treasury
 };
+use sui::bag::{Self, Bag};
 
 public struct Hashi has key {
     id: UID,
@@ -17,6 +18,8 @@ public struct Hashi has key {
     deposit_queue: hashi::deposit_queue::DepositRequestQueue,
     utxo_pool: hashi::utxo_pool::UtxoPool,
     proposals: ProposalSet,
+    /// TOB certificates by epoch (epoch -> EpochCerts)
+    tob: Bag,
 }
 
 #[allow(unused_function)]
@@ -29,6 +32,7 @@ fun init(ctx: &mut TxContext) {
         deposit_queue: hashi::deposit_queue::create(ctx),
         utxo_pool: hashi::utxo_pool::create(ctx),
         proposals: proposal_set::create(ctx),
+        tob: bag::new(ctx),
     };
 
     sui::transfer::share_object(hashi);
@@ -121,4 +125,19 @@ public(package) fun utxo_pool(self: &Hashi): &hashi::utxo_pool::UtxoPool {
 
 public(package) fun utxo_pool_mut(self: &mut Hashi): &mut hashi::utxo_pool::UtxoPool {
     &mut self.utxo_pool
+}
+
+public(package) fun tob_mut(self: &mut Hashi): &mut Bag {
+    &mut self.tob
+}
+
+public(package) fun epoch_certs_and_committee(
+    self: &mut Hashi,
+    epoch: u64,
+    ctx: &mut TxContext,
+): (&mut hashi::tob::EpochCerts, &Committee) {
+    if (!self.tob.contains(epoch)) {
+        self.tob.add(epoch, hashi::tob::create(epoch, ctx));
+    };
+    (self.tob.borrow_mut(epoch), self.committee_set.current_committee())
 }
