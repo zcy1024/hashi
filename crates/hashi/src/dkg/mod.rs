@@ -2146,6 +2146,10 @@ mod tests {
         fn published_count(&self) -> usize {
             self.published.lock().unwrap().len()
         }
+
+        fn pending_messages(&self) -> Option<usize> {
+            Some(self.certificates.lock().unwrap().len())
+        }
     }
 
     #[async_trait::async_trait]
@@ -2170,17 +2174,6 @@ mod tests {
                         "No more certificates".to_string(),
                     )
                 })
-        }
-
-        async fn try_receive_timeout(
-            &mut self,
-            _duration: std::time::Duration,
-        ) -> ChannelResult<Option<Certificate>> {
-            unimplemented!()
-        }
-
-        fn pending_messages(&self) -> Option<usize> {
-            Some(self.certificates.lock().unwrap().len())
         }
 
         fn existing_certificate_weight(&self) -> u32 {
@@ -2584,17 +2577,6 @@ mod tests {
             } else {
                 unreachable!()
             }
-        }
-
-        async fn try_receive_timeout(
-            &mut self,
-            _duration: std::time::Duration,
-        ) -> ChannelResult<Option<Certificate>> {
-            unreachable!()
-        }
-
-        fn pending_messages(&self) -> Option<usize> {
-            Some(0)
         }
     }
 
