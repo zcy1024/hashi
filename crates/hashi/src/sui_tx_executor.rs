@@ -370,7 +370,7 @@ impl SuiTxExecutor {
 
         let message = dkg_cert.message();
         let dealer = message.dealer_address;
-        let message_hash = message.message_hash.inner().to_vec();
+        let message_hash = message.messages_hash.inner().to_vec();
         let epoch = dkg_cert.epoch();
         let signature = dkg_cert.signature_bytes().to_vec();
         let signers_bitmap = dkg_cert.signers_bitmap_bytes().to_vec();

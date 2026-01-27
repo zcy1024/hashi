@@ -14,7 +14,7 @@ use super::ChannelResult;
 use super::OrderedBroadcastChannel;
 use crate::config::HashiIds;
 use crate::dkg::types::CertificateV1;
-use crate::dkg::types::DkgDealerMessageHash;
+use crate::dkg::types::DealerMessagesHash;
 use crate::onchain::OnchainState;
 use crate::sui_tx_executor::SuiTxExecutor;
 use hashi_types::committee::Committee;
@@ -101,7 +101,7 @@ impl SuiTobChannel {
             .map_err(|e| TobError::RpcError(e.to_string()))?;
         let mut certificates = Vec::with_capacity(raw_certs.len());
         for (dealer, dkg_cert) in raw_certs {
-            let inner_cert = DkgDealerMessageHash::from_onchain_cert(
+            let inner_cert = DealerMessagesHash::from_onchain_dkg_cert(
                 &dkg_cert,
                 self.epoch,
                 &self.committee,
