@@ -214,7 +214,8 @@ pub struct UtxoId {
 
 #[derive(Debug, serde_derive::Deserialize)]
 pub struct UtxoPool {
-    pub utxos: Bag,
+    pub active_utxos: Bag,
+    pub spent_utxos: Bag,
 }
 
 /// Rust version of the Move hashi::tob::ProtocolType enum.
