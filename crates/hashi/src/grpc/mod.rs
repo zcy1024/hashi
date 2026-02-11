@@ -123,8 +123,12 @@ impl HttpService {
         (local_addr, service)
     }
 
-    pub fn dkg_manager(&self) -> Arc<std::sync::RwLock<crate::mpc::DkgManager>> {
-        self.inner.dkg_manager()
+    pub fn dkg_manager(
+        &self,
+    ) -> Result<Arc<std::sync::RwLock<crate::mpc::DkgManager>>, tonic::Status> {
+        self.inner
+            .dkg_manager()
+            .ok_or_else(|| tonic::Status::unavailable("DKG manager not yet initialized"))
     }
 
     pub fn signing_manager(&self) -> Arc<std::sync::RwLock<crate::mpc::SigningManager>> {

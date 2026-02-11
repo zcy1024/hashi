@@ -102,22 +102,22 @@ impl Hashi {
         self.onchain_state.get()
     }
 
-    pub fn dkg_manager(&self) -> Arc<RwLock<mpc::DkgManager>> {
-        self.dkg_manager
-            .get()
-            .expect("DkgManager not initialized")
-            .clone()
+    pub fn dkg_manager(&self) -> Option<Arc<RwLock<mpc::DkgManager>>> {
+        self.dkg_manager.get().cloned()
     }
 
     pub fn set_dkg_manager(&self, manager: mpc::DkgManager) {
-        *self
-            .dkg_manager
-            .get()
-            .expect("DkgManager not initialized")
-            .write()
-            // RwLock::write only fails if poisoned (a thread panicked while holding the lock).
-            // Poisoning indicates a bug, so we propagate the panic rather than recover.
-            .unwrap() = manager;
+        match self.dkg_manager.get() {
+            Some(lock) => {
+                // RwLock::write only fails if poisoned (a thread panicked while holding the lock).
+                // Poisoning indicates a bug, so we propagate the panic rather than recover.
+                *lock.write().unwrap() = manager;
+            }
+            None => {
+                // First-time initialization (e.g. new committee member joining mid-rotation).
+                let _ = self.dkg_manager.set(Arc::new(RwLock::new(manager)));
+            }
+        }
     }
 
     pub fn signing_manager(&self) -> Arc<RwLock<mpc::SigningManager>> {
@@ -275,17 +275,22 @@ impl Hashi {
 
         // Initialize
         let onchain_service = self.initialize_onchain_state().await?;
-
-        let epoch = self.onchain_state().epoch();
-        let dkg_manager = self
-            .create_dkg_manager(epoch, mpc::types::ProtocolType::Dkg)
-            .map_err(|e| {
-                tracing::error!("Failed to create DkgManager: {e}");
-                e
-            })?;
-        self.dkg_manager
-            .set(Arc::new(RwLock::new(dkg_manager)))
-            .map_err(|_| anyhow!("DkgManager already set"))?;
+        if self.is_in_current_committee() {
+            let epoch = self.onchain_state().epoch();
+            let dkg_manager = self
+                .create_dkg_manager(epoch, mpc::types::ProtocolType::Dkg)
+                .map_err(|e| {
+                    tracing::error!("Failed to create DkgManager: {e}");
+                    e
+                })?;
+            self.dkg_manager
+                .set(Arc::new(RwLock::new(dkg_manager)))
+                .map_err(|_| anyhow!("DkgManager already set"))?;
+        } else {
+            tracing::info!(
+                "Node is not in the current committee; skipping initial DKG manager creation"
+            );
+        }
 
         let (mpc_service, mpc_handle) = mpc::MpcService::new(self.clone());
         self.mpc_handle
@@ -310,6 +315,16 @@ impl Hashi {
             .merge(mpc_service);
 
         Ok(service)
+    }
+
+    pub(crate) fn is_in_current_committee(&self) -> bool {
+        let address = match self.config.validator_address() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        self.onchain_state()
+            .current_committee()
+            .is_some_and(|c| c.index_of(&address).is_some())
     }
 }
 
