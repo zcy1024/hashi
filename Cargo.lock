@@ -2620,6 +2620,7 @@ dependencies = [
  "rustls 0.23.36",
  "serde",
  "serde_derive",
+ "serde_json",
  "sui-crypto",
  "sui-futures",
  "sui-http",
