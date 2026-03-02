@@ -41,7 +41,7 @@ pub struct Hashi {
     pub withdrawal_queue: WithdrawalRequestQueue,
     pub utxo_pool: UtxoPool,
     pub proposals: Bag,
-    /// TOB certificates by epoch (epoch -> EpochCertsV1)
+    /// TOB certificates by (epoch, batch_index) -> EpochCertsV1
     pub tob: Bag,
 }
 
@@ -207,6 +207,7 @@ pub struct DepositRequestQueue {
 pub struct WithdrawalRequestQueue {
     pub requests: Bag,
     pub pending_withdrawals: Bag,
+    pub num_consumed_presigs: u64,
 }
 
 /// Rust version of the Move hashi::withdrawal_queue::WithdrawalRequest type.

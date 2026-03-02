@@ -21,7 +21,7 @@ public struct Hashi has key {
     withdrawal_queue: WithdrawalRequestQueue,
     utxo_pool: UtxoPool,
     proposals: Bag,
-    /// TOB certificates by epoch (epoch -> EpochCertsV1)
+    /// TOB certificates by (epoch, batch_index) -> EpochCertsV1
     tob: Bag,
 }
 
