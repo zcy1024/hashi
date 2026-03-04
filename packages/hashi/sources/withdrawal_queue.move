@@ -101,7 +101,25 @@ public(package) fun new_pending_withdrawal(
     assert!(input_amount >= output_amount);
     let _fee = input_amount - output_amount;
 
-    // TODO Check that all requests have a corresponding output and that the amount is X - required BTC fee
+    // Outputs must be either one-per-request, or one-per-request plus a single
+    // trailing change output.
+    let request_count = requests.length();
+    let output_count = outputs.length();
+    assert!(output_count == request_count || output_count == request_count + 1);
+
+    // Each approved request must match the output at the same index.
+    request_count.do!(|request_index| {
+        let request = requests.borrow(request_index);
+        let output = outputs.borrow(request_index);
+        // TODO: once we start reducing user withdrawal amounts to accounts for fees, this needs to be adjusted
+        // https://linear.app/mysten-labs/issue/IOP-237/withdrawals-ensure-fees-are-taken-out-of-users-withdrawal-amount
+        assert!(request.btc_amount == output.amount);
+        assert!(request.bitcoin_address == output.bitcoin_address);
+    });
+
+    // TODO: ensure any change output goes to the correct destination address, once we start
+    // storing the pubkey on chain.
+    // https://linear.app/mysten-labs/issue/IOP-226/dkg-commit-mpc-public-key-onchain-and-read-from-there
 
     let mut rng = sui::random::new_generator(r, ctx);
     let randomness = rng.generate_bytes(NUMBER_OF_RANDOM_BYTES);
