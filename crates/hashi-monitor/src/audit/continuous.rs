@@ -5,12 +5,11 @@ use crate::audit::AuditorCore;
 use crate::audit::log_findings;
 use crate::config::Config;
 use crate::domain::Cursors;
-use crate::domain::UnixSeconds;
+use crate::domain::PollOutcome;
 use crate::domain::WithdrawalEvent;
 use crate::domain::WithdrawalEventType;
 use crate::domain::now_unix_seconds;
-use crate::rpc::poll_guardian;
-use crate::rpc::poll_sui;
+use hashi_types::guardian::time_utils::UnixSeconds;
 
 // TODO: Move to config
 // TODO: Consider switching to a streaming API
@@ -36,7 +35,7 @@ pub struct ContinuousAuditor {
 
 impl AuditWindow for ContinuousAuditWindow {
     fn in_window(&self, e: &WithdrawalEvent) -> bool {
-        e.timestamp >= self.user_start
+        e.timestamp_secs >= self.user_start
     }
 }
 
@@ -57,7 +56,7 @@ impl ContinuousAuditWindow {
 }
 
 impl ContinuousAuditor {
-    pub fn new(cfg: Config, start: UnixSeconds) -> anyhow::Result<Self> {
+    pub async fn new(cfg: Config, start: UnixSeconds) -> anyhow::Result<Self> {
         let cur_time = now_unix_seconds();
         anyhow::ensure!(
             start <= cur_time,
@@ -70,7 +69,7 @@ impl ContinuousAuditor {
         };
 
         Ok(Self {
-            inner: AuditorCore::new(cfg, cursors),
+            inner: AuditorCore::new(cfg, cursors).await?,
             window: audit_window,
         })
     }
@@ -80,37 +79,18 @@ impl ContinuousAuditor {
         log_findings("continuous", "ingest", &errors);
     }
 
-    fn handle_poll_result(
-        &mut self,
-        is_sui: bool,
-        result: anyhow::Result<(Vec<WithdrawalEvent>, UnixSeconds)>,
-    ) -> anyhow::Result<()> {
-        match result {
-            Ok((events, new_cursor)) => {
-                self.ingest_batch(events);
-                if is_sui {
-                    self.inner.set_sui_cursor(new_cursor);
-                } else {
-                    self.inner.set_guardian_cursor(new_cursor);
-                }
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    // TODO: Poll continuously if we are lagging behind?
     async fn tick_sui(&mut self) -> anyhow::Result<()> {
-        let cursor = self.inner.get_sui_cursor();
-        let result = poll_sui(&self.inner.cfg, cursor).await;
-        self.handle_poll_result(true, result)
+        if let PollOutcome::CursorAdvanced(events) = self.inner.poll_sui().await? {
+            self.ingest_batch(events);
+        }
+        Ok(())
     }
 
-    // TODO: Poll continuously if we are lagging behind?
     async fn tick_guardian(&mut self) -> anyhow::Result<()> {
-        let cursor = self.inner.get_guardian_cursor();
-        let result = poll_guardian(&self.inner.cfg, cursor).await;
-        self.handle_poll_result(false, result)
+        if let PollOutcome::CursorAdvanced(events) = self.inner.poll_guardian().await? {
+            self.ingest_batch(events);
+        }
+        Ok(())
     }
 
     /// Throws an error if BTC RPC infra fails.

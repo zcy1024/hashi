@@ -2685,6 +2685,7 @@ dependencies = [
  "anyhow",
  "bitcoin",
  "clap",
+ "hashi-guardian-enclave",
  "hashi-types",
  "serde",
  "serde_yaml",

@@ -8,6 +8,8 @@ anyhow.workspace = true
 bitcoin.workspace = true
 clap.workspace = true
 hashi-types = { path = "../hashi-types" }
+# enclave imported for s3 logger
+hashi-guardian-enclave = { path = "../hashi-guardian-enclave" }
 serde.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
