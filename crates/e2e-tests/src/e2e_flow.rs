@@ -10,6 +10,9 @@ mod tests {
     use hashi::sui_tx_executor::SuiTxExecutor;
     use hashi_types::move_types::DepositConfirmedEvent;
     use hashi_types::move_types::WithdrawalConfirmedEvent;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use sui_rpc::field::FieldMask;
     use sui_rpc::field::FieldMaskUtil;
@@ -300,6 +303,52 @@ mod tests {
         Ok(hbtc_recipient)
     }
 
+    /// Mines one block per second on Bitcoin regtest until stopped.
+    /// Stops automatically when dropped.
+    struct BackgroundMiner {
+        stop_flag: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl BackgroundMiner {
+        fn start(bitcoin_node: &crate::BitcoinNodeHandle) -> Self {
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let stop_clone = stop_flag.clone();
+            let rpc_url = bitcoin_node.rpc_url().to_string();
+            let handle = std::thread::spawn(move || {
+                let rpc = bitcoincore_rpc::Client::new(
+                    &rpc_url,
+                    bitcoincore_rpc::Auth::UserPass(
+                        crate::bitcoin_node::RPC_USER.to_string(),
+                        crate::bitcoin_node::RPC_PASSWORD.to_string(),
+                    ),
+                )
+                .expect("failed to create mining RPC client");
+                let addr = rpc
+                    .get_new_address(None, None)
+                    .expect("failed to get mining address")
+                    .assume_checked();
+                while !stop_clone.load(Ordering::Relaxed) {
+                    let _ = rpc.generate_to_address(1, &addr);
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            });
+            Self {
+                stop_flag,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for BackgroundMiner {
+        fn drop(&mut self) {
+            self.stop_flag.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
     fn extract_witness_program(address: &bitcoin::Address) -> Result<Vec<u8>> {
         let script = address.script_pubkey();
         let bytes = script.as_bytes();
@@ -321,10 +370,33 @@ mod tests {
     ) -> Result<()> {
         let start = std::time::Instant::now();
 
+        // Wait until the tx is visible (either in mempool or already confirmed).
         loop {
             if bitcoin_node.rpc_client().get_mempool_entry(txid).is_ok() {
                 info!("Withdrawal tx {} is in mempool", txid);
                 break;
+            }
+            // The background miner may have already confirmed it.
+            if let Ok(info) = bitcoin_node
+                .rpc_client()
+                .get_raw_transaction_info(txid, None)
+                && info.confirmations.unwrap_or(0) > 0
+            {
+                info!("Withdrawal tx {} is already confirmed", txid);
+                let tx = bitcoin_node.rpc_client().get_raw_transaction(txid, None)?;
+                let pays_destination = tx.output.iter().any(|output| {
+                    output.value == amount && output.script_pubkey == destination.script_pubkey()
+                });
+                if !pays_destination {
+                    return Err(anyhow!(
+                        "Withdrawal tx {} is confirmed but does not pay {} to {}",
+                        txid,
+                        amount,
+                        destination
+                    ));
+                }
+                info!("Withdrawal tx {} confirmed with expected output", txid);
+                return Ok(());
             }
             if start.elapsed() >= timeout {
                 return Err(anyhow!(
@@ -440,12 +512,16 @@ mod tests {
             .await?;
         info!("Withdrawal request created: {}", withdrawal_request_id);
 
+        let miner = BackgroundMiner::start(&networks.bitcoin_node);
+
         let confirmed_event = wait_for_withdrawal_confirmation(
             &mut networks.sui_network.client,
-            Duration::from_secs(30),
+            Duration::from_secs(60),
         )
         .await?;
         info!("Withdrawal confirmed on Sui");
+
+        drop(miner);
 
         let hbtc_balance_after = get_hbtc_balance(
             &mut networks.sui_network.client,
@@ -490,11 +566,17 @@ mod tests {
         executor
             .execute_create_withdrawal_request(withdrawal_amount_sats, destination_bytes, 0)
             .await?;
+
+        let miner = BackgroundMiner::start(&networks.bitcoin_node);
+
         let confirmed = wait_for_withdrawal_confirmation(
             &mut networks.sui_network.client,
             Duration::from_secs(60),
         )
         .await?;
+
+        drop(miner);
+
         let withdrawal_txid = address_to_txid(&confirmed.txid);
         wait_for_withdrawal_tx_success(
             &networks.bitcoin_node,
