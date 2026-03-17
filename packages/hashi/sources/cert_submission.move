@@ -1,6 +1,6 @@
 module hashi::cert_submission;
 
-use hashi::{hashi::Hashi, threshold, tob::ProtocolType};
+use hashi::{hashi::Hashi, tob::ProtocolType};
 
 entry fun submit_dkg_cert(
     hashi: &mut Hashi,
@@ -84,19 +84,18 @@ fun submit_cert_internal(
     ctx: &mut TxContext,
 ) {
     hashi.config().assert_version_enabled();
+    assert!(ctx.sender() == dealer);
+    assert!(hashi.committee_set().has_member(dealer));
     let pending = hashi.committee_set().pending_epoch_change();
     assert!(epoch == hashi.committee_set().epoch() || pending.contains(&epoch));
-    let (epoch_certs, committee) = hashi.epoch_certs_and_committee(key, protocol_type, ctx);
-    let threshold = threshold::certificate_threshold(committee.total_weight() as u16) as u64;
+    let epoch_certs = hashi.epoch_certs(key, protocol_type, ctx);
     hashi::tob::submit_cert(
         epoch_certs,
-        committee,
         epoch,
         dealer,
         messages_hash,
         signature,
         signers_bitmap,
-        threshold,
     );
 }
 
