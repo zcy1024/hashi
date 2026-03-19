@@ -438,6 +438,10 @@ impl MpcService {
                 commitments: std::collections::BTreeMap::new(),
             }
         };
+        info!("Presig desync recovery triggered, rescraping on-chain state");
+        if let Err(e) = self.inner.onchain_state().rescrape().await {
+            warn!("Failed to rescrape on-chain state before presig recovery: {e}");
+        }
         let epoch = self.inner.onchain_state().epoch();
         match self.recover_presigning_state(&output) {
             Ok(()) => return,
