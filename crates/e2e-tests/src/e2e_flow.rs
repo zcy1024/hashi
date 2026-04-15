@@ -1317,6 +1317,34 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_mpc_config_defaults_match_rust() -> Result<()> {
+        init_test_logging();
+
+        let networks = TestNetworksBuilder::new().with_nodes(1).build().await?;
+        networks.hashi_network.nodes()[0]
+            .wait_for_mpc_key(Duration::from_secs(60))
+            .await?;
+
+        use hashi::onchain::types::DEFAULT_MPC_THRESHOLD_IN_BASIS_POINTS;
+        use hashi::onchain::types::DEFAULT_MPC_WEIGHT_REDUCTION_ALLOWED_DELTA;
+
+        let hashi = networks.hashi_network.nodes()[0].hashi();
+        let threshold_bps = hashi.onchain_state().mpc_threshold_in_basis_points();
+        let weight_reduction_allowed_delta =
+            hashi.onchain_state().mpc_weight_reduction_allowed_delta();
+
+        assert_eq!(
+            threshold_bps, DEFAULT_MPC_THRESHOLD_IN_BASIS_POINTS,
+            "on-chain mpc_threshold_in_basis_points ({threshold_bps}) != Rust default ({DEFAULT_MPC_THRESHOLD_IN_BASIS_POINTS})"
+        );
+        assert_eq!(
+            weight_reduction_allowed_delta, DEFAULT_MPC_WEIGHT_REDUCTION_ALLOWED_DELTA,
+            "on-chain mpc_weight_reduction_allowed_delta ({weight_reduction_allowed_delta}) != Rust default ({DEFAULT_MPC_WEIGHT_REDUCTION_ALLOWED_DELTA})"
+        );
+        Ok(())
+    }
+
     /// Verify that a withdrawal can spend a change output whose producing
     /// transaction is mined on Bitcoin but not yet confirmed on Sui. The
     /// actual Bitcoin confirmation count must be queried from the node
