@@ -2981,6 +2981,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

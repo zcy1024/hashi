@@ -668,19 +668,16 @@ fn parse_metadata(args: Vec<String>) -> Vec<(String, String)> {
 }
 
 fn init_tracing(verbose: bool) {
-    let filter = if verbose {
-        tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(tracing::level_filters::LevelFilter::DEBUG.into())
-            .from_env_lossy()
+    let level = if verbose {
+        tracing::level_filters::LevelFilter::DEBUG
     } else {
-        tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(tracing::level_filters::LevelFilter::WARN.into())
-            .from_env_lossy()
+        tracing::level_filters::LevelFilter::WARN
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    hashi_types::telemetry::TelemetryConfig::new()
+        .with_default_level(level)
         .with_target(false)
+        .with_env()
         .init();
 }
 
