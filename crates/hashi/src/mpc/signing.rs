@@ -26,6 +26,8 @@ use tokio::time::Instant;
 
 use crate::communication::P2PChannel;
 use crate::communication::send_to_many;
+use crate::metrics::MPC_LABEL_SIGNING;
+use crate::metrics::Metrics;
 use crate::mpc::types::GetPartialSignaturesRequest;
 use crate::mpc::types::GetPartialSignaturesResponse;
 use crate::mpc::types::PartialSigningOutput;
@@ -227,6 +229,7 @@ impl SigningManager {
         beacon_value: &S,
         derivation_address: Option<&DerivationAddress>,
         timeout: Duration,
+        metrics: &Metrics,
     ) -> SigningResult<SchnorrSignature> {
         let config = &self.config;
         let threshold = config.threshold;
@@ -306,6 +309,10 @@ impl SigningManager {
                      batch_index={used_batch_index}, \
                      position={target_position})",
                 );
+                let _timer = metrics
+                    .mpc_sign_partial_gen_duration_seconds
+                    .with_label_values(&[MPC_LABEL_SIGNING])
+                    .start_timer();
                 let result = generate_partial_signatures(
                     message,
                     presig,
@@ -315,6 +322,7 @@ impl SigningManager {
                     derivation_address,
                 )
                 .map_err(|e| SigningError::CryptoError(e.to_string()))?;
+                drop(_timer);
 
                 // Trigger refill based on the latest batch's consumption.
                 if let Some(latest) = state.batches.last() {
@@ -359,6 +367,10 @@ impl SigningManager {
             .collect();
         let request = GetPartialSignaturesRequest { sui_request_id };
         let deadline = Instant::now() + timeout;
+        let _collection_timer = metrics
+            .mpc_sign_collection_duration_seconds
+            .with_label_values(&[MPC_LABEL_SIGNING])
+            .start_timer();
         loop {
             if all_partial_sigs.len() >= threshold as usize {
                 break;
@@ -377,6 +389,7 @@ impl SigningManager {
             )
             .await;
         }
+        drop(_collection_timer);
         let params = AggregationParams {
             message,
             public_nonce: &public_nonce,
@@ -385,6 +398,10 @@ impl SigningManager {
             verifying_key: &verifying_key,
             derivation_address,
         };
+        let _agg_timer = metrics
+            .mpc_sign_aggregation_duration_seconds
+            .with_label_values(&[MPC_LABEL_SIGNING])
+            .start_timer();
         let result = match aggregate_signatures(
             params.message,
             params.public_nonce,
@@ -413,6 +430,7 @@ impl SigningManager {
             }
             Err(e) => Err(SigningError::CryptoError(e.to_string())),
         };
+        drop(_agg_timer);
         match &result {
             Ok(_) => {}
             Err(e) => {
@@ -572,6 +590,10 @@ mod tests {
     use hashi_types::committee::EncryptionPublicKey;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+
+    fn test_metrics() -> Metrics {
+        Metrics::new(&prometheus::Registry::new())
+    }
 
     fn mock_shares(rng: &mut impl AllowedRng, secret: S, t: u16, n: u16) -> Vec<Eval<S>> {
         let p = Poly::rand_fixed_c0(t - 1, secret, rng);
@@ -1117,6 +1139,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await
         .unwrap();
@@ -1169,6 +1192,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await
         .unwrap();
@@ -1197,6 +1221,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await
         .unwrap();
@@ -1225,6 +1250,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await
         .unwrap();
@@ -1257,6 +1283,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await;
 
@@ -1293,6 +1320,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_millis(1), // very short timeout
+            &test_metrics(),
         )
         .await;
 
@@ -1373,6 +1401,7 @@ mod tests {
             &S::zero(),
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await
         .unwrap();
@@ -1398,6 +1427,7 @@ mod tests {
             &S::zero(),
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await;
 
@@ -1423,6 +1453,7 @@ mod tests {
             &S::zero(),
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await;
 
@@ -1485,6 +1516,7 @@ mod tests {
             &S::zero(),
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await;
 
@@ -1514,6 +1546,7 @@ mod tests {
                 &beacon,
                 None,
                 Duration::from_secs(30),
+                &test_metrics(),
             )
             .await;
             assert!(result.is_ok(), "sign {i} should succeed");
@@ -1538,6 +1571,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await;
 
@@ -1582,6 +1616,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await;
 
@@ -1609,6 +1644,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await;
         assert!(result1.is_ok());
@@ -1625,6 +1661,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await;
         assert!(matches!(result2, Err(SigningError::PoolExhausted)));
@@ -1646,6 +1683,7 @@ mod tests {
             &S::zero(),
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await;
 
@@ -1674,6 +1712,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await
         .unwrap();
@@ -1695,6 +1734,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await
         .unwrap();
@@ -1738,6 +1778,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await
         .unwrap();
@@ -1753,6 +1794,7 @@ mod tests {
             &beacon,
             None,
             Duration::from_secs(30),
+            &test_metrics(),
         )
         .await
         .unwrap();

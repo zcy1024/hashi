@@ -5,6 +5,7 @@ use crate::communication::ChannelError;
 use crate::communication::ChannelResult;
 use crate::communication::P2PChannel;
 use crate::grpc::Client;
+use crate::grpc::MPC_PROTOCOL_METADATA_KEY;
 use crate::mpc::types::ComplainRequest;
 use crate::mpc::types::ComplaintResponses;
 use crate::mpc::types::GetPartialSignaturesRequest;
@@ -18,17 +19,20 @@ use crate::mpc::types::SendMessagesResponse;
 use crate::onchain::OnchainState;
 use async_trait::async_trait;
 use sui_sdk_types::Address;
+use tonic::metadata::MetadataValue;
 
 pub struct RpcP2PChannel {
     onchain_state: OnchainState,
     epoch: u64,
+    protocol_label: &'static str,
 }
 
 impl RpcP2PChannel {
-    pub fn new(onchain_state: OnchainState, epoch: u64) -> Self {
+    pub fn new(onchain_state: OnchainState, epoch: u64, protocol_label: &'static str) -> Self {
         Self {
             onchain_state,
             epoch,
+            protocol_label,
         }
     }
 
@@ -40,6 +44,18 @@ impl RpcP2PChannel {
             .client(address)
             .ok_or(ChannelError::ClientNotFound(*address))
     }
+
+    /// Wrap a protobuf message in a `tonic::Request` tagged with the MPC
+    /// protocol label, so the server-side metrics layer can attribute
+    /// traffic to the originating protocol.
+    fn build_request<T>(&self, message: T) -> tonic::Request<T> {
+        let mut req = tonic::Request::new(message);
+        req.metadata_mut().insert(
+            MPC_PROTOCOL_METADATA_KEY,
+            MetadataValue::from_static(self.protocol_label),
+        );
+        req
+    }
 }
 
 #[async_trait]
@@ -49,9 +65,14 @@ impl P2PChannel for RpcP2PChannel {
         recipient: &Address,
         request: &SendMessagesRequest,
     ) -> ChannelResult<SendMessagesResponse> {
-        self.get_client(recipient)?
-            .send_messages(self.epoch, request)
+        let client = self.get_client(recipient)?;
+        let proto_request = self.build_request(request.to_proto(self.epoch));
+        let response = client
+            .mpc_service_client()
+            .send_messages(proto_request)
             .await
+            .map_err(|e| ChannelError::RequestFailed(e.to_string()))?;
+        SendMessagesResponse::try_from(response.get_ref())
             .map_err(|e| ChannelError::RequestFailed(e.to_string()))
     }
 
@@ -60,9 +81,14 @@ impl P2PChannel for RpcP2PChannel {
         party: &Address,
         request: &RetrieveMessagesRequest,
     ) -> ChannelResult<RetrieveMessagesResponse> {
-        self.get_client(party)?
-            .retrieve_messages(request)
+        let client = self.get_client(party)?;
+        let proto_request = self.build_request(request.to_proto());
+        let response = client
+            .mpc_service_client()
+            .retrieve_messages(proto_request)
             .await
+            .map_err(|e| ChannelError::RequestFailed(e.to_string()))?;
+        RetrieveMessagesResponse::try_from(response.get_ref())
             .map_err(|e| ChannelError::RequestFailed(e.to_string()))
     }
 
@@ -71,9 +97,14 @@ impl P2PChannel for RpcP2PChannel {
         party: &Address,
         request: &ComplainRequest,
     ) -> ChannelResult<ComplaintResponses> {
-        self.get_client(party)?
-            .complain(request)
+        let client = self.get_client(party)?;
+        let proto_request = self.build_request(request.to_proto());
+        let response = client
+            .mpc_service_client()
+            .complain(proto_request)
             .await
+            .map_err(|e| ChannelError::RequestFailed(e.to_string()))?;
+        ComplaintResponses::try_from(response.get_ref())
             .map_err(|e| ChannelError::RequestFailed(e.to_string()))
     }
 
@@ -82,9 +113,14 @@ impl P2PChannel for RpcP2PChannel {
         party: &Address,
         request: &GetPublicMpcOutputRequest,
     ) -> ChannelResult<GetPublicMpcOutputResponse> {
-        self.get_client(party)?
-            .get_public_mpc_output(request)
+        let client = self.get_client(party)?;
+        let proto_request = self.build_request(request.to_proto());
+        let response = client
+            .mpc_service_client()
+            .get_public_mpc_output(proto_request)
             .await
+            .map_err(|e| ChannelError::RequestFailed(e.to_string()))?;
+        GetPublicMpcOutputResponse::try_from(response.get_ref())
             .map_err(|e| ChannelError::RequestFailed(e.to_string()))
     }
 
@@ -93,9 +129,14 @@ impl P2PChannel for RpcP2PChannel {
         party: &Address,
         request: &GetPartialSignaturesRequest,
     ) -> ChannelResult<GetPartialSignaturesResponse> {
-        self.get_client(party)?
-            .get_partial_signatures(self.epoch, request)
+        let client = self.get_client(party)?;
+        let proto_request = self.build_request(request.to_proto(self.epoch));
+        let response = client
+            .mpc_service_client()
+            .get_partial_signatures(proto_request)
             .await
+            .map_err(|e| ChannelError::RequestFailed(e.to_string()))?;
+        GetPartialSignaturesResponse::try_from(response.get_ref())
             .map_err(|e| ChannelError::RequestFailed(e.to_string()))
     }
 }

@@ -558,7 +558,8 @@ impl Hashi {
                 epoch,
             );
         }
-        let p2p_channel = RpcP2PChannel::new(onchain_state, epoch);
+        let p2p_channel =
+            RpcP2PChannel::new(onchain_state, epoch, crate::metrics::MPC_LABEL_SIGNING);
         let signing_manager = self.signing_manager_for(epoch).ok_or_else(|| {
             anyhow::anyhow!(
                 "SigningManager not available for epoch {epoch}; \
@@ -585,6 +586,7 @@ impl Hashi {
                     &beacon,
                     derivation_address.as_ref(),
                     WITHDRAWAL_SIGNING_TIMEOUT,
+                    &self.metrics,
                 )
                 .await;
             let sign_duration = sign_start.elapsed().as_secs_f64();

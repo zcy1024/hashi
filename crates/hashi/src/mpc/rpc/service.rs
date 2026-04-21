@@ -33,7 +33,17 @@ impl MpcService for HttpService {
         let external_request = request.into_inner();
         let internal_request = types::SendMessagesRequest::try_from(&external_request)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let label = match &internal_request.messages {
+            types::Messages::Dkg(_) => crate::metrics::MPC_LABEL_DKG,
+            types::Messages::Rotation(_) => crate::metrics::MPC_LABEL_KEY_ROTATION,
+            types::Messages::NonceGeneration(_) => crate::metrics::MPC_LABEL_NONCE_GENERATION,
+        };
         let mpc_manager = self.mpc_manager()?;
+        let _timer = self
+            .metrics()
+            .mpc_rpc_handler_process_duration_seconds
+            .with_label_values(&[label])
+            .start_timer();
         let response = spawn_blocking(move || -> Result<_, Status> {
             let mut mgr = mpc_manager.write().unwrap();
             validate_epoch(mgr.mpc_config.epoch, external_request.epoch)?;
@@ -48,6 +58,7 @@ impl MpcService for HttpService {
                 })
         })
         .await?;
+        drop(_timer);
         Ok(tonic::Response::new(SendMessagesResponse::from(&response)))
     }
 

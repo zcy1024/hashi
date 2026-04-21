@@ -12,6 +12,7 @@ use crate::Hashi;
 mod client;
 pub use client::BoxedChannel;
 pub use client::Client;
+pub use client::MPC_PROTOCOL_METADATA_KEY;
 
 pub mod bridge_service;
 pub mod metrics_layer;
@@ -39,6 +40,10 @@ pub struct HttpService {
 impl HttpService {
     pub fn new(hashi: Arc<Hashi>) -> Self {
         Self { inner: hashi }
+    }
+
+    pub(crate) fn metrics(&self) -> &crate::metrics::Metrics {
+        &self.inner.metrics
     }
 
     pub async fn start(self) -> (std::net::SocketAddr, Service) {

@@ -691,9 +691,14 @@ mod tests {
                     .signing_manager_for(epoch)
                     .unwrap_or_else(|| panic!("SigningManager not initialized for epoch {epoch}"));
                 let onchain_state = node.hashi().onchain_state().clone();
-                let p2p_channel = hashi::mpc::rpc::RpcP2PChannel::new(onchain_state, epoch);
+                let p2p_channel = hashi::mpc::rpc::RpcP2PChannel::new(
+                    onchain_state,
+                    epoch,
+                    hashi::metrics::MPC_LABEL_SIGNING,
+                );
                 let beacon = beacon_value;
                 let message = message.to_vec();
+                let metrics = node.hashi().metrics.clone();
                 async move {
                     signing_manager
                         .sign(
@@ -704,6 +709,7 @@ mod tests {
                             &beacon,
                             None,
                             SIGNING_TIMEOUT,
+                            &metrics,
                         )
                         .await
                 }
