@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Prometheus metrics for the proxy, served on `METRICS_LISTEN_ADDR`. The
-//! `unavailable_*` outcomes are the fail-closed paths and worth alerting on,
-//! `unavailable_verify_failed` especially (bucket tampering or version skew).
+//! `unavailable_*` outcomes are the fail-closed paths. Alert on them, and on
+//! a `widlog_cursor_lag_seconds` that grows (the index tail has stalled).
 
 use prometheus::Encoder;
-use prometheus::Histogram;
-use prometheus::HistogramOpts;
 use prometheus::IntCounter;
 use prometheus::IntCounterVec;
+use prometheus::IntGauge;
 use prometheus::Opts;
 use prometheus::Registry;
 use prometheus::TextEncoder;
@@ -17,22 +16,34 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
 
-pub const OUTCOME_L1_HIT: &str = "l1_hit";
-pub const OUTCOME_S3_HIT: &str = "s3_hit";
+pub const OUTCOME_HIT: &str = "hit";
 pub const OUTCOME_FORWARDED: &str = "forwarded";
 pub const OUTCOME_UNAVAILABLE_LOG_STORE: &str = "unavailable_log_store";
-pub const OUTCOME_UNAVAILABLE_SCAN_CAP: &str = "unavailable_scan_cap";
-pub const OUTCOME_UNAVAILABLE_VERIFY_FAILED: &str = "unavailable_verify_failed";
-pub const OUTCOME_UNAVAILABLE_GUARDIAN_INFO: &str = "unavailable_guardian_info";
 
 pub struct ProxyMetrics {
     registry: Registry,
     /// `StandardWithdrawal` requests by cache outcome.
     pub requests: IntCounterVec,
-    /// LIST calls per S3 lookup (hit or miss); the scan cap bounds the tail.
-    pub scan_lists: Histogram,
-    /// Wid-matching log records that failed to parse (schema skew or garbage).
-    pub record_parse_failures: IntCounter,
+    /// Wids in the index.
+    pub widlog_index_size: IntGauge,
+    /// Seconds the index tail trails the clock. Normally less than 75 minutes.
+    pub widlog_cursor_lag_seconds: IntGauge,
+    /// Tail ticks that did not list an hour directory.
+    pub widlog_tail_failures: IntCounter,
+    /// When the served TLS certificate expires, in unix seconds.
+    pub tls_cert_not_after: IntGauge,
+    /// Failed TLS certificate reloads; the proxy keeps serving the old one.
+    pub tls_cert_reload_failures: IntCounter,
+    /// Requests the committee member gate refused, by reason.
+    pub member_refused: IntCounterVec,
+    /// Members on the current allowlist snapshot.
+    pub member_allowlist_size: IntGauge,
+    /// Checkpoint time of the chain state on the allowlist; its age is what to alert on.
+    pub member_snapshot_timestamp_seconds: IntGauge,
+    /// Failed allowlist reads.
+    pub member_refresh_failures: IntCounter,
+    /// Committee updates the handoff gate refused, by reason.
+    pub handoff_refused: IntCounterVec,
 }
 
 impl ProxyMetrics {
@@ -47,17 +58,60 @@ impl ProxyMetrics {
             &["outcome"],
         )
         .expect("valid metric");
-        let scan_lists = Histogram::with_opts(
-            HistogramOpts::new(
-                "guardian_proxy_widlog_scan_lists",
-                "S3 LIST calls per wid log lookup",
-            )
-            .buckets(vec![2.0, 5.0, 10.0, 25.0, 50.0, 100.0]),
+        let widlog_index_size = IntGauge::new(
+            "guardian_proxy_widlog_index_size",
+            "Wids in the withdrawal log index",
         )
         .expect("valid metric");
-        let record_parse_failures = IntCounter::new(
-            "guardian_proxy_widlog_parse_failures_total",
-            "Wid-matching log records that failed to parse",
+        let widlog_cursor_lag_seconds = IntGauge::new(
+            "guardian_proxy_widlog_cursor_lag_seconds",
+            "Seconds the withdrawal log index tail trails the clock",
+        )
+        .expect("valid metric");
+        let widlog_tail_failures = IntCounter::new(
+            "guardian_proxy_widlog_tail_failures_total",
+            "Withdrawal log index tail ticks that failed",
+        )
+        .expect("valid metric");
+        let tls_cert_not_after = IntGauge::new(
+            "guardian_proxy_tls_cert_not_after_seconds",
+            "Expiry of the served TLS certificate, in unix seconds",
+        )
+        .expect("valid metric");
+        let tls_cert_reload_failures = IntCounter::new(
+            "guardian_proxy_tls_cert_reload_failures_total",
+            "TLS certificate reloads that failed",
+        )
+        .expect("valid metric");
+        let member_refused = IntCounterVec::new(
+            Opts::new(
+                "guardian_proxy_member_refused_total",
+                "Requests refused by the committee member gate, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("valid metric");
+        let member_allowlist_size = IntGauge::new(
+            "guardian_proxy_member_allowlist_size",
+            "Committee members on the current allowlist snapshot",
+        )
+        .expect("valid metric");
+        let member_snapshot_timestamp_seconds = IntGauge::new(
+            "guardian_proxy_member_snapshot_timestamp_seconds",
+            "Checkpoint time, in unix seconds, of the chain state on the committee member allowlist",
+        )
+        .expect("valid metric");
+        let member_refresh_failures = IntCounter::new(
+            "guardian_proxy_member_refresh_failures_total",
+            "Failed committee member allowlist reads",
+        )
+        .expect("valid metric");
+        let handoff_refused = IntCounterVec::new(
+            Opts::new(
+                "guardian_proxy_handoff_refused_total",
+                "Committee updates refused by the handoff gate, by reason",
+            ),
+            &["reason"],
         )
         .expect("valid metric");
 
@@ -65,17 +119,49 @@ impl ProxyMetrics {
             .register(Box::new(requests.clone()))
             .expect("register");
         registry
-            .register(Box::new(scan_lists.clone()))
+            .register(Box::new(widlog_index_size.clone()))
             .expect("register");
         registry
-            .register(Box::new(record_parse_failures.clone()))
+            .register(Box::new(widlog_cursor_lag_seconds.clone()))
+            .expect("register");
+        registry
+            .register(Box::new(widlog_tail_failures.clone()))
+            .expect("register");
+        registry
+            .register(Box::new(tls_cert_not_after.clone()))
+            .expect("register");
+        registry
+            .register(Box::new(tls_cert_reload_failures.clone()))
+            .expect("register");
+        registry
+            .register(Box::new(member_refused.clone()))
+            .expect("register");
+        registry
+            .register(Box::new(member_allowlist_size.clone()))
+            .expect("register");
+        registry
+            .register(Box::new(member_snapshot_timestamp_seconds.clone()))
+            .expect("register");
+        registry
+            .register(Box::new(member_refresh_failures.clone()))
+            .expect("register");
+        registry
+            .register(Box::new(handoff_refused.clone()))
             .expect("register");
 
         Self {
             registry,
             requests,
-            scan_lists,
-            record_parse_failures,
+            widlog_index_size,
+            widlog_cursor_lag_seconds,
+            widlog_tail_failures,
+            tls_cert_not_after,
+            tls_cert_reload_failures,
+            member_refused,
+            member_allowlist_size,
+            member_snapshot_timestamp_seconds,
+            member_refresh_failures,
+            handoff_refused,
         }
     }
 

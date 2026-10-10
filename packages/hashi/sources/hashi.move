@@ -16,13 +16,14 @@ use hashi::{
     committee::{CertifiedMessage, Committee, CommitteeSignature},
     committee_set::CommitteeSet,
     config::Config,
+    mpc_signing::{Self, Presig, PresigAllocator},
     proposals::{Self, Proposals},
     threshold,
     treasury::Treasury,
     versioning::{Self, Versioning}
 };
 use std::string::String;
-use sui::{bag::{Self, Bag}, dynamic_field as df, table::Table};
+use sui::{bag::{Self, Bag}, dynamic_field as df};
 
 // ~~~~~~~ Errors ~~~~~~~
 
@@ -51,12 +52,13 @@ public struct Hashi has key {
     versioning: Versioning,
     treasury: Treasury,
     proposals: Proposals,
-    /// TOB certificates by (epoch, batch_index, protocol_type). Values are
-    /// bare `EpochCertsV1` buckets or, for nonce certs, `StampedEpochCertsV1`.
+    /// TOB certificates by (epoch, batch_index, protocol_type). Every value
+    /// is an `EpochCertsV1` bucket.
     tob: Bag,
-    /// Number of presignatures consumed in the current epoch.
-    /// Used by recovering nodes to derive `(batch_index, index_in_batch)`.
-    num_consumed_presigs: u64,
+    /// The only source of `Presig` handles for the current epoch. The
+    /// presignatures themselves come from the committee's off-chain
+    /// presigning protocol.
+    presig_allocator: PresigAllocator,
 }
 
 // ~~~~~~~ Entry Functions ~~~~~~~
@@ -70,7 +72,7 @@ public struct Hashi has key {
 // has registered. `Option::fill` inside `set_upgrade_cap` (and the write-once
 // BTC currency/treasury registration) make this call-once.
 //
-// The guardian URL and BTC key are both required: the guardian is a
+// The guardian URLs and BTC key are all required: the guardian is a
 // load-bearing component of every deposit address (2-of-2 taproot leaf)
 // and every withdrawal signature, so a deploy without them would produce
 // a non-functional bridge.
@@ -79,6 +81,7 @@ entry fun finish_publish(
     upgrade_cap: sui::package::UpgradeCap,
     bitcoin_chain_id: address,
     guardian_url: String,
+    guardian_node_url: String,
     guardian_btc_public_key: vector<u8>,
     bitcoin_confirmation_threshold: Option<u64>,
     bitcoin_deposit_time_delay_ms: Option<u64>,
@@ -95,6 +98,7 @@ entry fun finish_publish(
     hashi::btc_config::set_bitcoin_chain_id(self.config_mut(), bitcoin_chain_id);
 
     self.config_mut().set_guardian_url(guardian_url);
+    self.config_mut().set_guardian_node_url(guardian_node_url);
     self.config_mut().set_guardian_btc_public_key(guardian_btc_public_key);
 
     if (bitcoin_confirmation_threshold.is_some()) {
@@ -135,8 +139,7 @@ public(package) fun verify<T>(
     message: T,
     sig: CommitteeSignature,
 ): CertifiedMessage<T> {
-    let threshold =
-        threshold::certificate_threshold(self.current_committee().total_weight() as u16) as u64;
+    let threshold = threshold::certificate_threshold(self.current_committee().total_weight());
     self
         .current_committee()
         .verify_certificate(self.id.uid_to_address(), intent, message, sig, threshold)
@@ -151,7 +154,7 @@ public(package) fun verify_with_committee<T>(
     message: T,
     sig: CommitteeSignature,
 ): CertifiedMessage<T> {
-    let threshold = threshold::certificate_threshold(committee.total_weight() as u16) as u64;
+    let threshold = threshold::certificate_threshold(committee.total_weight());
     committee.verify_certificate(self.id.uid_to_address(), intent, message, sig, threshold)
 }
 
@@ -226,15 +229,6 @@ public(package) fun bitcoin_mut(self: &mut Hashi): &mut BitcoinState {
     df::borrow_mut(&mut self.id, bitcoin_state::key())
 }
 
-public(package) fun committee_set_and_tls_keys_mut(
-    self: &mut Hashi,
-): (&mut CommitteeSet, &mut Table<vector<u8>, address>) {
-    (
-        &mut self.committee_set,
-        df::borrow_mut(&mut self.id, hashi::committee_set::tls_key_index_key()),
-    )
-}
-
 public(package) fun tob_mut(self: &mut Hashi): &mut Bag {
     &mut self.tob
 }
@@ -251,41 +245,13 @@ public(package) fun epoch_certs(
     self.tob.borrow_mut(key)
 }
 
-public(package) fun cert_bucket_is_bare(self: &Hashi, key: hashi::tob::TobKey): bool {
-    self.tob.contains_with_type<hashi::tob::TobKey, hashi::tob::EpochCertsV1>(key)
+/// Mint `count` fresh `Presig` handles for the current epoch.
+public(package) fun allocate_presigs(self: &mut Hashi, count: u64): vector<Presig> {
+    self.presig_allocator.allocate(count)
 }
 
-/// A nonce bucket keeps the layout it was created with: one created bare
-/// (only possible on a chain that predates stamping) keeps taking bare
-/// writes, and a new bucket is always stamped.
-public(package) fun nonce_write_stays_bare(self: &Hashi, key: hashi::tob::TobKey): bool {
-    self.tob.contains(key) && self.cert_bucket_is_bare(key)
-}
-
-public(package) fun epoch_certs_stamped(
-    self: &mut Hashi,
-    key: hashi::tob::TobKey,
-    ctx: &mut TxContext,
-): &mut hashi::tob::StampedEpochCertsV1 {
-    let epoch = key.epoch();
-    if (!self.tob.contains(key)) {
-        self.tob.add(key, hashi::tob::create_stamped(epoch, key.protocol_type(), ctx));
-    };
-    self.tob.borrow_mut(key)
-}
-
-public(package) fun num_consumed_presigs(self: &Hashi): u64 {
-    self.num_consumed_presigs
-}
-
-public(package) fun allocate_presigs(self: &mut Hashi, count: u64): u64 {
-    let start = self.num_consumed_presigs;
-    self.num_consumed_presigs = self.num_consumed_presigs + count;
-    start
-}
-
-public(package) fun reset_num_consumed_presigs(self: &mut Hashi) {
-    self.num_consumed_presigs = 0;
+public(package) fun reset_presig_allocator(self: &mut Hashi) {
+    self.presig_allocator.reset();
 }
 
 // ~~~~~~~ Private Functions ~~~~~~~
@@ -309,15 +275,10 @@ fun init(ctx: &mut TxContext) {
         treasury: hashi::treasury::create(ctx),
         proposals: proposals::create(ctx),
         tob: bag::new(ctx),
-        num_consumed_presigs: 0,
+        presig_allocator: mpc_signing::new_allocator(),
     };
 
     df::add(&mut hashi.id, bitcoin_state::key(), bitcoin_state::new(ctx));
-    df::add(
-        &mut hashi.id,
-        hashi::committee_set::tls_key_index_key(),
-        sui::table::new<vector<u8>, address>(ctx),
-    );
 
     sui::transfer::share_object(hashi);
 }
@@ -334,14 +295,6 @@ public(package) fun epoch_certs_ref(
     self: &Hashi,
     key: hashi::tob::TobKey,
 ): &hashi::tob::EpochCertsV1 {
-    self.tob.borrow(key)
-}
-
-#[test_only]
-public(package) fun epoch_certs_stamped_ref(
-    self: &Hashi,
-    key: hashi::tob::TobKey,
-): &hashi::tob::StampedEpochCertsV1 {
     self.tob.borrow(key)
 }
 
@@ -366,14 +319,9 @@ public fun create_for_testing(
         treasury,
         proposals,
         tob,
-        num_consumed_presigs: 0,
+        presig_allocator: mpc_signing::new_allocator(),
     };
     df::add(&mut hashi.id, bitcoin_state::key(), bitcoin_state::new(ctx));
-    df::add(
-        &mut hashi.id,
-        hashi::committee_set::tls_key_index_key(),
-        sui::table::new<vector<u8>, address>(ctx),
-    );
     hashi
 }
 
@@ -386,6 +334,7 @@ public fun finish_publish_for_testing(
     upgrade_cap: sui::package::UpgradeCap,
     bitcoin_chain_id: address,
     guardian_url: String,
+    guardian_node_url: String,
     guardian_btc_public_key: vector<u8>,
     coin_registry: &mut sui::coin_registry::CoinRegistry,
     ctx: &mut TxContext,
@@ -395,6 +344,7 @@ public fun finish_publish_for_testing(
         upgrade_cap,
         bitcoin_chain_id,
         guardian_url,
+        guardian_node_url,
         guardian_btc_public_key,
         option::none(),
         option::none(),

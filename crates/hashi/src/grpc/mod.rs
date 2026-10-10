@@ -43,15 +43,24 @@ impl Drop for ServerHandleGuard {
 #[derive(Clone)]
 pub struct HttpService {
     inner: Arc<Hashi>,
+    signing_tasks: peer_limit::CallerTaskLimiter,
 }
 
 impl HttpService {
     pub fn new(hashi: Arc<Hashi>) -> Self {
-        Self { inner: hashi }
+        let signing_tasks = peer_limit::CallerTaskLimiter::new(hashi.metrics.clone());
+        Self {
+            inner: hashi,
+            signing_tasks,
+        }
     }
 
     pub(crate) fn metrics(&self) -> &crate::metrics::Metrics {
         &self.inner.metrics
+    }
+
+    pub(crate) fn onchain_state_opt(&self) -> Option<crate::onchain::OnchainState> {
+        self.inner.onchain_state_opt().cloned()
     }
 
     pub async fn start(self) -> (std::net::SocketAddr, Service) {
@@ -148,6 +157,9 @@ impl HttpService {
                 .config(
                     sui_http::Config::default()
                         .max_concurrent_streams(crate::config::DEFAULT_GRPC_PER_PEER_INFLIGHT_LIMIT)
+                        .http2_max_pending_accept_reset_streams(Some(
+                            crate::config::DEFAULT_GRPC_PER_PEER_INFLIGHT_LIMIT as usize,
+                        ))
                         .max_connection_age(std::time::Duration::from_secs(120))
                         .max_connection_age_grace(std::time::Duration::from_secs(120))
                         .http2_keepalive_interval(Some(std::time::Duration::from_secs(30))),
@@ -158,17 +170,7 @@ impl HttpService {
         );
         let local_addr = *server_handle.local_addr();
 
-        let guard = ServerHandleGuard(server_handle.clone());
-        let service = Service::new()
-            .spawn_aborting(async move {
-                guard.0.wait_for_shutdown().await;
-                Ok(())
-            })
-            .with_shutdown_signal(async move {
-                server_handle.trigger_shutdown();
-            });
-
-        (local_addr, service)
+        (local_addr, supervise(server_handle))
     }
 
     pub fn mpc_manager(
@@ -197,6 +199,21 @@ impl HttpService {
     pub fn get_reconfig_signature(&self, epoch: u64) -> Option<Vec<u8>> {
         self.inner.get_reconfig_signature(epoch)
     }
+
+    pub fn get_presig_seal_signature(&self, epoch: u64, batch_index: u32) -> Option<Vec<u8>> {
+        self.inner
+            .get_presig_dealer_set_signature(epoch, batch_index)
+    }
+}
+
+// A server that stops without a shutdown signal has crashed (one HTTP/1 handler
+// panic ends sui-http's accept loop), so fail rather than run on without it.
+fn supervise(server_handle: Arc<ServerHandle>) -> Service {
+    let guard = ServerHandleGuard(server_handle);
+    Service::new().spawn_aborting(async move {
+        guard.0.wait_for_shutdown().await;
+        anyhow::bail!("HTTP server stopped unexpectedly")
+    })
 }
 
 async fn health() -> impl axum::response::IntoResponse {
@@ -351,4 +368,44 @@ fn lookup_validator_address<B>(
         .committees
         .lookup_address_by_tls_public_key(&tls_public_key)
         .ok_or(RefusalReason::NotRegistered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server() -> Arc<ServerHandle> {
+        Arc::new(
+            sui_http::Builder::new()
+                .serve(("127.0.0.1", 0), axum::Router::new())
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_service_fails_when_the_server_stops_without_a_shutdown_signal() {
+        let server = server();
+        let mut service = supervise(server.clone());
+
+        server.trigger_shutdown();
+
+        service
+            .join()
+            .await
+            .expect_err("a server that stopped on its own must fail the service");
+    }
+
+    #[tokio::test]
+    async fn a_requested_shutdown_stops_the_server_and_the_service_cleanly() {
+        let server = server();
+
+        supervise(server.clone()).shutdown().await.unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server.wait_for_shutdown(),
+        )
+        .await
+        .expect("a requested shutdown must stop the server");
+    }
 }

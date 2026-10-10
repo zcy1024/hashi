@@ -57,7 +57,7 @@ impl Hashi {
         };
         let deposit_address = self
             .get_deposit_address(deposit_request.utxo.derivation_path.as_ref())
-            .map_err(UnapprovedDepositError::AmlServiceError)?;
+            .map_err(UnapprovedDepositError::DepositAddressUnavailable)?;
         let screening = trm::DepositScreening::new(deposit_request, deposit_address.to_string());
         let started = std::time::Instant::now();
         let result = trm.screen_deposit(&screening).await;
@@ -261,7 +261,7 @@ impl Hashi {
         })?;
         let expected_address = self
             .get_deposit_address(deposit_request.utxo.derivation_path.as_ref())
-            .map_err(UnapprovedDepositError::DepositDataMismatch)?;
+            .map_err(UnapprovedDepositError::DepositAddressUnavailable)?;
 
         if deposit_address != expected_address {
             return Err(UnapprovedDepositError::DepositDataMismatch(anyhow!(
@@ -339,10 +339,17 @@ impl Hashi {
         XOnlyPublicKey::from_slice(&derived.to_byte_array()).context("valid 32-byte x-only key")
     }
 
+    /// Prefers the key pinned from the live guardian; falls back to the
+    /// on-chain key the pin must match, which is write-once.
     fn require_guardian_btc_pubkey(&self) -> anyhow::Result<XOnlyPublicKey> {
-        self.guardian_btc_pubkey()
-            .copied()
-            .ok_or_else(|| anyhow!("Guardian BTC pubkey not yet pinned"))
+        if let Some(pinned) = self.guardian_btc_pubkey() {
+            return Ok(*pinned);
+        }
+        let onchain = self
+            .onchain_state()
+            .guardian_btc_public_key()
+            .context("Guardian BTC pubkey not on chain yet")?;
+        XOnlyPublicKey::from_slice(&onchain).context("Invalid on-chain guardian BTC pubkey")
     }
 
     fn sign_deposit_confirmation(
@@ -458,11 +465,17 @@ pub enum UnapprovedDepositError {
     #[error("Deposit data mismatch: {0}")]
     DepositDataMismatch(#[source] anyhow::Error),
 
+    #[error("Deposit address not derivable yet: {0}")]
+    DepositAddressUnavailable(#[source] anyhow::Error),
+
     #[error("AML checks rejected deposit: {0}")]
     AmlRejected(#[source] anyhow::Error),
 
     #[error("Failed quorum: weight {weight} < {required_weight}")]
     FailedQuorum { weight: u64, required_weight: u64 },
+
+    #[error("Committee epoch {epoch} is stale: peers signed at epoch {peer_epoch}")]
+    StaleCommittee { epoch: u64, peer_epoch: u64 },
 
     #[error("Failed to build deposit certificate: {0}")]
     CertificateBuildFailed(#[source] anyhow::Error),
@@ -489,8 +502,10 @@ impl UnapprovedDepositError {
             Self::BitcoinConfirmFailed(_)
             | Self::BitcoinNotConfirmed(_)
             | Self::AmlServiceError(_)
+            | Self::DepositAddressUnavailable(_)
             | Self::SpentUtxoLookupFailed(_)
             | Self::FailedQuorum { .. }
+            | Self::StaleCommittee { .. }
             | Self::CertificateBuildFailed(_)
             | Self::ExecutorInitFailed(_)
             | Self::ApproveDepositFailed(_)
@@ -561,5 +576,89 @@ impl RetryPolicy for ApprovedDepositErrorKind {
 
     fn max_retries(self) -> u32 {
         u32::MAX
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mpc::signing::tests::SigningTestSetup;
+    use crate::onchain::types::Utxo;
+    use crate::onchain::types::UtxoId;
+    use sui_sdk_types::Address;
+    use sui_sdk_types::Digest;
+
+    fn deposit_request(derivation_path: Address) -> DepositRequest {
+        DepositRequest {
+            id: Address::new([1; 32]),
+            sender: Address::ZERO,
+            created_timestamp_ms: 1,
+            sui_tx_digest: Digest::new([1; 32]),
+            utxo: Utxo {
+                id: UtxoId {
+                    txid: Address::new([2; 32]).into(),
+                    vout: 0,
+                },
+                amount: 1_000,
+                derivation_path: Some(derivation_path),
+            },
+            approval_cert: None,
+            approved_timestamp_ms: None,
+            confirmed_timestamp_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn deposit_to_another_address_is_never_retried() {
+        let tmpdir = tempfile::Builder::new().tempdir().unwrap();
+        let mut config = crate::config::Config::new_for_testing();
+        config.db = Some(tmpdir.path().into());
+        let hashi = Hashi::new_with_registry(
+            crate::ServerVersion::new("unknown", "unknown"),
+            None,
+            config,
+            &prometheus::Registry::new(),
+        )
+        .unwrap();
+        *hashi.signing_manager.write().unwrap() =
+            Some(SigningTestSetup::new(4).managers[0].clone());
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let guardian = bitcoin::secp256k1::Keypair::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap(),
+        )
+        .x_only_public_key()
+        .0;
+        hashi.guardian_btc_pubkey.set(Some(guardian)).unwrap();
+        let network = hashi.config.bitcoin_network();
+        let mpc_g = hashi.signing_verifying_key().unwrap();
+        let request = deposit_request(Address::new([3; 32]));
+        let expected_script = derive_deposit_address(
+            &mpc_g,
+            &guardian,
+            request.utxo.derivation_path.as_ref(),
+            network,
+        )
+        .unwrap()
+        .script_pubkey();
+        let other_script =
+            derive_deposit_address(&mpc_g, &guardian, Some(&Address::new([4; 32])), network)
+                .unwrap()
+                .script_pubkey();
+
+        hashi
+            .validate_deposit_request_derivation_path(&expected_script, &request)
+            .await
+            .unwrap();
+        let err = hashi
+            .validate_deposit_request_derivation_path(&other_script, &request)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UnapprovedDepositError::DepositDataMismatch(_)),
+            "{err:#}"
+        );
+        assert_eq!(err.kind(), UnapprovedDepositErrorKind::NeverRetry);
     }
 }

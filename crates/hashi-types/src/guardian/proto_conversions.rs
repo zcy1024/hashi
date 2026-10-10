@@ -5,6 +5,7 @@
 //    Protobuf RPC conversions
 // ---------------------------------
 
+use super::AttestedGuardianInfo;
 use super::AttestedKpCert;
 use super::BatchProvisionerInitRequest;
 use super::BatchProvisionerRotateKpSetRequest;
@@ -19,7 +20,6 @@ use super::DeploymentConfig;
 use super::DeploymentConfigSummary;
 use super::EnclaveLifecycle;
 use super::GenesisState;
-use super::GetGuardianInfoResponse;
 use super::GuardianEncryptedShare;
 use super::GuardianError;
 use super::GuardianError::InvalidInputs;
@@ -565,7 +565,7 @@ impl TryFrom<pb::BuildPcrs> for BuildPcrs {
             .git_revision
             .ok_or_else(|| missing("git_revision"))?;
         let pcr0 = build_pb.pcr0.ok_or_else(|| missing("pcr0"))?.to_vec();
-        Ok(BuildPcrs::new(&git_revision, pcr0))
+        BuildPcrs::new(&git_revision, pcr0)
     }
 }
 
@@ -596,63 +596,39 @@ impl TryFrom<pb::InitConfig> for InitConfig {
             .ok_or_else(|| missing("limiter_config"))?;
         let limiter_config = LimiterConfig::try_from(limiter_config_pb)?;
 
-        let master_pk_bytes = config_pb
-            .hashi_btc_master_pubkey
-            .ok_or_else(|| missing("hashi_btc_master_pubkey"))?;
-
-        let master_pk_bytes_arr: [u8; 33] = master_pk_bytes.as_ref().try_into().map_err(|_| {
-            InvalidInputs(format!(
-                "hashi_btc_master_pubkey must be 33 bytes (compressed), got {}",
-                master_pk_bytes.len()
-            ))
-        })?;
-        let hashi_btc_master_pubkey = HashiMasterG::from_byte_array(&master_pk_bytes_arr)
-            .map_err(|e| InvalidInputs(format!("invalid hashi_btc_master_pubkey: {e:?}")))?;
-
         let deployment = config_pb
             .deployment
             .ok_or_else(|| missing("deployment"))?
             .try_into()?;
 
-        let hashi_object_id_bytes = config_pb
-            .hashi_object_id
-            .ok_or_else(|| missing("hashi_object_id"))?;
-        let hashi_object_id_arr: [u8; 32] =
-            hashi_object_id_bytes.as_ref().try_into().map_err(|_| {
-                InvalidInputs(format!(
-                    "hashi_object_id must be 32 bytes, got {}",
-                    hashi_object_id_bytes.len()
-                ))
-            })?;
-        let hashi_object_id = sui_sdk_types::Address::new(hashi_object_id_arr);
+        Ok(InitConfig::new(limiter_config, deployment))
+    }
+}
 
-        Ok(InitConfig::new(
-            limiter_config,
-            hashi_btc_master_pubkey,
-            deployment,
-            hashi_object_id,
+impl TryFrom<pb::GetGuardianInfoResponse> for GuardianResponse<GuardianInfo> {
+    type Error = GuardianError;
+
+    fn try_from(resp: pb::GetGuardianInfoResponse) -> Result<Self, Self::Error> {
+        Ok(GuardianResponse::new(
+            resp.info.ok_or_else(|| missing("info"))?.try_into()?,
+            resp.timestamp_ms.ok_or_else(|| missing("timestamp_ms"))?,
         ))
     }
 }
 
-impl TryFrom<pb::GetGuardianInfoResponse> for GetGuardianInfoResponse {
+impl TryFrom<pb::GetAttestedGuardianInfoResponse> for AttestedGuardianInfo {
     type Error = GuardianError;
 
-    fn try_from(resp: pb::GetGuardianInfoResponse) -> Result<Self, Self::Error> {
-        let attestation = resp.attestation.ok_or_else(|| missing("attestation"))?;
-
-        let signing_pub_key_bytes = resp
-            .signing_pub_key
-            .ok_or_else(|| missing("signing_pub_key"))?;
-        let signing_pub_key = GuardianPubKey::try_from(signing_pub_key_bytes.as_ref())
-            .map_err(|e| InvalidInputs(format!("invalid signing_pub_key: {e}")))?;
-
+    fn try_from(resp: pb::GetAttestedGuardianInfoResponse) -> Result<Self, Self::Error> {
         let signed_info_pb = resp.signed_info.ok_or_else(|| missing("signed_info"))?;
         let signed_info = GuardianSignedResponse::<GuardianInfo>::try_from(signed_info_pb)?;
 
-        Ok(GetGuardianInfoResponse::new(
-            NitroAttestation::new(attestation.to_vec()),
-            signing_pub_key,
+        Ok(AttestedGuardianInfo::new(
+            NitroAttestation::new(
+                resp.attestation
+                    .ok_or_else(|| missing("attestation"))?
+                    .to_vec(),
+            ),
             signed_info,
         ))
     }
@@ -915,12 +891,10 @@ impl From<KpSigned<ProvisionerRotateCertRequest>> for pb::SignedProvisionerRotat
 
 // Throws an error if network is invalid.
 pub fn init_config_to_pb(s: InitConfig) -> GuardianResult<pb::InitConfig> {
-    let (limiter_config, hashi_btc_master_pubkey, deployment, hashi_object_id) = s.into_parts();
+    let (limiter_config, deployment) = s.into_parts();
     Ok(pb::InitConfig {
         limiter_config: Some(limiter_config_to_pb(limiter_config)),
-        hashi_btc_master_pubkey: Some(hashi_btc_master_pubkey.to_byte_array().to_vec().into()),
         deployment: Some(deployment_config_to_pb(deployment)?),
-        hashi_object_id: Some(hashi_object_id.into_inner().to_vec().into()),
     })
 }
 
@@ -1040,10 +1014,20 @@ impl From<KpSigned<ProvisionerRotateKpSetRequest>> for pb::SignedProvisionerRota
     }
 }
 
-pub fn get_guardian_info_response_to_pb(r: GetGuardianInfoResponse) -> pb::GetGuardianInfoResponse {
+pub fn get_guardian_info_response_to_pb(
+    r: GuardianResponse<GuardianInfo>,
+) -> pb::GetGuardianInfoResponse {
     pb::GetGuardianInfoResponse {
+        info: Some(guardian_info_data_to_pb(r.response)),
+        timestamp_ms: Some(r.timestamp_ms),
+    }
+}
+
+pub fn get_attested_guardian_info_response_to_pb(
+    r: AttestedGuardianInfo,
+) -> pb::GetAttestedGuardianInfoResponse {
+    pb::GetAttestedGuardianInfoResponse {
         attestation: Some(r.attestation.into_bytes().into()),
-        signing_pub_key: Some(r.signing_pub_key.to_bytes().to_vec().into()),
         signed_info: Some(signed_guardian_info_to_pb(r.signed_info)),
     }
 }
@@ -1151,7 +1135,6 @@ impl TryFrom<i32> for CeremonyStage {
 
     fn try_from(stage: i32) -> Result<Self, Self::Error> {
         match pb::CeremonyStage::try_from(stage) {
-            Ok(pb::CeremonyStage::Uninitialized) => Ok(Self::Uninitialized),
             Ok(pb::CeremonyStage::OperatorInitialized) => Ok(Self::OperatorInitialized),
             Ok(pb::CeremonyStage::AwaitingKeyProvisionerConfirmations) => {
                 Ok(Self::AwaitingKeyProvisionerConfirmations)
@@ -1166,7 +1149,6 @@ impl TryFrom<i32> for CeremonyStage {
 
 fn ceremony_stage_to_pb(stage: CeremonyStage) -> i32 {
     match stage {
-        CeremonyStage::Uninitialized => pb::CeremonyStage::Uninitialized as i32,
         CeremonyStage::OperatorInitialized => pb::CeremonyStage::OperatorInitialized as i32,
         CeremonyStage::AwaitingKeyProvisionerConfirmations => {
             pb::CeremonyStage::AwaitingKeyProvisionerConfirmations as i32
@@ -1180,7 +1162,6 @@ impl TryFrom<i32> for WithdrawStage {
 
     fn try_from(stage: i32) -> Result<Self, Self::Error> {
         match pb::WithdrawStage::try_from(stage) {
-            Ok(pb::WithdrawStage::Uninitialized) => Ok(Self::Uninitialized),
             Ok(pb::WithdrawStage::OperatorInitialized) => Ok(Self::OperatorInitialized),
             Ok(pb::WithdrawStage::ProvisionerInitialized) => Ok(Self::ProvisionerInitialized),
             Ok(pb::WithdrawStage::Activated) => Ok(Self::Activated),
@@ -1193,7 +1174,6 @@ impl TryFrom<i32> for WithdrawStage {
 
 fn withdraw_stage_to_pb(stage: WithdrawStage) -> i32 {
     match stage {
-        WithdrawStage::Uninitialized => pb::WithdrawStage::Uninitialized as i32,
         WithdrawStage::OperatorInitialized => pb::WithdrawStage::OperatorInitialized as i32,
         WithdrawStage::ProvisionerInitialized => pb::WithdrawStage::ProvisionerInitialized as i32,
         WithdrawStage::Activated => pb::WithdrawStage::Activated as i32,
@@ -1204,12 +1184,18 @@ impl TryFrom<pb::GuardianInfoData> for GuardianInfo {
     type Error = GuardianError;
 
     fn try_from(data: pb::GuardianInfoData) -> Result<Self, Self::Error> {
-        let lifecycle = match data.lifecycle.ok_or_else(|| missing("lifecycle"))? {
-            pb::guardian_info_data::Lifecycle::Ceremony(stage) => {
-                EnclaveLifecycle::Ceremony(CeremonyStage::try_from(stage)?)
+        let signing_pub_key_bytes = data
+            .signing_pub_key
+            .ok_or_else(|| missing("signing_pub_key"))?;
+        let signing_pub_key = GuardianPubKey::try_from(signing_pub_key_bytes.as_ref())
+            .map_err(|e| InvalidInputs(format!("invalid signing_pub_key: {e}")))?;
+        let lifecycle = match data.lifecycle {
+            None => None,
+            Some(pb::guardian_info_data::Lifecycle::Ceremony(stage)) => {
+                Some(EnclaveLifecycle::Ceremony(CeremonyStage::try_from(stage)?))
             }
-            pb::guardian_info_data::Lifecycle::Withdraw(stage) => {
-                EnclaveLifecycle::Withdraw(WithdrawStage::try_from(stage)?)
+            Some(pb::guardian_info_data::Lifecycle::Withdraw(stage)) => {
+                Some(EnclaveLifecycle::Withdraw(WithdrawStage::try_from(stage)?))
             }
         };
         let secret_sharing_instance = data
@@ -1275,6 +1261,7 @@ impl TryFrom<pb::GuardianInfoData> for GuardianInfo {
             .transpose()?;
 
         Ok(Self {
+            signing_pub_key,
             lifecycle,
             secret_sharing_instance,
             deployment_info,
@@ -1292,16 +1279,17 @@ impl TryFrom<pb::GuardianInfoData> for GuardianInfo {
 }
 
 fn guardian_info_data_to_pb(info: GuardianInfo) -> pb::GuardianInfoData {
-    let lifecycle = match info.lifecycle {
+    let lifecycle = info.lifecycle.map(|lifecycle| match lifecycle {
         EnclaveLifecycle::Ceremony(stage) => {
             pb::guardian_info_data::Lifecycle::Ceremony(ceremony_stage_to_pb(stage))
         }
         EnclaveLifecycle::Withdraw(stage) => {
             pb::guardian_info_data::Lifecycle::Withdraw(withdraw_stage_to_pb(stage))
         }
-    };
+    });
     pb::GuardianInfoData {
-        lifecycle: Some(lifecycle),
+        signing_pub_key: Some(info.signing_pub_key.to_bytes().to_vec().into()),
+        lifecycle,
         secret_sharing_instance: info
             .secret_sharing_instance
             .as_ref()
@@ -1608,11 +1596,18 @@ impl TryFrom<pb::CommitteeMember> for crate::move_types::CommitteeMember {
 
         let weight = m.weight.ok_or_else(|| missing("weight"))?;
 
+        // Carried verbatim as BCS bytes, like the committee's config, so the
+        // member's signed bytes survive the wire without reconstruction.
+        let extra_fields_bytes = m.extra_fields.ok_or_else(|| missing("extra_fields"))?;
+        let extra_fields: Config = bcs::from_bytes(&extra_fields_bytes)
+            .map_err(|e| InvalidInputs(format!("invalid extra_fields: {e}")))?;
+
         Ok(Self {
             validator_address,
             public_key: public_key.to_vec(),
             encryption_public_key: encryption_public_key.to_vec(),
             weight,
+            extra_fields,
         })
     }
 }
@@ -1815,6 +1810,11 @@ fn move_committee_to_pb(c: &crate::move_types::Committee) -> pb::Committee {
                 public_key: Some(m.public_key.clone().into()),
                 encryption_public_key: Some(m.encryption_public_key.clone().into()),
                 weight: Some(m.weight),
+                extra_fields: Some(
+                    bcs::to_bytes(&m.extra_fields)
+                        .expect("Config serializes")
+                        .into(),
+                ),
             })
             .collect(),
         total_weight: Some(c.total_weight),
@@ -1882,19 +1882,39 @@ mod tests {
 
     #[test]
     fn get_guardian_info_response_round_trip() {
-        let resp = GetGuardianInfoResponse::mock_for_testing();
+        let resp = GuardianResponse::new(GuardianInfo::mock_for_testing(), 1234);
         let pb = get_guardian_info_response_to_pb(resp.clone());
-        let back = GetGuardianInfoResponse::try_from(pb).unwrap();
-        assert_eq!(resp, back);
+        assert_eq!(
+            GuardianResponse::<GuardianInfo>::try_from(pb).unwrap(),
+            resp
+        );
+    }
+
+    #[test]
+    fn get_attested_guardian_info_response_round_trip() {
+        let resp = AttestedGuardianInfo::mock_for_testing();
+        let pb = get_attested_guardian_info_response_to_pb(resp.clone());
+        assert_eq!(AttestedGuardianInfo::try_from(pb).unwrap(), resp);
+    }
+
+    #[test]
+    fn get_attested_guardian_info_requires_attestation() {
+        let mut pb =
+            get_attested_guardian_info_response_to_pb(AttestedGuardianInfo::mock_for_testing());
+        pb.attestation = None;
+        assert!(AttestedGuardianInfo::try_from(pb).is_err());
     }
 
     #[test]
     fn guardian_info_data_with_enclave_btc_pubkey_round_trip() {
-        use crate::bitcoin::create_btc_keypair_for_test;
-        let kp = create_btc_keypair_for_test(&[7u8; 32]);
+        use crate::bitcoin::BTC_LIB;
+        use crate::bitcoin::BitcoinKeypair;
+        let kp =
+            BitcoinKeypair::from_seckey_slice(&BTC_LIB, &[7u8; 32]).expect("valid test secret key");
         let pk = kp.x_only_public_key().0;
 
         let info = GuardianInfo {
+            signing_pub_key: GuardianInfo::mock_for_testing().signing_pub_key,
             lifecycle: WithdrawStage::ProvisionerInitialized.into(),
             hashi_object_id: None,
             secret_sharing_instance: None,
@@ -1937,6 +1957,14 @@ mod tests {
         let round_trip =
             GuardianSignedResponse::<ProvisionerRotateCertResponse>::try_from(pb).unwrap();
         assert_eq!(response, round_trip);
+    }
+
+    #[test]
+    fn init_config_round_trip_preserves_digest() {
+        let config = InitConfig::mock_for_testing();
+        let decoded = InitConfig::try_from(init_config_to_pb(config.clone()).unwrap()).unwrap();
+        assert_eq!(config, decoded);
+        assert_eq!(config.digest(), decoded.digest());
     }
 
     #[test]
@@ -2119,6 +2147,7 @@ mod tests {
                 public_key: sk.public_key().as_ref().to_vec(),
                 encryption_public_key: junk_key.clone(),
                 weight: 10,
+                extra_fields: crate::move_types::Config::from_entries(vec![]),
             }],
             total_weight: 10,
             config: crate::move_types::Config::from_entries(vec![]),
@@ -2133,6 +2162,68 @@ mod tests {
         assert_eq!(
             back.new_committee.members[0].encryption_public_key,
             junk_key
+        );
+    }
+
+    /// A one-member committee whose member carries `extra_fields`.
+    fn committee_with_member_extra_fields(
+        extra_fields: crate::move_types::Config,
+    ) -> crate::move_types::Committee {
+        crate::move_types::Committee {
+            epoch: 6,
+            members: vec![crate::move_types::CommitteeMember {
+                validator_address: sui_sdk_types::Address::new([7u8; 32]),
+                public_key: vec![0x11; 96],
+                encryption_public_key: vec![0x22; 32],
+                weight: 10,
+                extra_fields,
+            }],
+            total_weight: 10,
+            config: crate::move_types::Config::from_entries(vec![]),
+        }
+    }
+
+    /// The member extension slot is empty on chain today, but once a future
+    /// upgrade populates it the guardian must still verify transition certs
+    /// over the exact bytes the members signed, so a populated slot has to
+    /// cross the wire verbatim rather than be dropped or rebuilt.
+    #[test]
+    fn committee_transition_carries_member_extra_fields_verbatim() {
+        let extra_fields = crate::move_types::Config::from_entries(vec![(
+            "future_member_key".to_string(),
+            crate::move_types::ConfigValue::Bytes(vec![0xAB; 33]),
+        )]);
+        let transition = CommitteeTransitionRequest {
+            new_committee: committee_with_member_extra_fields(extra_fields),
+        };
+
+        let pb = committee_transition_to_pb(&transition);
+        let back = CommitteeTransitionRequest::try_from(pb).expect("verbatim decode");
+        assert_eq!(back, transition);
+        assert_eq!(
+            bcs::to_bytes(&back).expect("serialize"),
+            bcs::to_bytes(&transition).expect("serialize"),
+        );
+    }
+
+    /// An absent slot is not the same as an empty one: substituting a default
+    /// would make the guardian verify over bytes nobody signed if the slot
+    /// were populated, so the decode refuses instead.
+    #[test]
+    fn committee_member_without_extra_fields_is_rejected() {
+        let mut pb = committee_transition_to_pb(&CommitteeTransitionRequest {
+            new_committee: committee_with_member_extra_fields(crate::move_types::Config::default()),
+        });
+        pb.new_committee
+            .as_mut()
+            .expect("committee present")
+            .members[0]
+            .extra_fields = None;
+
+        let err = CommitteeTransitionRequest::try_from(pb).expect_err("missing extra_fields");
+        assert!(
+            matches!(&err, InvalidInputs(msg) if msg == "missing extra_fields"),
+            "{err:?}"
         );
     }
 }

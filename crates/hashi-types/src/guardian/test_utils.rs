@@ -1,22 +1,17 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(any(test, feature = "test-utils"))]
 pub use super::crypto::encryption::attested_test_utils::dev_kp_attestations;
-#[cfg(any(test, feature = "test-utils"))]
 pub use super::crypto::encryption::attested_test_utils::mock_attested_kp_certs;
-#[cfg(any(test, feature = "test-utils"))]
 pub use super::crypto::encryption::attested_test_utils::mock_attested_kp_keypair;
 
+use super::AttestedGuardianInfo;
 use super::AttestedKpCert;
-#[cfg(any(test, feature = "test-utils"))]
 use super::BatchProvisionerInitRequest;
-#[cfg(any(test, feature = "test-utils"))]
 use super::BatchProvisionerRotateKpSetRequest;
 use super::BuildPcrs;
 use super::Ciphertext;
 use super::GenesisState;
-use super::GetGuardianInfoResponse;
 use super::GuardianEncryptedShare;
 use super::GuardianInfo;
 use super::GuardianResponse;
@@ -26,11 +21,9 @@ use super::HashiCommittee;
 use super::HashiCommitteeMember;
 use super::HashiSigned;
 use super::InitConfig;
-#[cfg(any(test, feature = "test-utils"))]
 use super::KpCertRoster;
 use super::KpEncryptedShare;
 use super::KpEncryptedShareRoster;
-#[cfg(any(test, feature = "test-utils"))]
 use super::KpSigned;
 use super::LimiterConfig;
 use super::NitroAttestation;
@@ -39,14 +32,12 @@ use super::PcrAllowlist;
 use super::ProvisionerInitRequest;
 use super::ProvisionerRotateCertRequest;
 use super::ProvisionerRotateCertResponse;
-#[cfg(any(test, feature = "test-utils"))]
 use super::ProvisionerRotateKpSetRequest;
 use super::RotateKpSetResponse;
 use super::S3BucketInfo;
 use super::S3Credentials;
 use super::SecretSharingInstance;
 use super::SessionID;
-#[cfg(any(test, feature = "test-utils"))]
 use super::SetupNewKeyRequest;
 use super::SetupNewKeyResponse;
 use super::ShareCommitment;
@@ -55,6 +46,7 @@ use super::StandardWithdrawalRequest;
 use super::StandardWithdrawalResponse;
 use super::WithdrawStage;
 use super::WithdrawalID;
+use super::crypto::attestation::NITRO_PCR0_LEN;
 
 use crate::bitcoin::BTC_LIB;
 use crate::bitcoin::BitcoinAddress;
@@ -63,9 +55,6 @@ use crate::bitcoin::HashiMasterG;
 use crate::bitcoin::InputUTXO;
 use crate::bitcoin::OutputUTXOWire;
 use crate::bitcoin::TxUTXOs;
-use crate::bitcoin::create_btc_keypair_for_test;
-use crate::bitcoin::hashi_master_g_from_btc_xonly_for_test;
-use crate::bitcoin::sign_btc_tx;
 use crate::committee::Bls12381PrivateKey;
 use crate::committee::BlsSignatureAggregator;
 use crate::committee::EncryptionPrivateKey;
@@ -103,6 +92,7 @@ const TEST_HASHI_BLS_SK_BYTES: [u8; Bls12381PrivateKey::LENGTH] = [9u8; Bls12381
 impl GuardianInfo {
     pub fn mock_for_testing() -> Self {
         Self {
+            signing_pub_key: ed25519_consensus::SigningKey::from([1u8; 32]).verification_key(),
             lifecycle: WithdrawStage::OperatorInitialized.into(),
             secret_sharing_instance: None,
             deployment_info: Some(
@@ -128,14 +118,32 @@ impl GuardianInfo {
     }
 }
 
-impl GetGuardianInfoResponse {
+impl super::OperatorInitInfo {
+    pub fn mock_for_testing() -> Self {
+        let config = InitConfig::mock_for_testing();
+        let (_, hashi_object_id, mpc_master_g) = GenesisState::mock_for_testing().into_parts();
+        Self {
+            deployment: config.deployment().clone(),
+            encryption_pubkey: vec![0u8; 32],
+            mode: super::OperatorInitMode::Withdraw(Box::new(super::WithdrawOperatorInitInfo {
+                secret_sharing_instance: SetupNewKeyResponse::mock_for_testing()
+                    .secret_sharing_instance,
+                config_hash: [2; 32],
+                limiter_config: *config.limiter_config(),
+                hashi_object_id,
+                mpc_master_g,
+                genesis_state_hash: None,
+            })),
+        }
+    }
+}
+
+impl AttestedGuardianInfo {
     pub fn mock_for_testing() -> Self {
         let signing_key = ed25519_consensus::SigningKey::from([1u8; 32]);
-        let signing_pub_key = signing_key.verification_key();
 
-        GetGuardianInfoResponse::new(
+        AttestedGuardianInfo::new(
             NitroAttestation::new("abcd".as_bytes().to_vec()),
-            signing_pub_key,
             GuardianSigned::sign(
                 GuardianResponse::new(GuardianInfo::mock_for_testing(), 1234),
                 &signing_key,
@@ -144,14 +152,12 @@ impl GetGuardianInfoResponse {
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 impl SetupNewKeyRequest {
     pub fn mock_for_testing() -> Self {
         SetupNewKeyRequest::new(mock_kp_certs_roster(TEST_N), TEST_N, TEST_T).unwrap()
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 pub fn mock_kp_certs_roster(n: usize) -> KpCertRoster {
     KpCertRoster::new(mock_attested_kp_certs(n)).unwrap()
 }
@@ -246,7 +252,7 @@ impl GuardianSignedResponse<ProvisionerRotateCertResponse> {
 
 impl OperatorInitRequest {
     pub fn mock_for_testing() -> Self {
-        let config = InitConfig::mock_for_testing(None);
+        let config = InitConfig::mock_for_testing();
         OperatorInitRequest::new_withdraw_mode(
             S3Credentials::mock_for_testing(),
             config,
@@ -257,11 +263,13 @@ impl OperatorInitRequest {
 
 impl GenesisState {
     pub fn mock_for_testing() -> Self {
-        let config = InitConfig::mock_for_testing(None);
-        Self::new(
-            mock_committee_with_one_member(0),
-            config.hashi_object_id(),
-            config.hashi_btc_master_pubkey(),
+        let kp =
+            BitcoinKeypair::from_seckey_slice(&BTC_LIB, &[1u8; 32]).expect("valid test secret key");
+        Self::from_parts(
+            (&mock_committee_with_one_member(0)).into(),
+            TEST_HASHI_OBJECT_ID,
+            HashiMasterG::with_even_y_from_x_be_bytes(&kp.x_only_public_key().0.serialize())
+                .expect("valid x-only public key"),
         )
     }
 }
@@ -279,7 +287,6 @@ impl ProvisionerInitRequest {
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 impl BatchProvisionerInitRequest {
     // NOTE: Incorrect encryption is used. Fix later if needed.
     pub fn mock_for_testing() -> Self {
@@ -292,7 +299,6 @@ impl BatchProvisionerInitRequest {
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 impl BatchProvisionerRotateKpSetRequest {
     // NOTE: Incorrect encryption and signature are used. This is only for wire round trips.
     pub fn mock_for_testing() -> Self {
@@ -369,55 +375,38 @@ fn mock_committee_with_one_member(epoch: u64) -> HashiCommittee {
 }
 
 impl InitConfig {
-    pub fn from_parts_for_testing(
-        limiter_config: LimiterConfig,
-        hashi_btc_master_pubkey: HashiMasterG,
-        network: super::Network,
-        hashi_object_id: SuiAddress,
-    ) -> Self {
+    pub fn from_parts_for_testing(limiter_config: LimiterConfig, network: super::Network) -> Self {
         InitConfig::new(
             limiter_config,
-            hashi_btc_master_pubkey,
             crate::guardian::DeploymentConfig {
                 pcr_allowlist: mock_pcr_allowlist(),
                 bucket_info: S3BucketInfo::mock_for_testing(),
                 retention_environment: super::S3RetentionEnvironment::Testnet,
                 bitcoin_network: network,
             },
-            hashi_object_id,
         )
     }
 
-    pub fn mock_for_testing(kp: Option<BitcoinKeypair>) -> Self {
-        let kp = kp.unwrap_or(create_btc_keypair_for_test(&[1u8; 32]));
-        let max_capacity = 1000;
-
-        // Convert the bitcoin-lib keypair's x-only pubkey to a raw `G` point.
-        // The bitcoin Keypair always signs against its even-y projection, so
-        // Building `G` from the x-only bytes with even-y gives the parent that
-        // matches what the keypair signs against.
-        let hashi_btc_master_pubkey =
-            hashi_master_g_from_btc_xonly_for_test(&kp.x_only_public_key().0);
-
-        InitConfig::new(
+    pub fn mock_for_testing() -> Self {
+        Self::from_parts_for_testing(
             LimiterConfig {
                 refill_rate: 10,
-                max_bucket_capacity: max_capacity,
+                max_bucket_capacity: 1000,
             },
-            hashi_btc_master_pubkey,
-            crate::guardian::DeploymentConfig {
-                pcr_allowlist: mock_pcr_allowlist(),
-                bucket_info: S3BucketInfo::mock_for_testing(),
-                retention_environment: super::S3RetentionEnvironment::Testnet,
-                bitcoin_network: super::Network::Regtest,
-            },
-            TEST_HASHI_OBJECT_ID,
+            super::Network::Regtest,
         )
     }
 }
 
+impl BuildPcrs {
+    /// Dummy PCR pins for tests; `pcr0_byte` must be nonzero.
+    pub fn mock_for_testing(git_revision: &str, pcr0_byte: u8) -> Self {
+        Self::new(git_revision, vec![pcr0_byte; NITRO_PCR0_LEN]).expect("valid mock PCR pins")
+    }
+}
+
 fn mock_pcr_allowlist() -> PcrAllowlist {
-    PcrAllowlist::new(BuildPcrs::new("unknown", vec![0]), []).expect("valid PCR allowlist")
+    PcrAllowlist::new(BuildPcrs::mock_for_testing("unknown", 1), []).expect("valid PCR allowlist")
 }
 
 /// A throwaway secret-sharing instance for tests that don't exercise share verification.
@@ -427,7 +416,8 @@ fn dummy_secret_sharing_instance() -> SecretSharingInstance {
 
 impl StandardWithdrawalRequest {
     fn mock_for_testing(network: Network, wid: WithdrawalID) -> Self {
-        let kp = create_btc_keypair_for_test(&[2u8; 32]);
+        let kp =
+            BitcoinKeypair::from_seckey_slice(&BTC_LIB, &[2u8; 32]).expect("valid test secret key");
         let (internal_key, _) = UntweakedPublicKey::from_keypair(&kp);
         let addr_unchecked =
             BitcoinAddress::p2tr(&BTC_LIB, internal_key, None, network).into_unchecked();
@@ -515,9 +505,14 @@ impl StandardWithdrawalRequest {
 
 impl StandardWithdrawalResponse {
     pub fn mock_for_testing() -> Self {
-        let kp = create_btc_keypair_for_test(&[3u8; 32]);
+        let kp =
+            BitcoinKeypair::from_seckey_slice(&BTC_LIB, &[3u8; 32]).expect("valid test secret key");
         let msg = Message::from_digest([5u8; 32]);
-        let enclave_signatures = sign_btc_tx(&[msg], &kp);
+        // Keep the checked-in S3 fixtures deterministic.
+        let enclave_signatures = vec![bitcoin::taproot::Signature {
+            signature: BTC_LIB.sign_schnorr_no_aux_rand(&msg, &kp),
+            sighash_type: bitcoin::TapSighashType::Default,
+        }];
         Self { enclave_signatures }
     }
 }

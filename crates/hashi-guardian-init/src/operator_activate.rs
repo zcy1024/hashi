@@ -11,12 +11,15 @@ use hashi_guardian::OTHER_SESSION_QUIET_PERIOD;
 use hashi_guardian::S3_WRITE_ATTEMPT_TIMEOUT;
 use hashi_guardian::s3_reader::GuardianReader;
 use hashi_types::guardian::ActivationState;
+use hashi_types::guardian::EnclaveLifecycle;
 use hashi_types::guardian::GuardianError;
 use hashi_types::guardian::GuardianInfo;
 use hashi_types::guardian::GuardianResult;
-use hashi_types::guardian::HashiCommittee;
 use hashi_types::guardian::InitConfig;
 use hashi_types::guardian::OperatorActivateRequest;
+use hashi_types::guardian::OperatorInitInfo;
+use hashi_types::guardian::OperatorInitMode;
+use hashi_types::guardian::RuntimeCommittee;
 use hashi_types::guardian::VerifiedGuardianInfo;
 use hashi_types::guardian::WithdrawStage;
 use hashi_types::guardian::proto_conversions::operator_activate_request_to_pb;
@@ -76,19 +79,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     info!(phase = "s3 connect", "connected to guardian log bucket");
 
     info!(
-        phase = "sui connect",
-        sui_rpc = %cfg.hashi.sui_rpc,
-        package_id = %cfg.hashi.hashi_ids.package_id,
-        hashi_object_id = %cfg.hashi.hashi_ids.hashi_object_id,
-        "connecting to Sui RPC for Hashi on-chain state",
-    );
-    let onchain_state = cfg.hashi.onchain_state().await?;
-    info!(phase = "sui connect", "connected to Sui RPC");
-
-    let master_g = onchain_state.onchain_verifying_key_g()?;
-    info!(phase = "setup", master_g = ?master_g, "fetched on-chain MPC master G");
-
-    info!(
         phase = "guardian connect",
         endpoint = %cfg.guardian_endpoint,
         "connecting to withdraw-mode guardian",
@@ -103,10 +93,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         "fetching + verifying provisioned standby GuardianInfo"
     );
     let preflight = verified_live_guardian_info(&mut client, allowlist.current_build()).await?;
-    let session_id = preflight.session_id.clone();
-    let signing_pub_key = preflight.signing_pub_key;
-    let pre_info = preflight.info.clone();
-    let standby = verify_provisioned_standby_info(&pre_info, &cfg, &master_g)?;
+    let session_id = preflight.session_id();
+    let signing_pub_key = preflight.info().signing_pub_key;
+    let pre_info = preflight.info().clone();
+    let standby = verify_provisioned_standby_info(&pre_info, &cfg)?;
     info!(
         phase = "guardian preflight",
         session_id = %session_id,
@@ -151,8 +141,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .await?
         .context("no committee-update or genesis record found")?;
     let committee_epoch = move_committee.epoch;
-    let committee: HashiCommittee = move_committee
-        .try_into()
+    let committee = RuntimeCommittee::from_move_with_encryption_key_fallback(move_committee)
         .context("invalid serving committee")?;
     let limiter_state = reader
         .recover_limiter_state(standby.init_config.limiter_config())
@@ -293,7 +282,6 @@ struct StandbyChecks {
 fn verify_provisioned_standby_info(
     info: &GuardianInfo,
     cfg: &Config,
-    master_g: &hashi_types::bitcoin::HashiMasterG,
 ) -> anyhow::Result<StandbyChecks> {
     ensure!(
         info.lifecycle == WithdrawStage::ProvisionerInitialized.into(),
@@ -313,9 +301,6 @@ fn verify_provisioned_standby_info(
     let limiter_config = info
         .limiter_config
         .context("Guardian info missing limiter config")?;
-    let mpc_master_g = info
-        .mpc_master_g
-        .context("Guardian info missing MPC master G")?;
     ensure!(
         info.limiter_state.is_none(),
         "Guardian has limiter_state => operator activation already ran"
@@ -336,18 +321,7 @@ fn verify_provisioned_standby_info(
         cfg.limiter_config,
         limiter_config
     );
-    ensure!(
-        master_g == &mpc_master_g,
-        "Guardian MPC master G mismatch: expected {:?}, got {:?}",
-        master_g,
-        mpc_master_g
-    );
-    let init_config = InitConfig::new(
-        cfg.limiter_config,
-        *master_g,
-        cfg.deployment.clone(),
-        cfg.hashi.hashi_ids.hashi_object_id,
-    );
+    let init_config = InitConfig::new(cfg.limiter_config, cfg.deployment.clone());
     let expected_config_hash = init_config.digest();
     ensure!(
         expected_config_hash == config_hash,
@@ -365,56 +339,43 @@ fn verify_provisioned_standby_info(
 }
 
 fn verify_oi_info_matches_provisioned_standby(
-    oi_info: &GuardianInfo,
+    oi_info: &OperatorInitInfo,
     live_info: &GuardianInfo,
 ) -> anyhow::Result<()> {
+    let OperatorInitMode::Withdraw(withdraw) = &oi_info.mode else {
+        anyhow::bail!("OI record is not withdraw-mode initialization");
+    };
     ensure!(
-        oi_info.lifecycle == WithdrawStage::Uninitialized.into(),
-        "OI GuardianInfo has an unexpected lifecycle stage"
+        Some(oi_info.mode()) == live_info.lifecycle.map(EnclaveLifecycle::mode),
+        "OI enclave mode differs from live standby GuardianInfo"
     );
     ensure!(
-        oi_info.lifecycle.mode() == live_info.lifecycle.mode(),
-        "OI GuardianInfo enclave mode differs from live standby GuardianInfo"
+        Some(&withdraw.secret_sharing_instance) == live_info.secret_sharing_instance.as_ref(),
+        "OI record secret-sharing instance differs from live standby GuardianInfo"
     );
     ensure!(
-        oi_info.enclave_btc_pubkey.is_none(),
-        "OI GuardianInfo unexpectedly has a BTC pubkey"
-    );
-    ensure!(
-        oi_info.limiter_state.is_none(),
-        "OI GuardianInfo unexpectedly has limiter_state"
-    );
-    ensure!(
-        oi_info.current_committee_epoch.is_none(),
-        "OI GuardianInfo unexpectedly has current_committee_epoch"
-    );
-    ensure!(
-        oi_info.secret_sharing_instance == live_info.secret_sharing_instance,
-        "OI GuardianInfo secret-sharing instance differs from live standby GuardianInfo"
-    );
-    ensure!(
-        oi_info.deployment_info == live_info.deployment_info,
-        "OI GuardianInfo deployment differs from live standby GuardianInfo"
+        Some(&oi_info.deployment.summary()) == live_info.deployment_info.as_ref(),
+        "OI record deployment differs from live standby GuardianInfo"
     );
     ensure!(
         oi_info.encryption_pubkey == live_info.encryption_pubkey,
-        "OI GuardianInfo encryption pubkey differs from live standby GuardianInfo"
+        "OI record encryption pubkey differs from live standby GuardianInfo"
     );
     ensure!(
-        oi_info.config_hash == live_info.config_hash,
-        "OI GuardianInfo config_hash differs from live standby GuardianInfo"
+        Some(withdraw.config_hash) == live_info.config_hash,
+        "OI record config_hash differs from live standby GuardianInfo"
     );
     ensure!(
-        oi_info.genesis_state_hash == live_info.genesis_state_hash,
-        "OI GuardianInfo genesis_state_hash differs from live standby GuardianInfo"
+        withdraw.genesis_state_hash == live_info.genesis_state_hash,
+        "OI record genesis_state_hash differs from live standby GuardianInfo"
     );
     ensure!(
-        oi_info.limiter_config == live_info.limiter_config,
-        "OI GuardianInfo limiter config differs from live standby GuardianInfo"
+        Some(withdraw.limiter_config) == live_info.limiter_config,
+        "OI record limiter config differs from live standby GuardianInfo"
     );
     ensure!(
-        oi_info.mpc_master_g == live_info.mpc_master_g,
-        "OI GuardianInfo MPC master G differs from live standby GuardianInfo"
+        Some(withdraw.mpc_master_g) == live_info.mpc_master_g,
+        "OI record MPC master G differs from live standby GuardianInfo"
     );
     Ok(())
 }
@@ -428,34 +389,34 @@ fn verify_activated_info(
     expected_limiter_state: hashi_types::guardian::LimiterState,
 ) -> anyhow::Result<()> {
     ensure!(
-        post.session_id.as_str() == expected_session_id,
+        post.session_id().as_str() == expected_session_id,
         "guardian session changed during operator activation: started {}, now {}",
         expected_session_id,
-        post.session_id
+        post.session_id()
     );
     ensure!(
-        post.signing_pub_key == expected_signing_key,
+        post.info().signing_pub_key == expected_signing_key,
         "guardian signing key changed during operator activation"
     );
     ensure!(
-        post.info.lifecycle == WithdrawStage::Activated.into(),
+        post.info().lifecycle == WithdrawStage::Activated.into(),
         "guardian is not an activated withdraw enclave"
     );
     ensure!(
-        post.info.enclave_btc_pubkey == Some(expected_enclave_btc_pubkey),
+        post.info().enclave_btc_pubkey == Some(expected_enclave_btc_pubkey),
         "Guardian BTC pubkey changed during operator activation"
     );
     ensure!(
-        post.info.current_committee_epoch == Some(expected_committee_epoch),
+        post.info().current_committee_epoch == Some(expected_committee_epoch),
         "Guardian committee epoch mismatch: expected {}, got {:?}",
         expected_committee_epoch,
-        post.info.current_committee_epoch
+        post.info().current_committee_epoch
     );
     ensure!(
-        post.info.limiter_state == Some(expected_limiter_state),
+        post.info().limiter_state == Some(expected_limiter_state),
         "Guardian limiter state mismatch: expected {:?}, got {:?}",
         expected_limiter_state,
-        post.info.limiter_state
+        post.info().limiter_state
     );
     Ok(())
 }

@@ -87,6 +87,102 @@ public struct WithdrawalConfirmationMessage has copy, drop, store {
 
 // ~~~~~~~ Entry Functions ~~~~~~~
 
+/// Request a withdrawal of BTC from the bridge.
+///
+/// The full BTC amount is stored in the withdrawal request. The miner
+/// fee is deducted later at commitment time.
+///
+/// The user must provide at least `bitcoin_withdrawal_minimum()` sats,
+/// which guarantees the amount covers worst-case miner fees plus dust.
+///
+/// Private `entry` rather than `public` so the signature stays upgradeable;
+/// a `public` signature is frozen at publish. Only other Move packages lose
+/// access, and they gain nothing over a direct PTB call: the request is
+/// owned by the transaction sender, never by a calling package. A PTB can
+/// still feed in a `Balance<BTC>` produced by earlier commands (e.g.
+/// `balance::redeem_funds` or a swap), since `Balance` has `store` and is
+/// therefore never a hot argument under the private-entry rules.
+entry fun request_withdrawal(
+    hashi: &mut Hashi,
+    clock: &Clock,
+    btc: Balance<BTC>,
+    bitcoin_address: vector<u8>,
+    ctx: &mut TxContext,
+) {
+    hashi.versioning().assert_version_enabled();
+    hashi.assert_unpaused();
+
+    assert!(btc.value() >= hashi.config().bitcoin_withdrawal_minimum(), EBelowMinimumWithdrawal);
+
+    // Only P2WPKH (20 bytes) and P2TR (32 bytes) witness programs are supported.
+    let addr_len = bitcoin_address.length();
+    assert!(addr_len == 20 || addr_len == 32, EInvalidBitcoinAddress);
+
+    // Create the withdrawal request.
+    let request = hashi::withdrawal_queue::create_withdrawal(
+        btc,
+        bitcoin_address,
+        clock,
+        ctx,
+    );
+    let request_id = request.request_id().to_address();
+    hashi::withdrawal_queue::emit_withdrawal_requested(&request);
+
+    // Insert into the active requests bag.
+    hashi.bitcoin_mut().withdrawal_queue_mut().insert_withdrawal(request);
+
+    // Index by sender for client discovery.
+    hashi.bitcoin_mut().index_user_request(ctx.sender(), request_id, ctx);
+}
+
+/// Cancel a pending withdrawal request and return the stored BTC to the requester.
+///
+/// Cancellation is allowed while the request awaits approval or commitment.
+/// Once the committee commits the request to a `WithdrawalTransaction` its BTC
+/// is burned and the request is linked to that transaction — cancellation is
+/// no longer possible.
+///
+/// Private `entry` for the same reason as `request_withdrawal`. The refund is
+/// returned rather than sent so the PTB decides where it goes (e.g.
+/// `balance::send_funds` back to the sender, or into a new request); an
+/// `entry` function may return a value without `drop` as long as a later
+/// command consumes it.
+entry fun cancel_withdrawal(
+    hashi: &mut Hashi,
+    request_id: address,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): Balance<BTC> {
+    hashi.versioning().assert_version_enabled();
+
+    assert!(
+        !hashi.bitcoin().withdrawal_queue().is_request_processing(request_id),
+        ECannotCancelProcessingWithdrawal,
+    );
+
+    let request = hashi.bitcoin().withdrawal_queue().borrow_request(request_id);
+
+    // Only the original requester can cancel.
+    assert!(request.request_sender() == ctx.sender(), EUnauthorizedCancellation);
+
+    // Enforce cooldown.
+    let cooldown = hashi.config().withdrawal_cancellation_cooldown_ms();
+    assert!(
+        clock.timestamp_ms() >= request.request_created_timestamp_ms() + cooldown,
+        ECooldownNotElapsed,
+    );
+
+    hashi::withdrawal_queue::emit_withdrawal_cancelled(request);
+
+    // Return BTC to the requester.
+    let btc = hashi.bitcoin_mut().withdrawal_queue_mut().cancel_withdrawal(request_id);
+
+    // Clean up the user index.
+    hashi.bitcoin_mut().unindex_user_request(ctx.sender(), request_id);
+
+    btc
+}
+
 entry fun approve_request(
     hashi: &mut Hashi,
     request_id: address,
@@ -145,8 +241,7 @@ entry fun commit_withdrawal_tx(
     // Extract request data for fee validation (read-only, before the object exists).
     let request_infos = hashi.bitcoin().withdrawal_queue().extract_request_infos(&request_ids);
 
-    // Allocate presigs from core counter
-    let presig_start_index = hashi.allocate_presigs(inputs.length());
+    let presigs = hashi.allocate_presigs(inputs.length());
 
     let mut rng = sui::random::new_generator(r, ctx);
     let randomness = rng.generate_bytes(32);
@@ -159,7 +254,7 @@ entry fun commit_withdrawal_tx(
         inputs,
         outputs,
         txid,
-        presig_start_index,
+        presigs,
         epoch,
         hashi.config(),
         clock,
@@ -371,19 +466,27 @@ entry fun finish_archive_withdrawal_txns(hashi: &mut Hashi, withdrawal_ids: vect
 /// Gated like commit/finalize (version-enabled, unpaused, not-reconfiguring): an
 /// in-progress reconfiguration settles first, then this runs afterward to recover
 /// the now-stale batch. Carries no committee cert: it authorizes no signatures,
-/// only re-points pending presig indices, bounded to once-per-withdrawal-per-epoch
-/// by the `mpc_signing` stale-epoch guard.
-entry fun reallocate_presigs(hashi: &mut Hashi, withdrawal_id: address) {
+/// only re-points pending presig indices and redraws the withdrawal's randomness,
+/// bounded to once-per-withdrawal-per-epoch by the `mpc_signing` stale-epoch
+/// guard.
+entry fun reallocate_presigs(
+    hashi: &mut Hashi,
+    withdrawal_id: address,
+    r: &Random,
+    ctx: &mut TxContext,
+) {
     hashi.versioning().assert_version_enabled();
     hashi.assert_unpaused();
     hashi.assert_not_reconfiguring();
     let current_epoch = hashi.committee_set().epoch();
     let pending = hashi.bitcoin().withdrawal_queue().withdrawal_txn_pending_count(withdrawal_id);
-    let new_base = hashi.allocate_presigs(pending);
+    let presigs = hashi.allocate_presigs(pending);
+    let mut rng = sui::random::new_generator(r, ctx);
+    let randomness = rng.generate_bytes(32);
     hashi
         .bitcoin_mut()
         .withdrawal_queue_mut()
-        .reallocate_presigs_for_withdrawal_txn(withdrawal_id, new_base, current_epoch, pending);
+        .reallocate_presigs_for_withdrawal_txn(withdrawal_id, presigs, current_epoch, randomness);
 }
 
 /// Finalize the on-chain bookkeeping for spent UTXOs. Moves each UTXO's
@@ -398,90 +501,6 @@ entry fun cleanup_spent_utxos(hashi: &mut Hashi, utxo_ids: vector<UtxoId>) {
     utxo_ids.do!(|utxo_id| {
         hashi.bitcoin_mut().utxo_pool_mut().cleanup_spent(utxo_id);
     });
-}
-
-// ~~~~~~~ Public Functions ~~~~~~~
-
-/// Request a withdrawal of BTC from the bridge.
-///
-/// The full BTC amount is stored in the withdrawal request. The miner
-/// fee is deducted later at commitment time.
-///
-/// The user must provide at least `bitcoin_withdrawal_minimum()` sats,
-/// which guarantees the amount covers worst-case miner fees plus dust.
-public fun request_withdrawal(
-    hashi: &mut Hashi,
-    clock: &Clock,
-    btc: Balance<BTC>,
-    bitcoin_address: vector<u8>,
-    ctx: &mut TxContext,
-) {
-    hashi.versioning().assert_version_enabled();
-    hashi.assert_unpaused();
-
-    assert!(btc.value() >= hashi.config().bitcoin_withdrawal_minimum(), EBelowMinimumWithdrawal);
-
-    // Only P2WPKH (20 bytes) and P2TR (32 bytes) witness programs are supported.
-    let addr_len = bitcoin_address.length();
-    assert!(addr_len == 20 || addr_len == 32, EInvalidBitcoinAddress);
-
-    // Create the withdrawal request.
-    let request = hashi::withdrawal_queue::create_withdrawal(
-        btc,
-        bitcoin_address,
-        clock,
-        ctx,
-    );
-    let request_id = request.request_id().to_address();
-    hashi::withdrawal_queue::emit_withdrawal_requested(&request);
-
-    // Insert into the active requests bag.
-    hashi.bitcoin_mut().withdrawal_queue_mut().insert_withdrawal(request);
-
-    // Index by sender for client discovery.
-    hashi.bitcoin_mut().index_user_request(ctx.sender(), request_id, ctx);
-}
-
-/// Cancel a pending withdrawal request and return the stored BTC to the requester.
-///
-/// Cancellation is allowed while the request awaits approval or commitment.
-/// Once the committee commits the request to a `WithdrawalTransaction` its BTC
-/// is burned and the request is linked to that transaction — cancellation is
-/// no longer possible.
-public fun cancel_withdrawal(
-    hashi: &mut Hashi,
-    request_id: address,
-    clock: &Clock,
-    ctx: &mut TxContext,
-): Balance<BTC> {
-    hashi.versioning().assert_version_enabled();
-
-    assert!(
-        !hashi.bitcoin().withdrawal_queue().is_request_processing(request_id),
-        ECannotCancelProcessingWithdrawal,
-    );
-
-    let request = hashi.bitcoin().withdrawal_queue().borrow_request(request_id);
-
-    // Only the original requester can cancel.
-    assert!(request.request_sender() == ctx.sender(), EUnauthorizedCancellation);
-
-    // Enforce cooldown.
-    let cooldown = hashi.config().withdrawal_cancellation_cooldown_ms();
-    assert!(
-        clock.timestamp_ms() >= request.request_created_timestamp_ms() + cooldown,
-        ECooldownNotElapsed,
-    );
-
-    hashi::withdrawal_queue::emit_withdrawal_cancelled(request);
-
-    // Return BTC to the requester.
-    let btc = hashi.bitcoin_mut().withdrawal_queue_mut().cancel_withdrawal(request_id);
-
-    // Clean up the user index.
-    hashi.bitcoin_mut().unindex_user_request(ctx.sender(), request_id);
-
-    btc
 }
 
 // ~~~~~~~ Package Functions ~~~~~~~

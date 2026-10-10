@@ -5,7 +5,6 @@ use super::LeaderService;
 use super::parse_member_signature;
 use crate::Hashi;
 use crate::onchain::types::WithdrawalTransaction;
-use hashi_types::committee::BlsSignatureAggregator;
 use hashi_types::committee::CommitteeMember;
 use hashi_types::committee::MemberSignature;
 use hashi_types::committee::SignedMessage;
@@ -190,11 +189,8 @@ impl LeaderService {
             });
         }
 
-        let mut aggregator = BlsSignatureAggregator::new(
-            inner.config.hashi_ids().hashi_object_id,
-            &committee,
-            guardian_request,
-        );
+        let mut aggregator = committee
+            .signature_aggregator(inner.config.hashi_ids().hashi_object_id, guardian_request);
         while let Some(result) = sig_tasks.join_next().await {
             let Ok(Some(sig)) = result else { continue };
             if let Err(e) = aggregator.add_signature(sig) {
@@ -375,11 +371,8 @@ impl LeaderService {
             });
         }
 
-        let mut aggregator = BlsSignatureAggregator::new(
-            inner.config.hashi_ids().hashi_object_id,
-            &from_committee,
-            transition,
-        );
+        let mut aggregator = from_committee
+            .signature_aggregator(inner.config.hashi_ids().hashi_object_id, transition);
         while let Some(result) = sig_tasks.join_next().await {
             let Ok(Some(sig)) = result else { continue };
             if let Err(e) = aggregator.add_signature(sig) {
@@ -412,25 +405,13 @@ impl LeaderService {
         member: &CommitteeMember,
     ) -> Option<MemberSignature> {
         let validator_address = member.validator_address();
-        let mut rpc_client = inner
-            .onchain_state()
-            .bridge_service_client(&validator_address)
-            .or_else(|| {
-                error!(
-                    "Cannot find client for validator address: {:?}",
-                    validator_address
-                );
-                None
-            })?;
-        let response = rpc_client
-            .sign_committee_transition(proto_request)
-            .await
-            .inspect_err(|e| {
-                error!(
-                    "Failed to get committee transition signature from {validator_address}: {e}"
-                );
-            })
-            .ok()?;
+        let response = Self::call_peer_with_retry(
+            inner,
+            validator_address,
+            "committee transition signature",
+            move |mut client| async move { client.sign_committee_transition(proto_request).await },
+        )
+        .await?;
         response
             .into_inner()
             .member_signature

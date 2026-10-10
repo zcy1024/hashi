@@ -3,6 +3,8 @@
 
 use super::*;
 use crate::communication::ChannelResult;
+use crate::config::AllowedDealer;
+use crate::config::ComplaintResponsePolicy;
 use crate::metrics::Metrics;
 
 async fn run_nonce_generation_for_test(
@@ -11,7 +13,7 @@ async fn run_nonce_generation_for_test(
     p2p_channel: &impl P2PChannel,
     tob_channel: &mut impl OrderedBroadcastChannel<CertificateV1>,
     metrics: &Metrics,
-) -> MpcResult<Vec<batch_avss::ReceiverOutput>> {
+) -> MpcResult<Vec<batch_avss_avid::ReceiverOutput>> {
     MpcManager::run_nonce_dealer_phase(mpc_manager, batch_index, p2p_channel, tob_channel, metrics)
         .await;
     let admitted = admitted_from_tob(tob_channel, mpc_manager, batch_index, None).await;
@@ -288,6 +290,7 @@ impl TestSetup {
             None,
             TEST_BATCH_SIZE_PER_WEIGHT,
             None, // test_corrupt_shares_for
+            ComplaintResponsePolicy::AllowAll,
             &test_metrics(),
         )
         .unwrap()
@@ -305,7 +308,7 @@ impl TestSetup {
         )
     }
 
-    fn committee(&self) -> &Committee {
+    fn committee(&self) -> &RuntimeCommittee {
         self.committee_set.current_committee().unwrap()
     }
 
@@ -336,7 +339,7 @@ impl TestSetup {
 }
 
 fn create_test_certificate(
-    committee: &Committee,
+    committee: &RuntimeCommittee,
     dealer_messages: &Messages,
     dealer_address: Address,
     signatures: Vec<MemberSignature>,
@@ -346,7 +349,7 @@ fn create_test_certificate(
         dealer_address,
         messages_hash,
     };
-    let mut aggregator = BlsSignatureAggregator::new(TEST_HASHI_ID, committee, dkg_message);
+    let mut aggregator = committee.signature_aggregator(TEST_HASHI_ID, dkg_message);
     for signature in signatures {
         aggregator
             .add_signature(signature)
@@ -397,7 +400,7 @@ fn rotation_peer_signatures(
 }
 
 fn create_rotation_test_certificate(
-    committee: &Committee,
+    committee: &RuntimeCommittee,
     rotation_messages: &Messages,
     dealer_address: Address,
     signatures: Vec<MemberSignature>,
@@ -407,7 +410,7 @@ fn create_rotation_test_certificate(
         dealer_address,
         messages_hash,
     };
-    let mut aggregator = BlsSignatureAggregator::new(TEST_HASHI_ID, committee, rotation_message);
+    let mut aggregator = committee.signature_aggregator(TEST_HASHI_ID, rotation_message);
     for signature in signatures {
         aggregator
             .add_signature(signature)
@@ -1030,6 +1033,7 @@ fn test_mpc_manager_new_from_committee_set() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None, // test_corrupt_shares_for
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .expect("Should create manager from CommitteeSet");
@@ -1063,6 +1067,7 @@ fn test_mpc_manager_new_succeeds_for_non_member_without_identity() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .expect("non-member must construct rather than panic");
@@ -1090,6 +1095,7 @@ fn test_this_node_deals_nothing_only_for_a_non_member() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .expect("member must construct");
@@ -1109,6 +1115,7 @@ fn test_this_node_deals_nothing_only_for_a_non_member() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .expect("non-member must construct");
@@ -1149,6 +1156,7 @@ fn test_send_messages_entry_point_rejects_only_a_non_member() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .expect("non-member must construct");
@@ -1171,6 +1179,7 @@ fn test_send_messages_entry_point_rejects_only_a_non_member() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .expect("member must construct");
@@ -1228,6 +1237,7 @@ fn test_role_predicates_separate_a_departing_node_from_a_never_member() {
             None,
             TEST_BATCH_SIZE_PER_WEIGHT,
             None,
+            ComplaintResponsePolicy::AllowAll,
             &test_metrics(),
         )
         .expect("a non-member must construct")
@@ -1293,6 +1303,7 @@ fn test_mpc_manager_new_fails_if_no_committee_for_epoch() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None, // test_corrupt_shares_for
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     );
 
@@ -1326,6 +1337,7 @@ fn test_mpc_manager_new_fails_on_encryption_key_mismatch() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     );
 
@@ -1412,6 +1424,7 @@ fn test_mpc_manager_new_finds_input_committee_across_gap() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .expect("MpcManager::new should succeed across a committee gap");
@@ -1497,6 +1510,7 @@ fn test_epoch_lookups_reject_neither_current_nor_previous() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .expect("MpcManager::new should succeed across a committee gap");
@@ -1601,6 +1615,7 @@ fn test_mpc_manager_new_uses_explicit_epoch_not_committee_set_recompute() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .expect(
@@ -1627,7 +1642,6 @@ fn test_mpc_manager_new_with_weighted_committee() {
     // With total_weight=15:
     // max_faulty = floor(15*3333/10000) = floor(4.9995) = 4
     // threshold  = 15 - 2*4 = 7
-    // (after prop_reduce with allowed_delta=0, no reduction)
     assert_eq!(manager.mpc_config.threshold, 7);
     assert_eq!(manager.mpc_config.max_faulty, 4);
 }
@@ -3285,7 +3299,7 @@ fn create_weight_based_test_certificate(
 
     let config = setup.dkg_config();
     let committee = setup.committee();
-    let mut aggregator = BlsSignatureAggregator::new(TEST_HASHI_ID, committee, dkg_message.clone());
+    let mut aggregator = committee.signature_aggregator(TEST_HASHI_ID, dkg_message.clone());
 
     let dkg_required = config.threshold as u32 + config.max_faulty as u32;
     let mut weight_sum = 0u32;
@@ -3410,8 +3424,6 @@ async fn test_run_as_party_exact_weight_threshold() {
 
 #[tokio::test]
 async fn test_run_as_party_with_reduced_weights() {
-    // 104 (not 100): reduction at allowed_delta = 0 needs a divisor that divides the weights,
-    // `t` and `f` exactly. With w=104 -> f=138, t=140, all even, so d=2 is feasible.
     let weights = vec![104, 104, 104, 104];
     let test_setup = setup_weight_based_test(weights.clone(), 0, None); // threshold computed automatically
 
@@ -3429,7 +3441,7 @@ async fn test_run_as_party_with_reduced_weights() {
 
     assert_ne!(
         original_weight, reduced_weight,
-        "Test requires weights to be reduced by Nodes::prop_reduce. \
+        "Test requires weights to be reduced by Nodes::knapsack_reduce. \
              Original: {}, Reduced: {}. If equal, this test won't catch the bug.",
         original_weight, reduced_weight
     );
@@ -4446,6 +4458,170 @@ fn test_handle_complain_request_caches_response() {
     assert_eq!(party2_manager.complaint_responses.len(), 1);
 }
 
+#[test]
+#[tracing_test::traced_test]
+fn test_handle_complain_request_withholds_valid_complaint_outside_policy() {
+    let mut rng = rand::thread_rng();
+    let setup = TestSetup::new(5);
+    let dealer_addr = setup.address(0);
+    let cheating_message = Messages::Dkg(create_cheating_message(&setup, 0, 1, &mut rng));
+    let config = setup.dkg_config();
+    let receiver1 = avss::Receiver::new(
+        config.nodes.clone(),
+        1,
+        Parameters {
+            t: config.threshold,
+            f: config.max_faulty,
+        },
+        setup.session_id().dealer_session_id(&dealer_addr).to_vec(),
+        None,
+        setup.encryption_keys[1].inner().clone(),
+    )
+    .unwrap();
+    let Messages::Dkg(inner_msg) = &cheating_message else {
+        unreachable!()
+    };
+    let Ok(avss::ProcessedMessage::Complaint(complaint)) =
+        receiver1.process_message(inner_msg, &mut rand::thread_rng())
+    else {
+        panic!("expected a complaint");
+    };
+    let mut manager = setup.create_manager(2);
+    receive_dealer_messages(&mut manager, &cheating_message, dealer_addr).unwrap();
+    let epoch = manager.mpc_config.epoch;
+    let request = ComplainRequest {
+        dealer: dealer_addr,
+        share_index: None,
+        batch_index: None,
+        complaint: ProtocolComplaint::Avss(complaint),
+        protocol_type: ProtocolTypeIndicator::Dkg,
+        epoch,
+    };
+
+    // Neither the default policy nor entries for another epoch or dealer
+    // release the response. It is verified and cached on the first attempt;
+    // the cache hits that answer the later ones are gated just the same.
+    for (attempt, dealers) in [
+        vec![],
+        vec![AllowedDealer {
+            epoch: epoch + 1,
+            dealer: dealer_addr,
+        }],
+        vec![AllowedDealer {
+            epoch,
+            dealer: setup.address(3),
+        }],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        manager.complaint_response_policy = ComplaintResponsePolicy::AllowList { dealers };
+        let result = manager.handle_complain_request(setup.address(1), &request);
+        assert!(
+            matches!(
+                result,
+                Err(MpcError::ComplaintWithheld { epoch: e, dealer: d })
+                    if e == epoch && d == dealer_addr
+            ),
+            "attempt {attempt}: expected the complaint to be withheld, got {result:?}"
+        );
+        assert_eq!(manager.complaint_responses.len(), 1);
+    }
+
+    // Another validator replaying that complaint is answered from the cache
+    // without being verified, and is withheld just the same.
+    let result = manager.handle_complain_request(setup.address(3), &request);
+    assert!(
+        matches!(result, Err(MpcError::ComplaintWithheld { .. })),
+        "expected the replay to be withheld, got {result:?}"
+    );
+    // Without the cache, the same complaint from that validator fails
+    // verification: it is not that validator's complaint.
+    let mut uncached = setup.create_manager(2);
+    receive_dealer_messages(&mut uncached, &cheating_message, dealer_addr).unwrap();
+    let result = uncached.handle_complain_request(setup.address(3), &request);
+    assert!(
+        matches!(result, Err(MpcError::CryptoError(_))),
+        "expected verification to fail, got {result:?}"
+    );
+
+    // Allow-listing the (epoch, dealer) pair releases it.
+    manager.complaint_response_policy = ComplaintResponsePolicy::AllowList {
+        dealers: vec![AllowedDealer {
+            epoch,
+            dealer: dealer_addr,
+        }],
+    };
+    manager
+        .handle_complain_request(setup.address(1), &request)
+        .unwrap();
+    assert_eq!(manager.complaint_responses.len(), 1);
+
+    // The one verification logged the exact request and dealer message it
+    // checked, decodable from the log alone; cache hits are not re-verified.
+    let expected_request = bcs::to_bytes(&request).unwrap();
+    let expected_message = bcs::to_bytes(&cheating_message).unwrap();
+    logs_assert(|lines: &[&str]| {
+        let logged: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("Verified complaint from"))
+            .collect();
+        if logged.len() != 1 {
+            return Err(format!(
+                "expected 1 verified complaint, got {}",
+                logged.len()
+            ));
+        }
+        let served = lines
+            .iter()
+            .filter(|line| line.contains("Serving the response to a complaint from"))
+            .count();
+        if served != 1 {
+            return Err(format!("expected 1 served response, got {served}"));
+        }
+        for line in logged {
+            let field = |name: &str| {
+                let hex_str = line.split(name).nth(1).unwrap().split(',').next().unwrap();
+                hex::decode(hex_str.trim()).unwrap()
+            };
+            let logged_request = field("request (bcs) ");
+            let logged_message = field("dealer message (bcs) ");
+            bcs::from_bytes::<ComplainRequest>(&logged_request).unwrap();
+            bcs::from_bytes::<Messages>(&logged_message).unwrap();
+            if logged_request != expected_request || logged_message != expected_message {
+                return Err(format!("logged complaint does not match: {line}"));
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn test_handle_complain_request_rejects_invalid_complaint_before_policy() {
+    let mut rng = rand::thread_rng();
+    let setup = TestSetup::new(5);
+    let (dealer_address, dealer_messages, complaint) =
+        create_dealer_message_and_complaint(&setup, &mut rng);
+    let mut manager = setup.create_manager(1);
+    manager.complaint_response_policy = ComplaintResponsePolicy::AllowList { dealers: vec![] };
+    if let Messages::Dkg(msg) = dealer_messages {
+        manager.current_dkg_messages.insert(dealer_address, msg);
+    }
+    let request = ComplainRequest {
+        dealer: dealer_address,
+        share_index: None,
+        batch_index: None,
+        complaint: ProtocolComplaint::Avss(complaint),
+        protocol_type: ProtocolTypeIndicator::Dkg,
+        epoch: manager.mpc_config.epoch,
+    };
+
+    // An invalid complaint fails verification rather than being counted as a
+    // valid complaint that was withheld.
+    let result = manager.handle_complain_request(setup.address(1), &request);
+    assert!(matches!(result, Err(MpcError::CryptoError(_))));
+}
+
 #[tokio::test]
 async fn test_recover_shares_via_complaint_succeeds_with_exact_threshold() {
     let mut rng = rand::thread_rng();
@@ -4639,7 +4815,10 @@ async fn test_recover_shares_via_complaint_no_complaint_for_dealer() {
     // Create empty mock P2P channel
     let mock_p2p = MockP2PChannel::new(HashMap::new(), party_addr);
 
-    let signers = cert.signers(&party_manager.committee).unwrap();
+    let signers = party_manager
+        .committee
+        .signers(cert.committee_signature())
+        .unwrap();
     let party_manager = Arc::new(RwLock::new(party_manager));
 
     // Call recover_shares_via_complaint - should fail because no complaint exists
@@ -5193,7 +5372,7 @@ async fn test_retrieve_dealer_message_rejects_wrong_hash() {
     );
 }
 fn create_certificate_with_signers(
-    committee: &Committee,
+    committee: &RuntimeCommittee,
     dealer_address: Address,
     messages: &Messages,
     signatures: Vec<MemberSignature>,
@@ -5204,7 +5383,7 @@ fn create_certificate_with_signers(
         messages_hash,
     };
 
-    let mut aggregator = BlsSignatureAggregator::new(TEST_HASHI_ID, committee, dkg_message);
+    let mut aggregator = committee.signature_aggregator(TEST_HASHI_ID, dkg_message);
 
     for signature in signatures {
         aggregator
@@ -5719,7 +5898,7 @@ async fn test_retrieve_stores_invalid_message_for_later_complaint() {
         messages_hash,
     };
     let committee = setup.committee();
-    let mut aggregator = BlsSignatureAggregator::new(TEST_HASHI_ID, committee, dkg_message);
+    let mut aggregator = committee.signature_aggregator(TEST_HASHI_ID, dkg_message);
     for (_, _, sig) in &signers {
         aggregator.add_signature(sig.clone()).unwrap();
     }
@@ -6283,7 +6462,8 @@ impl RotationTestSetup {
                 target_epoch,
                 TEST_WEIGHT_REDUCTION_ALLOWED_DELTA,
                 TEST_MAX_FAULTY_IN_BASIS_POINTS,
-            ),
+            )
+            .into(),
         );
         self.setup.committee_set.set_epoch(target_epoch);
         target_epoch
@@ -6314,6 +6494,7 @@ impl RotationTestSetup {
             None,
             TEST_BATCH_SIZE_PER_WEIGHT,
             None,
+            ComplaintResponsePolicy::AllowAll,
             &test_metrics(),
         )
         .unwrap();
@@ -6911,6 +7092,7 @@ async fn test_departing_dealer_deals_into_the_rotation_that_removes_it() {
     let outcome = MpcManager::run_key_rotation(
         &departing,
         &rotation_setup.certificates(),
+        &[],
         &mock_p2p,
         &mut mock_tob,
         &test_metrics(),
@@ -6956,6 +7138,7 @@ async fn test_departing_dealer_surfaces_a_failed_deal_instead_of_reporting_succe
     let outcome = MpcManager::run_key_rotation(
         &departing,
         &rotation_setup.certificates(),
+        &[],
         &mock_p2p,
         &mut mock_tob,
         &test_metrics(),
@@ -7002,6 +7185,7 @@ async fn test_departing_dealer_retries_a_failed_reconstruction_instead_of_parkin
     let as_dealer_only = MpcManager::prepare_previous_output(
         &departing,
         &[],
+        &[],
         &mock_p2p,
         &test_metrics(),
         RotationRole::DealerOnly,
@@ -7014,6 +7198,7 @@ async fn test_departing_dealer_retries_a_failed_reconstruction_instead_of_parkin
 
     let (fallback, _) = MpcManager::prepare_previous_output(
         &departing,
+        &[],
         &[],
         &mock_p2p,
         &test_metrics(),
@@ -7112,6 +7297,7 @@ async fn test_run_key_rotation() {
     let new_output = MpcManager::run_key_rotation(
         &test_manager,
         &rotation_setup.certificates(),
+        &[],
         &mock_p2p,
         &mut mock_tob,
         &test_metrics(),
@@ -7250,6 +7436,7 @@ async fn test_run_key_rotation_skips_dealer_phase() {
     let new_output = MpcManager::run_key_rotation(
         &test_manager,
         &rotation_setup.certificates(),
+        &[],
         &mock_p2p,
         &mut mock_tob,
         &test_metrics(),
@@ -7394,6 +7581,7 @@ async fn test_run_key_rotation_excludes_empty_messages_from_share_count() {
     let new_output = MpcManager::run_key_rotation(
         &test_manager,
         &rotation_setup.certificates(),
+        &[],
         &mock_p2p,
         &mut mock_tob,
         &test_metrics(),
@@ -7618,7 +7806,7 @@ async fn test_run_key_rotation_recovers_from_hash_mismatch() {
             );
         }
         ref_manager
-            .complete_key_rotation(&ref_dkg_output, &certified_share_indices)
+            .complete_key_rotation(&ref_dkg_output, &certified_share_indices, &[])
             .unwrap()
             .key_shares
     };
@@ -7630,6 +7818,7 @@ async fn test_run_key_rotation_recovers_from_hash_mismatch() {
     let new_output = MpcManager::run_key_rotation(
         &test_manager,
         &rotation_setup.certificates(),
+        &[],
         &mock_p2p,
         &mut mock_tob,
         &test_metrics(),
@@ -7767,6 +7956,7 @@ async fn test_run_key_rotation_with_complaint_recovery() {
     let new_output = MpcManager::run_key_rotation(
         &test_manager,
         &rotation_setup.certificates(),
+        &[],
         &mock_p2p,
         &mut mock_tob,
         &test_metrics(),
@@ -7867,13 +8057,14 @@ async fn test_prepare_previous_output_for_new_member() {
 
     let mut committees = BTreeMap::new();
     committees.insert(epoch - 1, previous_committee);
-    committees.insert(epoch, new_current_committee);
+    committees.insert(epoch, new_current_committee.into());
 
     let mut new_committee_set = CommitteeSet::new(Address::ZERO, Address::ZERO);
     new_committee_set
         .set_epoch(epoch - 1)
         .set_pending_epoch_change(Some(epoch))
-        .set_committees(committees);
+        .committees_mut()
+        .extend(committees);
 
     // Create new member's MpcManager
     let new_member_manager = MpcManager::new(
@@ -7890,6 +8081,7 @@ async fn test_prepare_previous_output_for_new_member() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None, // test_corrupt_shares_for
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .unwrap();
@@ -7913,6 +8105,7 @@ async fn test_prepare_previous_output_for_new_member() {
     let metrics = test_metrics();
     let (previous_output, is_member_of_previous_committee) = MpcManager::prepare_previous_output(
         &new_member_manager,
+        &[],
         &[],
         &mock_p2p,
         &metrics,
@@ -7997,6 +8190,7 @@ async fn test_prepare_previous_output_retrieves_missing_dkg_messages() {
     let (previous_output, is_member) = MpcManager::prepare_previous_output(
         &test_manager,
         &previous_certs,
+        &[],
         &mock_p2p,
         &metrics,
         RotationRole::DealerAndParty,
@@ -8084,6 +8278,7 @@ async fn test_prepare_previous_output_refetches_diverged_dkg_message() {
     let (previous_output, is_member) = MpcManager::prepare_previous_output(
         &test_manager,
         &previous_certs,
+        &[],
         &mock_p2p,
         &test_metrics(),
         RotationRole::DealerAndParty,
@@ -8205,6 +8400,7 @@ async fn test_prepare_previous_output_retrieves_missing_rotation_messages() {
     let (previous_output, is_member) = MpcManager::prepare_previous_output(
         &test_manager,
         &rotation_certs,
+        &[],
         &mock_p2p,
         &metrics,
         RotationRole::DealerAndParty,
@@ -8220,6 +8416,107 @@ async fn test_prepare_previous_output_retrieves_missing_rotation_messages() {
     assert!(
         !previous_output.key_shares.shares.is_empty(),
         "Should have key shares after reconstruction"
+    );
+}
+
+#[tokio::test]
+async fn test_prepare_previous_output_skips_repairs_past_the_reconstruction_prefix() {
+    let rotation_setup = RotationTestSetup::new();
+    let epoch = rotation_setup.setup.epoch();
+
+    let dealer_indices = [0usize, 1, 4];
+    let mut dealers: Vec<(usize, MpcManager, MpcOutput)> = dealer_indices
+        .iter()
+        .map(|&i| {
+            let (mut mgr, output) = rotation_setup.create_receiver_with_memory_store(i);
+            mgr.previous_output = Some(output.clone());
+            (i, mgr, output)
+        })
+        .collect();
+
+    let mut rng = rand::thread_rng();
+    let mut rotation_certs = Vec::new();
+    let mut dealer_rotation_messages: HashMap<Address, RotationMessages> = HashMap::new();
+    for idx in 0..dealers.len() {
+        let dealer_addr = rotation_setup.setup.address(dealers[idx].0);
+        let dkg_output = dealers[idx].2.clone();
+        let msgs = dealers[idx]
+            .1
+            .create_rotation_messages(&dkg_output, &mut rng);
+        let rotation_messages = Messages::Rotation(msgs.clone());
+        for d in dealers.iter_mut() {
+            d.1.current_rotation_messages
+                .insert(dealer_addr, msgs.clone());
+        }
+        dealer_rotation_messages.insert(dealer_addr, msgs);
+
+        let out0 = dealers[0].2.clone();
+        let out1 = dealers[1].2.clone();
+        let sig0 = dealers[0]
+            .1
+            .try_sign_rotation_messages(&out0, dealer_addr, &rotation_messages)
+            .unwrap();
+        let sig1 = dealers[1]
+            .1
+            .try_sign_rotation_messages(&out1, dealer_addr, &rotation_messages)
+            .unwrap();
+        let cert = create_rotation_test_certificate(
+            rotation_setup.setup.committee(),
+            &rotation_messages,
+            dealer_addr,
+            vec![
+                MemberSignature::new(epoch, rotation_setup.setup.address(0), sig0),
+                MemberSignature::new(epoch, rotation_setup.setup.address(1), sig1),
+            ],
+        )
+        .unwrap();
+        rotation_certs.push(VerifiedCertificateV1::new_unchecked(
+            CertificateV1::Rotation(cert),
+        ));
+    }
+
+    let past_prefix = rotation_setup.setup.address(dealer_indices[2]);
+    let (mut test_manager, test_dkg_output) = rotation_setup.create_receiver_with_memory_store(2);
+    let test_addr = rotation_setup.setup.address(2);
+    test_manager.public_messages_store = Arc::new(InMemoryPublicMessagesStore::new());
+    test_manager.previous_committee = Some(rotation_setup.setup.committee().clone());
+    test_manager.previous_epoch = epoch;
+    test_manager.previous_output = Some(test_dkg_output.clone());
+    for (dealer, msgs) in &dealer_rotation_messages {
+        if *dealer != past_prefix {
+            test_manager
+                .persist_and_cache_rotation_messages(epoch, *dealer, msgs)
+                .unwrap();
+        }
+    }
+    let test_manager = Arc::new(RwLock::new(test_manager));
+
+    let mut other_managers_map = HashMap::new();
+    for (i, mgr, _) in dealers {
+        other_managers_map.insert(rotation_setup.setup.address(i), mgr);
+    }
+    let (mut mgr3, out3) = rotation_setup.create_receiver_with_memory_store(3);
+    mgr3.previous_output = Some(out3);
+    other_managers_map.insert(rotation_setup.setup.address(3), mgr3);
+    let mock_p2p = MockP2PChannel::new(other_managers_map, test_addr);
+
+    let (previous_output, _) = MpcManager::prepare_previous_output(
+        &test_manager,
+        &rotation_certs,
+        &[],
+        &mock_p2p,
+        &test_metrics(),
+        RotationRole::DealerAndParty,
+    )
+    .await
+    .expect("the stored prefix is enough to reconstruct");
+
+    assert_eq!(previous_output.public_key, test_dkg_output.public_key);
+    assert!(!previous_output.key_shares.shares.is_empty());
+    assert_eq!(
+        mock_p2p.retrieve_calls(),
+        0,
+        "a message past the reconstruction prefix must not be fetched",
     );
 }
 
@@ -8326,6 +8623,7 @@ async fn test_prepare_previous_output_refetches_diverged_rotation_message() {
     let (previous_output, is_member) = MpcManager::prepare_previous_output(
         &test_manager,
         &rotation_certs,
+        &[],
         &mock_p2p,
         &test_metrics(),
         RotationRole::DealerAndParty,
@@ -8440,6 +8738,7 @@ async fn test_prepare_previous_output_does_not_refetch_matching_messages() {
     let (previous_output, is_member) = MpcManager::prepare_previous_output(
         &test_manager,
         &rotation_certs,
+        &[],
         &mock_p2p,
         &test_metrics(),
         RotationRole::DealerAndParty,
@@ -8459,8 +8758,168 @@ async fn test_prepare_previous_output_does_not_refetch_matching_messages() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn test_prepare_previous_output_adopts_only_the_on_chain_key() {
+    use fastcrypto::groups::GroupElement;
+    struct StaggeredChannel {
+        immediate: HashMap<Address, PublicMpcOutput>,
+        delayed: HashMap<Address, PublicMpcOutput>,
+    }
+    #[async_trait::async_trait]
+    impl P2PChannel for StaggeredChannel {
+        async fn send_messages(
+            &self,
+            _party: &Address,
+            _request: &SendMessagesRequest,
+        ) -> ChannelResult<SendMessagesResponse> {
+            unimplemented!()
+        }
+        async fn retrieve_messages(
+            &self,
+            _party: &Address,
+            _request: &RetrieveMessagesRequest,
+        ) -> ChannelResult<RetrieveMessagesResponse> {
+            unimplemented!()
+        }
+        async fn complain(
+            &self,
+            _party: &Address,
+            _request: &ComplainRequest,
+        ) -> ChannelResult<ComplaintResponse> {
+            unimplemented!()
+        }
+        async fn get_public_mpc_output(
+            &self,
+            party: &Address,
+            _request: &GetPublicMpcOutputRequest,
+        ) -> ChannelResult<GetPublicMpcOutputResponse> {
+            if let Some(output) = self.immediate.get(party) {
+                return Ok(GetPublicMpcOutputResponse {
+                    output: output.clone(),
+                });
+            }
+            if let Some(output) = self.delayed.get(party) {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                return Ok(GetPublicMpcOutputResponse {
+                    output: output.clone(),
+                });
+            }
+            Err(crate::communication::ChannelError::RequestFailed(
+                "no output".into(),
+            ))
+        }
+        async fn get_partial_signatures(
+            &self,
+            _party: &Address,
+            _request: &GetPartialSignaturesRequest,
+        ) -> ChannelResult<GetPartialSignaturesResponse> {
+            unimplemented!()
+        }
+    }
+
+    let rotation_setup = RotationTestSetup::new();
+    let (mut test_manager, test_dkg_output) = rotation_setup.create_receiver_with_memory_store(0);
+    test_manager.previous_committee = Some(rotation_setup.setup.committee().clone());
+    test_manager.previous_epoch = rotation_setup.setup.epoch();
+    let test_manager = Arc::new(RwLock::new(test_manager));
+
+    let rebuilt = PublicMpcOutput::from_mpc_output(&test_dkg_output);
+    let onchain = PublicMpcOutput {
+        public_key: G::generator(),
+        ..rebuilt.clone()
+    };
+    let address = |i: usize| rotation_setup.setup.address(i);
+    let channel = StaggeredChannel {
+        immediate: HashMap::from([(address(2), rebuilt.clone()), (address(3), rebuilt.clone())]),
+        delayed: HashMap::from([(address(0), onchain.clone()), (address(1), onchain.clone())]),
+    };
+    let previous_certs = rotation_setup.certificates();
+
+    let (previous, _) = MpcManager::prepare_previous_output(
+        &test_manager,
+        &previous_certs,
+        &bcs::to_bytes(&rebuilt.public_key).unwrap(),
+        &channel,
+        &test_metrics(),
+        RotationRole::DealerAndParty,
+    )
+    .await
+    .unwrap();
+    assert_eq!(previous.public_key, rebuilt.public_key);
+    assert!(!previous.key_shares.shares.is_empty());
+
+    let (previous, _) = MpcManager::prepare_previous_output(
+        &test_manager,
+        &previous_certs,
+        &bcs::to_bytes(&onchain.public_key).unwrap(),
+        &channel,
+        &test_metrics(),
+        RotationRole::DealerAndParty,
+    )
+    .await
+    .unwrap();
+    assert_eq!(PublicMpcOutput::from_mpc_output(&previous), onchain);
+    assert!(previous.key_shares.shares.is_empty());
+}
+
+#[test]
+fn test_complete_key_rotation_refuses_a_key_the_chain_does_not_hold() {
+    let mut rng = rand::thread_rng();
+    let rotation_setup = RotationTestSetup::new();
+    let dealt: Vec<(Address, Messages)> = [2usize, 3]
+        .into_iter()
+        .map(|i| {
+            let (dealer, dkg_output) = rotation_setup.create_receiver_with_memory_store(i);
+            let msgs = dealer.create_rotation_messages(&dkg_output, &mut rng);
+            (rotation_setup.setup.address(i), Messages::Rotation(msgs))
+        })
+        .collect();
+    let (mut party, dkg_output) = rotation_setup.create_receiver_with_memory_store(0);
+    let mut certified_share_indices = Vec::new();
+    for (dealer, messages) in &dealt {
+        if let Messages::Rotation(msgs) = messages {
+            party
+                .current_rotation_messages
+                .insert(*dealer, msgs.clone());
+        }
+        party
+            .try_sign_rotation_messages(&dkg_output, *dealer, messages)
+            .unwrap();
+        let party_id = party
+            .previous_committee
+            .as_ref()
+            .unwrap()
+            .index_of(dealer)
+            .unwrap() as u16;
+        certified_share_indices.extend(
+            party
+                .previous_nodes
+                .as_ref()
+                .unwrap()
+                .share_ids_of(party_id)
+                .unwrap()
+                .into_iter()
+                .map(|idx| (*dealer, idx)),
+        );
+    }
+    let onchain_key = bcs::to_bytes(&dkg_output.public_key).unwrap();
+    let mut other_key = onchain_key.clone();
+    other_key[0] ^= 0xff;
+
+    let err = party
+        .complete_key_rotation(&dkg_output, &certified_share_indices, &other_key)
+        .unwrap_err();
+    assert!(
+        matches!(&err, MpcError::ProtocolFailed(msg) if msg.contains("on-chain key")),
+        "{err:?}"
+    );
+    party
+        .complete_key_rotation(&dkg_output, &certified_share_indices, &onchain_key)
+        .unwrap();
+}
+
 #[tokio::test]
-async fn test_prepare_previous_output_repairs_later_dealers_after_one_fails() {
+async fn test_prepare_previous_output_stops_repairing_at_an_unrepairable_prefix_dealer() {
     let rotation_setup = RotationTestSetup::new();
     let epoch = rotation_setup.setup.epoch();
 
@@ -8517,7 +8976,7 @@ async fn test_prepare_previous_output_repairs_later_dealers_after_one_fails() {
     }
 
     let unrepairable = rotation_setup.setup.address(dealer_indices[0]);
-    let repairable = rotation_setup.setup.address(dealer_indices[2]);
+    let repairable = rotation_setup.setup.address(dealer_indices[1]);
 
     for d in dealers.iter_mut() {
         d.1.current_rotation_messages.remove(&unrepairable);
@@ -8525,8 +8984,8 @@ async fn test_prepare_previous_output_repairs_later_dealers_after_one_fails() {
 
     let out_first = dealers[0].2.clone();
     let diverged_first = dealers[0].1.create_rotation_messages(&out_first, &mut rng);
-    let out_later = dealers[2].2.clone();
-    let diverged_later = dealers[2].1.create_rotation_messages(&out_later, &mut rng);
+    let out_later = dealers[1].2.clone();
+    let diverged_later = dealers[1].1.create_rotation_messages(&out_later, &mut rng);
     let repairable_certified_hash =
         Messages::Rotation(certified[&repairable].clone()).compute_hash();
     assert_ne!(
@@ -8561,6 +9020,7 @@ async fn test_prepare_previous_output_repairs_later_dealers_after_one_fails() {
     let _ = MpcManager::prepare_previous_output(
         &test_manager,
         &rotation_certs,
+        &[],
         &mock_p2p,
         &test_metrics(),
         RotationRole::DealerAndParty,
@@ -8574,10 +9034,10 @@ async fn test_prepare_previous_output_repairs_later_dealers_after_one_fails() {
         .get_rotation_messages(epoch, &repairable)
         .unwrap()
         .expect("the later dealer's message is still present");
-    assert_eq!(
+    assert_ne!(
         Messages::Rotation(stored_later).compute_hash(),
         repairable_certified_hash,
-        "a failed repair must not skip the dealers certified after it",
+        "reconstruction fails on the unrepairable dealer first, so the walk must stop there",
     );
 }
 
@@ -9863,7 +10323,7 @@ fn test_party_restart_uses_stored_rotation_messages() {
 
     // Complete key rotation using stored messages
     let rotation_output = party_manager
-        .complete_key_rotation(&dkg_output, &certified_share_indices)
+        .complete_key_rotation(&dkg_output, &certified_share_indices, &[])
         .unwrap();
 
     // Verify the output is valid (public key should be derivable)
@@ -9877,9 +10337,6 @@ fn test_party_restart_uses_stored_rotation_messages() {
     );
 }
 
-/// Tests that `reconstruct_previous_dkg_output` uses the previous committee's
-/// parameters (nodes, party_id, threshold) to decrypt DKG messages, not the target
-/// committee's.
 #[test]
 fn test_reconstruct_previous_dkg_output_with_shifted_party_ids() {
     let mut rng = rand::thread_rng();
@@ -9992,6 +10449,7 @@ fn test_reconstruct_previous_dkg_output_with_shifted_party_ids() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None, // test_corrupt_shares_for
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .unwrap();
@@ -10016,7 +10474,7 @@ fn test_reconstruct_previous_dkg_output_with_shifted_party_ids() {
     // if previous committee parameters were not used for decryption.
     let reconstructed = unwrap_reconstruction_success(
         manager
-            .reconstruct_previous_dkg_output(&certificates, &HashMap::new())
+            .reconstruct_previous_output(&certificates, &HashMap::new())
             .unwrap(),
     );
 
@@ -10174,6 +10632,7 @@ fn test_reconstruct_previous_dkg_output_stops_at_threshold() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None, // test_corrupt_shares_for
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .unwrap();
@@ -10183,7 +10642,7 @@ fn test_reconstruct_previous_dkg_output_stops_at_threshold() {
     // and produces key_threshold.
     let reconstructed = unwrap_reconstruction_success(
         manager
-            .reconstruct_previous_dkg_output(&certificates, &HashMap::new())
+            .reconstruct_previous_output(&certificates, &HashMap::new())
             .unwrap(),
     );
 
@@ -10308,12 +10767,13 @@ fn test_reconstruct_previous_dkg_output_uses_previous_encryption_key() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .unwrap();
     let reconstructed = unwrap_reconstruction_success(
         manager_with_prev
-            .reconstruct_previous_dkg_output(&certificates, &HashMap::new())
+            .reconstruct_previous_output(&certificates, &HashMap::new())
             .unwrap(),
     );
     assert_eq!(
@@ -10337,11 +10797,11 @@ fn test_reconstruct_previous_dkg_output_uses_previous_encryption_key() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .unwrap();
-    let result =
-        manager_without_prev.reconstruct_previous_dkg_output(&certificates, &HashMap::new());
+    let result = manager_without_prev.reconstruct_previous_output(&certificates, &HashMap::new());
     let Err(err) = result else {
         panic!("missing previous_encryption_key must error, got Ok");
     };
@@ -10443,6 +10903,7 @@ fn test_recover_current_dkg() {
             None,
             TEST_BATCH_SIZE_PER_WEIGHT,
             None,
+            ComplaintResponsePolicy::AllowAll,
             &test_metrics(),
         )
         .unwrap()
@@ -10615,6 +11076,7 @@ fn test_recover_current_dkg_not_applicable_on_certified_dealer_complaint() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .unwrap();
@@ -10638,8 +11100,6 @@ fn test_recover_current_dkg_not_applicable_on_certified_dealer_complaint() {
     );
 }
 
-/// Tests that `reconstruct_previous_rotation_output` uses the previous committee's
-/// parameters to decrypt rotation messages.
 #[test]
 fn test_reconstruct_previous_rotation_output_with_shifted_party_ids() {
     let mut rng = rand::thread_rng();
@@ -10706,6 +11166,7 @@ fn test_reconstruct_previous_rotation_output_with_shifted_party_ids() {
             None,
             TEST_BATCH_SIZE_PER_WEIGHT,
             None, // test_corrupt_shares_for
+            ComplaintResponsePolicy::AllowAll,
             &test_metrics(),
         )
         .unwrap();
@@ -10740,6 +11201,7 @@ fn test_reconstruct_previous_rotation_output_with_shifted_party_ids() {
             None,
             TEST_BATCH_SIZE_PER_WEIGHT,
             None, // test_corrupt_shares_for
+            ComplaintResponsePolicy::AllowAll,
             &test_metrics(),
         )
         .unwrap();
@@ -10848,6 +11310,7 @@ fn test_reconstruct_previous_rotation_output_with_shifted_party_ids() {
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None, // test_corrupt_shares_for
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .unwrap();
@@ -10871,7 +11334,7 @@ fn test_reconstruct_previous_rotation_output_with_shifted_party_ids() {
     // This would panic with index-out-of-bounds if previous committee parameters were not used for decryption.
     let reconstructed = unwrap_reconstruction_success(
         manager
-            .reconstruct_previous_rotation_output(&rotation_certificates, &HashMap::new())
+            .reconstruct_previous_output(&rotation_certificates, &HashMap::new())
             .unwrap(),
     );
 
@@ -10937,6 +11400,7 @@ fn test_recover_current_rotation() {
             None,
             TEST_BATCH_SIZE_PER_WEIGHT,
             None,
+            ComplaintResponsePolicy::AllowAll,
             &test_metrics(),
         )
         .unwrap();
@@ -11016,6 +11480,7 @@ fn test_recover_current_rotation() {
             None,
             TEST_BATCH_SIZE_PER_WEIGHT,
             None,
+            ComplaintResponsePolicy::AllowAll,
             &test_metrics(),
         )
         .unwrap()
@@ -11203,6 +11668,7 @@ fn test_recover_current_rotation_not_applicable_on_certified_dealer_complaint() 
             None,
             TEST_BATCH_SIZE_PER_WEIGHT,
             None,
+            ComplaintResponsePolicy::AllowAll,
             &test_metrics(),
         )
         .unwrap();
@@ -11284,6 +11750,7 @@ fn test_recover_current_rotation_not_applicable_on_certified_dealer_complaint() 
         None,
         TEST_BATCH_SIZE_PER_WEIGHT,
         None,
+        ComplaintResponsePolicy::AllowAll,
         &test_metrics(),
     )
     .unwrap();
@@ -11762,7 +12229,7 @@ fn valid_dealer_submission(
     setup: &TestSetup,
     dealer_idx: usize,
     timestamp_ms: u64,
-) -> (Address, hashi_types::move_types::StampedDealerSubmissionV1) {
+) -> (Address, hashi_types::move_types::DealerSubmissionV1) {
     let all: Vec<usize> = (0..setup.signing_keys.len()).collect();
     valid_dealer_submission_signed_by(setup, dealer_idx, timestamp_ms, &all)
 }
@@ -11772,7 +12239,7 @@ fn valid_dealer_submission_signed_by(
     dealer_idx: usize,
     timestamp_ms: u64,
     signer_indices: &[usize],
-) -> (Address, hashi_types::move_types::StampedDealerSubmissionV1) {
+) -> (Address, hashi_types::move_types::DealerSubmissionV1) {
     let dealer = setup.address(dealer_idx);
     let hash_bytes = [7u8; 32];
     let target = DealerMessagesHash {
@@ -11781,7 +12248,7 @@ fn valid_dealer_submission_signed_by(
     };
     let committee = setup.committee();
     let epoch = committee.epoch();
-    let mut aggregator = BlsSignatureAggregator::new(TEST_HASHI_ID, committee, target.clone());
+    let mut aggregator = committee.signature_aggregator(TEST_HASHI_ID, target.clone());
     for &i in signer_indices {
         aggregator
             .add_signature(setup.signing_keys[i].sign(
@@ -11795,17 +12262,15 @@ fn valid_dealer_submission_signed_by(
     let signed = aggregator.finish().unwrap();
     (
         dealer,
-        hashi_types::move_types::StampedDealerSubmissionV1 {
-            submission: hashi_types::move_types::DealerSubmissionV1 {
-                message: hashi_types::move_types::DealerMessagesHashV1 {
-                    dealer_address: dealer,
-                    messages_hash: hash_bytes.to_vec(),
-                },
-                signature: hashi_types::move_types::CommitteeSignature {
-                    epoch,
-                    signature: signed.signature_bytes().to_vec(),
-                    signers_bitmap: signed.signers_bitmap_bytes().to_vec(),
-                },
+        hashi_types::move_types::DealerSubmissionV1 {
+            message: hashi_types::move_types::DealerMessagesHashV1 {
+                dealer_address: dealer,
+                messages_hash: hash_bytes.to_vec(),
+            },
+            signature: hashi_types::move_types::CommitteeSignature {
+                epoch,
+                signature: signed.signature_bytes().to_vec(),
+                signers_bitmap: signed.signers_bitmap_bytes().to_vec(),
             },
             timestamp_ms,
         },
@@ -11897,7 +12362,7 @@ fn test_zero_accumulation_window_is_floor_only() {
 }
 
 #[test]
-fn test_bare_zero_stamp_certs_force_floor_only_window() {
+fn test_zero_stamp_certs_force_floor_only_window() {
     let setup = TestSetup::with_weights(&[25, 25, 25, 25]);
     let mut mgr = setup.create_manager(0);
     mgr.mpc_config.max_faulty = 25;
@@ -12037,8 +12502,9 @@ fn test_try_sign_avid_nonce_optimistic_confirms_and_persists() {
         batch_index,
     };
     let member_sig = MemberSignature::new(receiver.mpc_config.epoch, receiver.address, sig);
-    let mut aggregator =
-        BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), confirm_target);
+    let mut aggregator = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, confirm_target);
     aggregator
         .add_signature(member_sig)
         .expect("Confirm signature must verify over AvssVoteMessagesHash{dealer, H(v), batch}");
@@ -12200,7 +12666,9 @@ fn avid_pessimistic_fixture(
         messages_hash: MessagesHash::from(common.hash().digest),
         batch_index,
     };
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), confirm_target);
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, confirm_target);
     for s in sigs {
         agg.add_signature(s).unwrap();
     }
@@ -12216,6 +12684,31 @@ fn avid_pessimistic_fixture(
     }
 }
 
+fn with_optimistic_message(
+    msg: &Messages,
+    optimistic_message: Option<batch_avss_avid::AvssMessage>,
+) -> Messages {
+    match msg {
+        Messages::NonceGenerationAvid(AvidNonceMessage {
+            batch_index,
+            kind:
+                AvidNonceMessageKind::Dispersal {
+                    dispersal,
+                    confirm_cert,
+                    ..
+                },
+        }) => Messages::NonceGenerationAvid(AvidNonceMessage {
+            batch_index: *batch_index,
+            kind: AvidNonceMessageKind::Dispersal {
+                dispersal: dispersal.clone(),
+                confirm_cert: confirm_cert.clone(),
+                optimistic_message,
+            },
+        }),
+        _ => panic!("expected an AVID dispersal message"),
+    }
+}
+
 fn extract_dispersal(msg: &Messages) -> (batch_avss_avid::Dispersal, AvidConfirmCertificate) {
     match msg {
         Messages::NonceGenerationAvid(AvidNonceMessage {
@@ -12223,6 +12716,7 @@ fn extract_dispersal(msg: &Messages) -> (batch_avss_avid::Dispersal, AvidConfirm
                 AvidNonceMessageKind::Dispersal {
                     dispersal,
                     confirm_cert,
+                    ..
                 },
             ..
         }) => (dispersal.clone(), confirm_cert.clone()),
@@ -12243,98 +12737,6 @@ fn extract_echo_for(echoes: &[(Address, Messages)], recipient: Address) -> batch
             })
         })
         .expect("echo addressed to recipient")
-}
-
-fn avid_confirm_cert_over(
-    setup: &TestSetup,
-    flow: &crate::mpc::types::AvidDealerFlowData,
-    dealer_addr: Address,
-    batch_index: u32,
-    signer_idxs: &[usize],
-) -> AvidConfirmCertificate {
-    let mut agg = BlsSignatureAggregator::new(
-        TEST_HASHI_ID,
-        setup.committee(),
-        flow.confirm_target.clone(),
-    );
-    for &i in signer_idxs {
-        if setup.address(i) == dealer_addr {
-            agg.add_signature(flow.my_signature.clone()).unwrap();
-            continue;
-        }
-        let (_, msg) = flow
-            .recipient_messages
-            .iter()
-            .find(|(a, _)| *a == setup.address(i))
-            .expect("optimistic message for signer");
-        let avss = extract_optimistic(msg).clone();
-        let mut mgr = setup.create_manager(i);
-        let sig = mgr
-            .try_sign_avid_nonce_optimistic(dealer_addr, batch_index, &avss)
-            .unwrap();
-        agg.add_signature(MemberSignature::new(mgr.mpc_config.epoch, mgr.address, sig))
-            .unwrap();
-    }
-    agg.finish().unwrap()
-}
-
-#[test]
-fn test_repeat_dealer_round_rebuilds_the_stored_signer_sets_dispersal() {
-    let setup = TestSetup::new(6);
-    let batch_index = 0u32;
-    let dealer_addr = setup.address(0);
-    let mut dealer = setup.create_manager(0);
-    let mut rng = rand::thread_rng();
-
-    let flow1 = dealer
-        .prepare_avid_nonce_dealer_flow(batch_index, &mut rng)
-        .unwrap();
-    assert!(
-        flow1.replay_signers.is_none(),
-        "a batch with no stored round must deal a fresh signer set"
-    );
-
-    let signers = [0usize, 1, 2, 3, 4];
-    let cert1 = avid_confirm_cert_over(&setup, &flow1, dealer_addr, batch_index, &signers);
-    let dispersals1 = dealer
-        .create_avid_nonce_dispersal_messages(&flow1.builder, cert1, batch_index)
-        .unwrap();
-
-    let own = dispersals1
-        .iter()
-        .find(|(a, _)| *a == dealer_addr)
-        .map(|(_, m)| m.clone())
-        .expect("dealer is addressed by its own dispersal");
-    let Messages::NonceGenerationAvid(own_avid) = own else {
-        panic!("expected an AVID dispersal message");
-    };
-    dealer
-        .handle_avid_nonce_message(dealer_addr, &own_avid)
-        .expect("the dealer self-handles its own dispersal");
-
-    let flow2 = dealer
-        .prepare_avid_nonce_dealer_flow(batch_index, &mut rng)
-        .unwrap();
-    let replayed = flow2
-        .replay_signers
-        .clone()
-        .expect("a stored round fixes the signer set to reproduce");
-    let expected: std::collections::BTreeSet<fastcrypto_tbls::nodes::PartyId> = signers
-        .iter()
-        .map(|i| *i as fastcrypto_tbls::nodes::PartyId)
-        .collect();
-    assert_eq!(replayed, expected);
-
-    let replayed_idxs: Vec<usize> = replayed.iter().map(|id| *id as usize).collect();
-    let cert2 = avid_confirm_cert_over(&setup, &flow2, dealer_addr, batch_index, &replayed_idxs);
-    let dispersals2 = dealer
-        .create_avid_nonce_dispersal_messages(&flow2.builder, cert2, batch_index)
-        .unwrap();
-    assert_eq!(
-        bcs::to_bytes(&dispersals1).unwrap(),
-        bcs::to_bytes(&dispersals2).unwrap(),
-        "a repeat round over the stored signer set must reproduce the dispersal byte for byte"
-    );
 }
 
 #[test]
@@ -12392,7 +12794,9 @@ fn test_avid_nonce_echo_and_vote_produces_verifiable_vote_and_echoes() {
         batch_index,
     };
     let member_sig = MemberSignature::new(voter.mpc_config.epoch, voter.address, vote);
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), vote_target);
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, vote_target);
     agg.add_signature(member_sig)
         .expect("Vote verifies over AvidVoteMessagesHash{dealer, H(AvidVote), batch}");
 
@@ -12479,7 +12883,7 @@ fn test_decode_avid_nonce_share_reconstructs_from_echoes() {
     let mut rng = rand::thread_rng();
     let setup = TestSetup::new(6);
     let batch_index = 0u32;
-    // Confirmers {0..4}, decoder = node 5. Decode needs W−2f=2 echoes; the Vote cert needs W−f=4.
+    // Confirmers {0..4}, decoder = node 5. Decode needs W−2f=4 shards; the Vote cert needs W−f=5.
     let mut fx = avid_pessimistic_fixture(&setup, 0, batch_index, &[0, 1, 2, 3, 4]);
     let dispersals = fx
         .dealer
@@ -12487,11 +12891,11 @@ fn test_decode_avid_nonce_share_reconstructs_from_echoes() {
         .unwrap();
     let decoder_addr = setup.address(5);
 
-    // Four voters process their dispersal -> Vote sigs (for the W−f cert) and echoes for the decoder.
+    // The voters process their dispersal -> Vote sigs (for the W−f cert) and echoes for the decoder.
     let mut vote_sigs = Vec::new();
     let mut avid_vote = None;
     let mut echoes = Vec::new();
-    for j in [1usize, 2, 3, 4] {
+    for j in [0usize, 1, 2, 3, 4] {
         let voter = &mut fx.confirmers[j];
         let (dispersal, confirm_cert) = extract_dispersal(&dispersals[j].1);
         let (vote, av, es) = voter
@@ -12512,6 +12916,14 @@ fn test_decode_avid_nonce_share_reconstructs_from_echoes() {
         echoes.push((j as PartyId, extract_echo_for(&es, decoder_addr)));
     }
     let avid_vote = avid_vote.unwrap();
+    assert_eq!(
+        vote_sigs.len() as u32,
+        MpcManager::avid_vote_quorum(
+            &fx.confirmers[0].mpc_config.nodes,
+            fx.confirmers[0].mpc_config.max_faulty,
+        ),
+        "the fixture must supply a full W-f AvidVote quorum",
+    );
 
     // Form and verify the W−f Vote cert over H(AvidVote).
     let vote_target = AvidVoteMessagesHash {
@@ -12519,7 +12931,9 @@ fn test_decode_avid_nonce_share_reconstructs_from_echoes() {
         messages_hash: hash_avid_vote(&avid_vote),
         batch_index,
     };
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), vote_target);
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, vote_target);
     for s in vote_sigs {
         agg.add_signature(s).unwrap();
     }
@@ -12595,7 +13009,9 @@ fn test_handle_avid_optimistic_returns_confirm_sig_and_persists() {
         receiver.address,
         response.signature.clone(),
     );
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), confirm_target);
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, confirm_target);
     agg.add_signature(member_sig)
         .expect("Confirm sig verifies over DealerMessagesHash{dealer, H(v)}");
     assert!(
@@ -12689,7 +13105,7 @@ fn test_handle_avid_dispersal_returns_vote_and_holds_echoes() {
         .handle_send_messages_request(fx.dealer_addr, &request)
         .unwrap();
 
-    let (held_vote, echoes) = receiver
+    let (held_vote, echoes, _) = receiver
         .avid_held_echoes
         .get(&(batch_index, fx.dealer_addr))
         .expect("echoes held for the round")
@@ -12704,7 +13120,9 @@ fn test_handle_avid_dispersal_returns_vote_and_holds_echoes() {
         receiver.address,
         response.signature.clone(),
     );
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), vote_target);
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, vote_target);
     agg.add_signature(member_sig)
         .expect("Vote verifies over AvidVoteMessagesHash{dealer, H(AvidVote), batch}");
     assert!(!echoes.is_empty());
@@ -12738,14 +13156,132 @@ fn test_handle_avid_dispersal_without_round_state_is_not_ready() {
     let result = laggard.handle_send_messages_request(
         fx.dealer_addr,
         &SendMessagesRequest {
-            messages: dispersals[5].1.clone(),
+            messages: with_optimistic_message(&dispersals[5].1, None),
         },
     );
     assert!(
         matches!(result, Err(MpcError::NotReady(_))),
-        "laggard dispersal must be NotReady: {result:?}"
+        "a dispersal with no attachment to a party without round state must be NotReady: {result:?}"
     );
     assert!(laggard.avid_held_echoes.is_empty());
+}
+
+#[test]
+fn test_handle_avid_dispersal_with_bundled_optimistic_lets_non_signer_vote() {
+    let setup = TestSetup::new(6);
+    let batch_index = 0u32;
+    let mut fx = avid_pessimistic_fixture(&setup, 0, batch_index, &[0, 1, 2, 3, 4]);
+    let dispersals = fx
+        .dealer
+        .create_avid_nonce_dispersal_messages(&fx.builder, fx.confirm_cert.clone(), batch_index)
+        .unwrap();
+
+    let mut non_signer = setup.create_manager(5);
+    non_signer
+        .handle_send_messages_request(
+            fx.dealer_addr,
+            &SendMessagesRequest {
+                messages: dispersals[5].1.clone(),
+            },
+        )
+        .expect("a non-signer processes the bundled round 1 and votes");
+    assert!(
+        non_signer
+            .dealer_avid_nonce_outputs
+            .contains_key(&(batch_index, fx.dealer_addr)),
+        "the bundled round-1 message is processed into an output"
+    );
+    let (non_signer_vote, _, _) = non_signer
+        .avid_held_echoes
+        .get(&(batch_index, fx.dealer_addr))
+        .expect("the non-signer holds echoes after voting");
+
+    let confirmer = &mut fx.confirmers[1];
+    confirmer
+        .handle_send_messages_request(
+            fx.dealer_addr,
+            &SendMessagesRequest {
+                messages: dispersals[1].1.clone(),
+            },
+        )
+        .unwrap();
+    let (confirmer_vote, _, _) = confirmer
+        .avid_held_echoes
+        .get(&(batch_index, fx.dealer_addr))
+        .unwrap();
+    assert_eq!(
+        hash_avid_vote(non_signer_vote),
+        hash_avid_vote(confirmer_vote),
+        "the attached voter votes on the same value, so one certificate covers both"
+    );
+}
+
+#[test]
+fn test_handle_avid_dispersal_refuses_a_confirm_cert_for_another_batch() {
+    let setup = TestSetup::new(6);
+    let batch_index = 0u32;
+    let mut fx = avid_pessimistic_fixture(&setup, 0, batch_index, &[0, 1, 2, 3, 4]);
+    let other_batch = AvssVoteMessagesHash {
+        dealer_address: fx.dealer_addr,
+        messages_hash: fx.confirm_cert.message().messages_hash,
+        batch_index: batch_index + 1,
+    };
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, other_batch.clone());
+    for i in 0..5usize {
+        agg.add_signature(setup.signing_keys[i].sign(
+            TEST_HASHI_ID,
+            setup.epoch(),
+            setup.address(i),
+            &other_batch,
+        ))
+        .unwrap();
+    }
+    let dispersals = fx
+        .dealer
+        .create_avid_nonce_dispersal_messages(&fx.builder, agg.finish().unwrap(), batch_index)
+        .unwrap();
+
+    let result = fx.confirmers[1].handle_send_messages_request(
+        fx.dealer_addr,
+        &SendMessagesRequest {
+            messages: dispersals[1].1.clone(),
+        },
+    );
+    assert!(
+        matches!(result, Err(MpcError::InvalidMessage { .. })),
+        "a confirm cert signed for another batch must be refused: {result:?}"
+    );
+    assert!(fx.confirmers[1].avid_held_echoes.is_empty());
+}
+
+#[test]
+fn test_handle_avid_dispersal_refuses_a_bundle_the_confirm_cert_does_not_cover() {
+    let setup = TestSetup::new(6);
+    let batch_index = 0u32;
+    let fx = avid_pessimistic_fixture(&setup, 0, batch_index, &[0, 1, 2, 3, 4]);
+    let dispersals = fx
+        .dealer
+        .create_avid_nonce_dispersal_messages(&fx.builder, fx.confirm_cert.clone(), batch_index)
+        .unwrap();
+    let other_builder = fx
+        .dealer
+        .create_avid_nonce_dealer_builder(batch_index, &mut rand::thread_rng())
+        .unwrap();
+    let tampered = with_optimistic_message(&dispersals[5].1, other_builder.message_for(5));
+
+    let mut non_signer = setup.create_manager(5);
+    let result = non_signer
+        .handle_send_messages_request(fx.dealer_addr, &SendMessagesRequest { messages: tampered });
+    assert!(
+        matches!(result, Err(MpcError::InvalidMessage { .. })),
+        "a bundled round-1 message the confirm cert does not cover must be refused: {result:?}"
+    );
+    assert!(
+        non_signer.current_avid_round_state.is_empty(),
+        "the refused bundle must not be processed into round state"
+    );
 }
 
 #[test]
@@ -12838,7 +13374,9 @@ fn test_handle_avid_dispersal_rejects_second_different_dispersal() {
         messages_hash: MessagesHash::from(fx.common.hash().digest),
         batch_index,
     };
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), confirm_target);
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, confirm_target);
     for s in sigs {
         agg.add_signature(s).unwrap();
     }
@@ -12865,7 +13403,7 @@ fn test_handle_avid_dispersal_rejects_second_different_dispersal() {
             },
         )
         .unwrap();
-    let (held_vote_before, _) = receiver
+    let (held_vote_before, _, _) = receiver
         .avid_held_echoes
         .get(&(batch_index, fx.dealer_addr))
         .unwrap()
@@ -12881,7 +13419,7 @@ fn test_handle_avid_dispersal_rejects_second_different_dispersal() {
         matches!(second, Err(MpcError::InvalidMessage { .. })),
         "a different dispersal for the same round must be rejected: {second:?}"
     );
-    let (held_vote_after, _) = receiver
+    let (held_vote_after, _, _) = receiver
         .avid_held_echoes
         .get(&(batch_index, fx.dealer_addr))
         .unwrap()
@@ -13081,7 +13619,7 @@ async fn test_run_as_avid_nonce_dealer_straggler_posts_vote_cert() {
         panic!("expected a nonce cert");
     };
     let mgr = dealer.read().unwrap();
-    let (held_vote, _) = mgr
+    let (held_vote, _, _) = mgr
         .avid_held_echoes
         .get(&(batch_index, dealer_addr))
         .expect("the dealer voted on its own dispersal and held its echoes");
@@ -13113,222 +13651,193 @@ async fn test_run_as_avid_nonce_dealer_straggler_posts_vote_cert() {
     );
 }
 
+struct BundleScenarioP2PChannel {
+    managers: Arc<std::sync::Mutex<HashMap<Address, MpcManager>>>,
+    current_sender: Address,
+    fail_optimistic_to: HashSet<Address>,
+    fail_dispersal_to: HashSet<Address>,
+}
+
+#[async_trait::async_trait]
+impl P2PChannel for BundleScenarioP2PChannel {
+    async fn send_messages(
+        &self,
+        recipient: &Address,
+        request: &SendMessagesRequest,
+    ) -> ChannelResult<SendMessagesResponse> {
+        let is_optimistic = matches!(
+            &request.messages,
+            Messages::NonceGenerationAvid(AvidNonceMessage {
+                kind: AvidNonceMessageKind::Optimistic(_),
+                ..
+            })
+        );
+        let is_dispersal = matches!(
+            &request.messages,
+            Messages::NonceGenerationAvid(AvidNonceMessage {
+                kind: AvidNonceMessageKind::Dispersal { .. },
+                ..
+            })
+        );
+        if (is_optimistic && self.fail_optimistic_to.contains(recipient))
+            || (is_dispersal && self.fail_dispersal_to.contains(recipient))
+        {
+            return Err(crate::communication::ChannelError::RequestFailed(
+                "injected network failure".to_string(),
+            ));
+        }
+        let mut managers = self.managers.lock().unwrap();
+        let manager = managers.get_mut(recipient).ok_or_else(|| {
+            crate::communication::ChannelError::RequestFailed(format!(
+                "Recipient {:?} not found",
+                recipient
+            ))
+        })?;
+        let response = manager
+            .handle_send_messages_request(self.current_sender, request)
+            .map_err(|e| ChannelError::RequestFailed(format!("Handler failed: {}", e)))?;
+        Ok(response)
+    }
+
+    async fn retrieve_messages(
+        &self,
+        _party: &Address,
+        _request: &RetrieveMessagesRequest,
+    ) -> ChannelResult<RetrieveMessagesResponse> {
+        unimplemented!("BundleScenarioP2PChannel does not implement retrieve_messages")
+    }
+
+    async fn complain(
+        &self,
+        _party: &Address,
+        _request: &ComplainRequest,
+    ) -> ChannelResult<ComplaintResponse> {
+        unimplemented!("BundleScenarioP2PChannel does not implement complain")
+    }
+
+    async fn get_public_mpc_output(
+        &self,
+        _party: &Address,
+        _request: &GetPublicMpcOutputRequest,
+    ) -> ChannelResult<GetPublicMpcOutputResponse> {
+        unimplemented!("BundleScenarioP2PChannel does not implement get_public_mpc_output")
+    }
+
+    async fn get_partial_signatures(
+        &self,
+        _party: &Address,
+        _request: &GetPartialSignaturesRequest,
+    ) -> ChannelResult<GetPartialSignaturesResponse> {
+        unimplemented!("BundleScenarioP2PChannel does not implement get_partial_signatures")
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn test_repeat_dealer_round_engages_the_replay_path_and_reuses_the_signer_set() {
+#[tracing_test::traced_test]
+async fn test_run_as_avid_nonce_dealer_bundled_non_signer_completes_the_round() {
     let setup = TestSetup::new(6);
     let batch_index = 0u32;
     let dealer_addr = setup.address(0);
-    let metrics = test_metrics();
-    let reused = || {
-        metrics
-            .mpc_nonce_dealer_signer_set_replay_total
-            .with_label_values(&["reused"])
-            .get()
-    };
-    let incomplete = || {
-        metrics
-            .mpc_nonce_dealer_signer_set_replay_total
-            .with_label_values(&["incomplete"])
-            .get()
-    };
-
-    let others: HashMap<_, _> = (1..5)
+    let others: HashMap<_, _> = (1..6)
         .map(|i| (setup.address(i), setup.create_manager(i)))
         .collect();
-    let mock_p2p = MockP2PChannel::new(others, dealer_addr);
+    let channel = BundleScenarioP2PChannel {
+        managers: Arc::new(std::sync::Mutex::new(others)),
+        current_sender: dealer_addr,
+        fail_optimistic_to: [setup.address(5)].into_iter().collect(),
+        fail_dispersal_to: [setup.address(4)].into_iter().collect(),
+    };
     let mut mock_tob = MockOrderedBroadcastChannel::new(vec![]);
     let dealer = Arc::new(RwLock::new(setup.create_manager(0)));
 
-    MpcManager::run_as_avid_nonce_dealer(&dealer, batch_index, &mock_p2p, &mut mock_tob, &metrics)
-        .await
-        .unwrap();
-    assert_eq!(
-        reused(),
-        0,
-        "the first round has no stored signer set to reuse"
-    );
-
-    MpcManager::run_as_avid_nonce_dealer(&dealer, batch_index, &mock_p2p, &mut mock_tob, &metrics)
-        .await
-        .unwrap();
-    assert_eq!(
-        reused(),
-        1,
-        "the repeat round must rebuild the stored signer set, not collect a fresh one"
-    );
-    assert_eq!(incomplete(), 0);
-
-    let published = mock_tob.published.lock().unwrap().clone();
-    assert_eq!(published.len(), 2);
-    let hash_of = |c: &CertificateV1| {
-        let CertificateV1::NonceGeneration { cert, .. } = c else {
-            panic!("expected a nonce cert");
-        };
-        cert.message().messages_hash
-    };
-    assert_eq!(
-        hash_of(&published[0]),
-        hash_of(&published[1]),
-        "the repeat round reproduces the stored round's AvidVote"
-    );
-
-    let swapped: HashMap<_, _> = [1, 2, 3, 5]
-        .into_iter()
-        .map(|i| (setup.address(i), setup.create_manager(i)))
-        .collect();
-    let swapped = MockP2PChannel::new(swapped, dealer_addr);
-    let result = MpcManager::run_as_avid_nonce_dealer(
+    MpcManager::run_as_avid_nonce_dealer(
         &dealer,
         batch_index,
-        &swapped,
+        &channel,
         &mut mock_tob,
-        &metrics,
+        &test_metrics(),
+    )
+    .await
+    .expect("the round completes because the bundled non-signer votes");
+
+    let published = mock_tob.published.lock().unwrap().clone();
+    assert_eq!(published.len(), 1);
+    assert!(
+        published[0].weight(setup.committee()).unwrap() >= 5,
+        "the Vote cert reaches the W-f quorum with the bundled non-signer's vote"
+    );
+    assert!(logs_contain(
+        "processed round-1 message bundled with an AVID dispersal"
+    ));
+    assert!(logs_contain("AVID nonce Vote quorum reached"));
+
+    let managers = channel.managers.lock().unwrap();
+    let non_signer = managers.get(&setup.address(5)).unwrap();
+    assert!(
+        non_signer
+            .avid_held_echoes
+            .contains_key(&(batch_index, dealer_addr)),
+        "the non-signer processed the attachment and voted"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_repeat_dealer_round_reuses_the_stored_cert_without_reconfirming() {
+    let setup = TestSetup::new(6);
+    let batch_index = 0u32;
+    let dealer_addr = setup.address(0);
+    let managers = std::sync::Arc::new(std::sync::Mutex::new(
+        (1..6)
+            .map(|i| (setup.address(i), setup.create_manager(i)))
+            .collect::<HashMap<_, _>>(),
+    ));
+    let dealer = Arc::new(RwLock::new(setup.create_manager(0)));
+
+    let run1 = BundleScenarioP2PChannel {
+        managers: managers.clone(),
+        current_sender: dealer_addr,
+        fail_optimistic_to: [setup.address(5)].into_iter().collect(),
+        fail_dispersal_to: [setup.address(4), setup.address(5)].into_iter().collect(),
+    };
+    let mut tob1 = MockOrderedBroadcastChannel::new(vec![]);
+    let first = MpcManager::run_as_avid_nonce_dealer(
+        &dealer,
+        batch_index,
+        &run1,
+        &mut tob1,
+        &test_metrics(),
     )
     .await;
     assert!(
-        matches!(result, Err(MpcError::ProtocolFailed(_))),
-        "{result:?}"
+        matches!(first, Err(MpcError::NotEnoughApprovals { .. })),
+        "run 1 reaches the pessimistic path but the vote falls short: {first:?}"
     );
-    assert_eq!(
-        incomplete(),
-        1,
-        "a round that cannot reassemble the stored signer set must refuse, and say so"
-    );
-    assert_eq!(reused(), 1);
-    assert_eq!(
-        mock_tob.published.lock().unwrap().len(),
-        2,
-        "the refusing round published nothing"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_repeat_dealer_round_waits_for_a_slow_member_of_the_stored_signer_set() {
-    let setup = TestSetup::new(9);
-    let batch_index = 0u32;
-    let dealer_addr = setup.address(0);
-    let metrics = test_metrics();
-    let reused = || {
-        metrics
-            .mpc_nonce_dealer_signer_set_replay_total
-            .with_label_values(&["reused"])
-            .get()
-    };
-    let dealer = Arc::new(RwLock::new(setup.create_manager(0)));
-    let mut mock_tob = MockOrderedBroadcastChannel::new(vec![]);
-    let reachable: HashMap<_, _> = (1..8)
-        .map(|i| (setup.address(i), setup.create_manager(i)))
-        .collect();
-    let first = MockP2PChannel::new(reachable, dealer_addr);
-    MpcManager::run_as_avid_nonce_dealer(&dealer, batch_index, &first, &mut mock_tob, &metrics)
-        .await
-        .unwrap();
-    assert_eq!(reused(), 0);
-    let pending = dealer
-        .read()
-        .unwrap()
-        .avid_held_echoes
-        .get(&(batch_index, dealer_addr))
-        .map(|(vote, _)| vote.vote.recipients.clone())
-        .expect("the first round dispersed and held its own echoes");
+    assert!(tob1.published.lock().unwrap().is_empty());
     assert!(
-        (dealer.read().unwrap().mpc_config.max_faulty as usize) > pending.len(),
-        "the stored signer set must carry slack over W-f, or the weight bar cannot be met \
-         without the slow member and the gate is inert"
-    );
-
-    let reachable: HashMap<_, _> = (1..8)
-        .map(|i| (setup.address(i), setup.create_manager(i)))
-        .collect();
-    let stalls = (BATCH_AVSS_VOTES_GRACE.as_secs()
-        / crate::communication::timeout_and_retry::CALL_TIMEOUT.as_secs()
-        + 1) as usize;
-    let slow = FlakyP2PChannel::new(
-        MockP2PChannel::new(reachable, dealer_addr),
-        HashMap::from([(setup.address(7), stalls)]),
-    );
-    MpcManager::run_as_avid_nonce_dealer(&dealer, batch_index, &slow, &mut mock_tob, &metrics)
-        .await
-        .unwrap();
-    assert_eq!(
-        reused(),
-        1,
-        "the round must hold collection open for a stored signer that answers after the grace"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_repeat_dealer_round_narrows_a_wider_confirm_set_back_to_the_stored_one() {
-    let setup = TestSetup::new(9);
-    let batch_index = 0u32;
-    let dealer_addr = setup.address(0);
-    let metrics = test_metrics();
-    let reused = || {
-        metrics
-            .mpc_nonce_dealer_signer_set_replay_total
-            .with_label_values(&["reused"])
-            .get()
-    };
-
-    let dealer = Arc::new(RwLock::new(setup.create_manager(0)));
-    let mut mock_tob = MockOrderedBroadcastChannel::new(vec![]);
-    let narrow: HashMap<_, _> = (1..7)
-        .map(|i| (setup.address(i), setup.create_manager(i)))
-        .collect();
-    let first = MockP2PChannel::new(narrow, dealer_addr);
-    MpcManager::run_as_avid_nonce_dealer(&dealer, batch_index, &first, &mut mock_tob, &metrics)
-        .await
-        .unwrap();
-    let pending = dealer
-        .read()
-        .unwrap()
-        .avid_held_echoes
-        .get(&(batch_index, dealer_addr))
-        .map(|(vote, _)| vote.vote.recipients.clone())
-        .expect("the first round dispersed and held its own echoes");
-    assert_eq!(
-        pending.len(),
-        2,
-        "two pending members leave room for a strictly wider confirm set that is still short of W"
-    );
-
-    let wider: HashMap<_, _> = (1..8)
-        .map(|i| (setup.address(i), setup.create_manager(i)))
-        .collect();
-    let second = MockP2PChannel::new(wider, dealer_addr);
-    MpcManager::run_as_avid_nonce_dealer(&dealer, batch_index, &second, &mut mock_tob, &metrics)
-        .await
-        .unwrap();
-    assert!(
-        second
-            .managers
-            .lock()
+        dealer
+            .read()
             .unwrap()
-            .get(&setup.address(7))
-            .unwrap()
-            .dealer_avid_nonce_outputs
+            .avid_held_echoes
             .contains_key(&(batch_index, dealer_addr)),
-        "the member pending in round 1 must have confirmed in round 2, or the round never \
-         collected a wider set and this test proves nothing"
-    );
-    assert_eq!(
-        reused(),
-        1,
-        "a round that confirms more than the stored set must narrow back to it, not refuse"
+        "run 1 persisted the held echoes and the confirm certificate"
     );
 
-    let published = mock_tob.published.lock().unwrap().clone();
-    assert_eq!(published.len(), 2);
-    let hash_of = |c: &CertificateV1| {
-        let CertificateV1::NonceGeneration { cert, .. } = c else {
-            panic!("expected a nonce cert");
-        };
-        cert.message().messages_hash
+    let run2 = BundleScenarioP2PChannel {
+        managers: managers.clone(),
+        current_sender: dealer_addr,
+        fail_optimistic_to: (1..6).map(|i| setup.address(i)).collect(),
+        fail_dispersal_to: HashSet::new(),
     };
-    assert_eq!(
-        hash_of(&published[0]),
-        hash_of(&published[1]),
-        "the extra confirmer must not change the dispersal"
+    let mut tob2 = MockOrderedBroadcastChannel::new(vec![]);
+    MpcManager::run_as_avid_nonce_dealer(&dealer, batch_index, &run2, &mut tob2, &test_metrics())
+        .await
+        .expect("the replay reproduces the dispersal from the stored cert, reconfirming nobody");
+    let published = tob2.published.lock().unwrap().clone();
+    assert_eq!(published.len(), 1);
+    assert!(
+        published[0].weight(setup.committee()).unwrap() >= 5,
+        "the replay reuses the stored cert and publishes without attempting round 1 (had it not, \
+         every round-1 send is configured to fail and the round would abandon)"
     );
 }
 
@@ -13602,7 +14111,9 @@ async fn test_avid_sizing_excludes_a_thin_confirm_cert_from_the_decided_set() {
         avid_confirm_signatures(&setup, &mut managers, 2, batch_index, &mut rng);
 
     let make_cert = |target: &AvssVoteMessagesHash, sigs: &[MemberSignature], take: usize| {
-        let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), target.clone());
+        let mut agg = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, target.clone());
         for sig in sigs.iter().take(take) {
             agg.add_signature(sig.clone()).unwrap();
         }
@@ -13666,7 +14177,9 @@ async fn test_avid_sizing_excludes_a_zero_weight_dealer_before_the_party_phase()
     let (second_sigs, second_target) =
         avid_confirm_signatures(&setup, &mut managers, 2, batch_index, &mut rng);
     let make_cert = |target: &AvssVoteMessagesHash, sigs: &[MemberSignature]| {
-        let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), target.clone());
+        let mut agg = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, target.clone());
         for sig in sigs.iter().take(6) {
             agg.add_signature(sig.clone()).unwrap();
         }
@@ -13749,7 +14262,9 @@ async fn test_nonce_party_phase_does_not_count_a_loop_skip_as_unmaterialised() {
     let (second_sigs, second_target) =
         avid_confirm_signatures(&setup, &mut managers, 2, batch_index, &mut rng);
     let make_cert = |target: &AvssVoteMessagesHash, sigs: &[MemberSignature]| {
-        let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), target.clone());
+        let mut agg = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, target.clone());
         for sig in sigs.iter().take(6) {
             agg.add_signature(sig.clone()).unwrap();
         }
@@ -13815,7 +14330,9 @@ fn two_full_certs_fixture(
     let (second_sigs, second_target) =
         avid_confirm_signatures(setup, &mut managers, 2, batch_index, rng);
     let make_cert = |target: &AvssVoteMessagesHash, sigs: &[MemberSignature]| {
-        let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), target.clone());
+        let mut agg = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, target.clone());
         for sig in sigs {
             agg.add_signature(sig.clone()).unwrap();
         }
@@ -13846,11 +14363,9 @@ async fn test_avid_party_does_not_pull_for_a_confirm_cert_without_round_state() 
         messages_hash: MessagesHash::from([9u8; 32]),
         batch_index,
     };
-    let mut agg = BlsSignatureAggregator::new(
-        TEST_HASHI_ID,
-        setup.committee(),
-        unresolvable_target.clone(),
-    );
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, unresolvable_target.clone());
     for i in 0..6 {
         agg.add_signature(setup.signing_keys[i].sign(
             TEST_HASHI_ID,
@@ -14020,8 +14535,9 @@ fn cut_off_confirmer_fixture(setup: &TestSetup, batch_index: u32) -> CutOffConfi
         messages_hash: hash_avid_vote(&avid_vote),
         batch_index,
     };
-    let mut agg =
-        BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), vote_target.clone());
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, vote_target.clone());
     for s in vote_sigs {
         agg.add_signature(s).unwrap();
     }
@@ -14157,8 +14673,9 @@ async fn test_avid_party_does_not_pull_for_a_confirm_cert_over_a_different_commo
         messages_hash: MessagesHash::from([9u8; 32]),
         batch_index,
     };
-    let mut agg =
-        BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), other_target.clone());
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, other_target.clone());
     for i in 0..6 {
         agg.add_signature(setup.signing_keys[i].sign(
             TEST_HASHI_ID,
@@ -14212,18 +14729,13 @@ fn test_consume_certified_nonce_outputs_drops_avid_entries_the_loop_did_not_stam
         .get_mut(&(batch_index, stamped))
         .unwrap()
         .cert_digest = Some(MessagesHash::from([1u8; 32]));
-    let indices = party
-        .mpc_config
-        .nodes
-        .share_ids_of(party.party_id().unwrap())
-        .unwrap();
 
     let (_, dealers, outputs) = consume_certified_nonce_outputs(
         &mut party.dealer_avid_nonce_outputs,
         batch_index,
         &HashSet::from([stamped, overwritten]),
         |tagged| tagged.cert_digest.is_some(),
-        |tagged| tagged.output.clone().into_legacy(&indices),
+        |tagged| tagged.output.clone(),
     );
 
     assert_eq!(dealers, vec![stamped]);
@@ -14423,7 +14935,9 @@ async fn test_run_as_avid_nonce_party_local_skips_a_confirm_cert_with_no_round_s
     let (second_sigs, second_target) =
         avid_confirm_signatures(&setup, &mut managers, 2, batch_index, &mut rng);
     let make_cert = |target: &AvssVoteMessagesHash, sigs: &[MemberSignature]| {
-        let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), target.clone());
+        let mut agg = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, target.clone());
         for sig in sigs.iter().take(6) {
             agg.add_signature(sig.clone()).unwrap();
         }
@@ -14571,7 +15085,9 @@ async fn test_run_as_avid_nonce_party_rederives_after_restart() {
     let (second_sigs, second_target) =
         avid_confirm_signatures(&setup, &mut managers, 2, batch_index, &mut rng);
     let make_full_cert = |target: &AvssVoteMessagesHash, sigs: Vec<MemberSignature>| {
-        let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), target.clone());
+        let mut agg = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, target.clone());
         for sig in sigs {
             agg.add_signature(sig).unwrap();
         }
@@ -14644,8 +15160,9 @@ fn test_avid_recovery_sizing_skips_sub_quorum_certs() {
                 dealer_address,
                 messages_hash: MessagesHash::from([dealer_idx as u8 + 1; 32]),
             };
-            let mut aggregator =
-                BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), message.clone());
+            let mut aggregator = setup
+                .committee()
+                .signature_aggregator(TEST_HASHI_ID, message.clone());
             for &s in signers {
                 let sig = setup.signing_keys[s].sign(
                     TEST_HASHI_ID,
@@ -14828,7 +15345,9 @@ async fn test_classification_survives_the_carrier_into_sizing() {
         messages_hash,
         batch_index,
     };
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), confirm.clone());
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, confirm.clone());
     for i in 0..4usize {
         agg.add_signature(setup.signing_keys[i].sign(
             TEST_HASHI_ID,
@@ -14921,7 +15440,9 @@ fn test_verify_and_classify_recovers_the_cert_kind() {
         messages_hash,
         batch_index: 3,
     };
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, avid.committee(), confirm.clone());
+    let mut agg = avid
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, confirm.clone());
     for s in 0..4usize {
         agg.add_signature(avid.signing_keys[s].sign(
             TEST_HASHI_ID,
@@ -14949,7 +15470,9 @@ fn test_verify_and_classify_recovers_the_cert_kind() {
         messages_hash,
         batch_index: 3,
     };
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, avid.committee(), vote.clone());
+    let mut agg = avid
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, vote.clone());
     for s in 0..4usize {
         agg.add_signature(avid.signing_keys[s].sign(
             TEST_HASHI_ID,
@@ -14978,7 +15501,9 @@ fn test_verify_and_classify_recovers_the_cert_kind() {
         lone_weight < vote_quorum,
         "one signer must sit under the vote bar or this proves nothing"
     );
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, avid.committee(), vote.clone());
+    let mut agg = avid
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, vote.clone());
     agg.add_signature(avid.signing_keys[0].sign(
         TEST_HASHI_ID,
         avid.epoch(),
@@ -15010,7 +15535,9 @@ fn test_verify_and_classify_recovers_the_cert_kind() {
         three_weight >= vote_quorum && three_weight < total,
         "three signers must clear the vote bar but not the confirm bar, or this proves nothing"
     );
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, avid.committee(), confirm.clone());
+    let mut agg = avid
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, confirm.clone());
     for s in 0..3usize {
         agg.add_signature(avid.signing_keys[s].sign(
             TEST_HASHI_ID,
@@ -15041,7 +15568,9 @@ fn test_verify_and_classify_recovers_the_cert_kind() {
         messages_hash,
     };
     let unclassified = {
-        let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, avid.committee(), legacy.clone());
+        let mut agg = avid
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, legacy.clone());
         for s in 0..4usize {
             agg.add_signature(avid.signing_keys[s].sign(
                 TEST_HASHI_ID,
@@ -15078,7 +15607,9 @@ fn test_nonce_cert_does_not_verify_under_another_batch_index() {
         messages_hash,
         batch_index: 0,
     };
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, avid.committee(), target.clone());
+    let mut agg = avid
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, target.clone());
     for s in 0..4usize {
         agg.add_signature(avid.signing_keys[s].sign(
             TEST_HASHI_ID,
@@ -15121,8 +15652,9 @@ fn test_avid_cutoff_ignores_certs_the_bar_excludes() {
                 dealer_address,
                 messages_hash: MessagesHash::from([dealer_idx as u8 + 1; 32]),
             };
-            let mut aggregator =
-                BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), message.clone());
+            let mut aggregator = setup
+                .committee()
+                .signature_aggregator(TEST_HASHI_ID, message.clone());
             for &s in signers {
                 let sig = setup.signing_keys[s].sign(
                     TEST_HASHI_ID,
@@ -15183,8 +15715,9 @@ async fn test_avid_party_counts_a_zero_weight_dealer_in_a_decided_set_as_a_skip(
         dealer_address,
         messages_hash: MessagesHash::from([7u8; 32]),
     };
-    let mut aggregator =
-        BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), message.clone());
+    let mut aggregator = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, message.clone());
     for s in 0..4 {
         let sig =
             setup.signing_keys[s].sign(TEST_HASHI_ID, setup.epoch(), setup.address(s), &message);
@@ -15242,8 +15775,9 @@ fn test_avid_sizing_reports_whether_the_window_closed() {
             dealer_address,
             messages_hash: MessagesHash::from([dealer_idx as u8 + 1; 32]),
         };
-        let mut aggregator =
-            BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), message.clone());
+        let mut aggregator = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, message.clone());
         for &s in &all {
             let sig = setup.signing_keys[s].sign(
                 TEST_HASHI_ID,
@@ -15283,6 +15817,57 @@ fn test_avid_sizing_reports_whether_the_window_closed() {
 }
 
 #[test]
+fn test_dealer_set_digest_covers_only_the_admitted_certs() {
+    let setup = TestSetup::with_weights(&[4, 3, 2, 1]);
+    let mgr = setup.create_manager(0);
+    let epoch = setup.committee().epoch();
+    let from_chain = |submissions: Vec<(Address, hashi_types::move_types::DealerSubmissionV1)>| {
+        let kinds = submissions
+            .iter()
+            .map(|(dealer, _)| (*dealer, CertKind::AvidVote))
+            .collect();
+        crate::mpc::service::nonce_certificates(
+            &VerifiedNonceCerts::new(submissions, kinds),
+            epoch,
+            0,
+        )
+    };
+    let all = [0, 1, 2, 3];
+
+    let admitted = mgr
+        .avid_admitted_nonce_dealers(
+            &from_chain(vec![
+                valid_dealer_submission_signed_by(&setup, 0, 1_000, &all),
+                valid_dealer_submission_signed_by(&setup, 1, 1_100, &all),
+                valid_dealer_submission_signed_by(&setup, 2, 1_200, &[3]),
+                valid_dealer_submission_signed_by(&setup, 3, 5_000, &all),
+            ]),
+            Some(2_000),
+        )
+        .unwrap();
+    let only_admitted = mgr
+        .avid_admitted_nonce_dealers(
+            &from_chain(vec![
+                valid_dealer_submission_signed_by(&setup, 0, 1_000, &all),
+                valid_dealer_submission_signed_by(&setup, 1, 1_100, &all),
+            ]),
+            Some(2_000),
+        )
+        .unwrap();
+
+    let admitted_dealers: Vec<Address> = admitted.dealers.iter().map(|d| d.dealer).collect();
+    assert_eq!(admitted_dealers, vec![setup.address(0), setup.address(1)]);
+    assert_eq!(
+        admitted.dealer_set_digest(),
+        only_admitted.dealer_set_digest()
+    );
+    assert_eq!(
+        hex::encode(admitted.dealer_set_digest()),
+        "e1568d3be309645d5f0cc272655f4d9e29e02a1e571c69bedc84e16b91d0e5ca",
+    );
+}
+
+#[test]
 fn test_avid_sizing_counts_past_the_floor() {
     let setup = TestSetup::with_weights(&[3, 3, 3, 1]);
     let mgr = setup.create_manager(0);
@@ -15295,8 +15880,9 @@ fn test_avid_sizing_counts_past_the_floor() {
             dealer_address,
             messages_hash: MessagesHash::from([dealer_idx as u8 + 1; 32]),
         };
-        let mut aggregator =
-            BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), message.clone());
+        let mut aggregator = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, message.clone());
         for s in 0..4 {
             let sig = setup.signing_keys[s].sign(
                 TEST_HASHI_ID,
@@ -15496,7 +16082,9 @@ async fn test_run_nonce_generation_avid_consumes_and_converts() {
     let (second_sigs, second_target) =
         avid_confirm_signatures(&setup, &mut managers, 2, batch_index, &mut rng);
     let make_full_cert = |target: &AvssVoteMessagesHash, sigs: Vec<MemberSignature>| {
-        let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), target.clone());
+        let mut agg = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, target.clone());
         for sig in sigs {
             agg.add_signature(sig).unwrap();
         }
@@ -15540,6 +16128,7 @@ async fn test_run_nonce_generation_avid_consumes_and_converts() {
 fn test_decoded_shares_match_optimistic_shares() {
     let setup = TestSetup::new(6);
     let batch_index = 0u32;
+    // Confirmers {0..4}, decoder = node 5. Decode needs W−2f=4 shards; the Vote cert needs W−f=5.
     let mut fx = avid_pessimistic_fixture(&setup, 0, batch_index, &[0, 1, 2, 3, 4]);
     let dispersals = fx
         .dealer
@@ -15550,7 +16139,7 @@ fn test_decoded_shares_match_optimistic_shares() {
     let mut vote_sigs = Vec::new();
     let mut avid_vote = None;
     let mut echoes = Vec::new();
-    for j in [1usize, 2, 3, 4] {
+    for j in [0usize, 1, 2, 3, 4] {
         let voter = &mut fx.confirmers[j];
         let (dispersal, confirm_cert) = extract_dispersal(&dispersals[j].1);
         let (vote, av, es) = voter
@@ -15571,12 +16160,22 @@ fn test_decoded_shares_match_optimistic_shares() {
         echoes.push((j as PartyId, extract_echo_for(&es, decoder_addr)));
     }
     let avid_vote = avid_vote.unwrap();
+    assert_eq!(
+        vote_sigs.len() as u32,
+        MpcManager::avid_vote_quorum(
+            &fx.confirmers[0].mpc_config.nodes,
+            fx.confirmers[0].mpc_config.max_faulty,
+        ),
+        "the fixture must supply a full W-f AvidVote quorum",
+    );
     let vote_target = AvidVoteMessagesHash {
         dealer_address: fx.dealer_addr,
         messages_hash: hash_avid_vote(&avid_vote),
         batch_index,
     };
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), vote_target);
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, vote_target);
     for s in vote_sigs {
         agg.add_signature(s).unwrap();
     }
@@ -15637,8 +16236,7 @@ fn test_decoded_shares_match_optimistic_shares() {
         .nodes
         .share_ids_of(decoder.party_id().unwrap())
         .unwrap();
-    let decoded = decoded.into_legacy(&indices);
-    let direct = direct.output.into_legacy(&indices);
+    let direct = direct.output;
     assert_eq!(
         bcs::to_bytes(&decoded.public_keys).unwrap(),
         bcs::to_bytes(&direct.public_keys).unwrap(),
@@ -15649,24 +16247,24 @@ fn test_decoded_shares_match_optimistic_shares() {
         direct.my_shares.shares.len(),
         "share-batch counts must match"
     );
-    for (d, o) in decoded
+    for ((d, o), index) in decoded
         .my_shares
         .shares
         .iter()
         .zip(direct.my_shares.shares.iter())
+        .zip(&indices)
     {
-        assert_eq!(d.index, o.index, "share indices must match");
         assert_eq!(
             bcs::to_bytes(&d.batch).unwrap(),
             bcs::to_bytes(&o.batch).unwrap(),
             "share values must match for index {}",
-            d.index
+            index
         );
         assert_eq!(
             bcs::to_bytes(&d.blinding_share).unwrap(),
             bcs::to_bytes(&o.blinding_share).unwrap(),
             "blinding shares must match for index {}",
-            d.index
+            index
         );
     }
 }
@@ -15687,7 +16285,9 @@ async fn test_run_nonce_generation_avid_recovers_from_replayed_certs() {
     let (second_sigs, second_target) =
         avid_confirm_signatures(&setup, &mut managers, 2, batch_index, &mut rng);
     let make_full_cert = |target: &AvssVoteMessagesHash, sigs: Vec<MemberSignature>| {
-        let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), target.clone());
+        let mut agg = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, target.clone());
         for sig in sigs {
             agg.add_signature(sig).unwrap();
         }
@@ -15847,11 +16447,9 @@ fn test_avid_voter_state_survives_restart() {
         ));
     }
     let cert = |sigs: &[MemberSignature]| {
-        let mut agg = BlsSignatureAggregator::new(
-            TEST_HASHI_ID,
-            setup.committee(),
-            flow.confirm_target.clone(),
-        );
+        let mut agg = setup
+            .committee()
+            .signature_aggregator(TEST_HASHI_ID, flow.confirm_target.clone());
         for sig in sigs {
             agg.add_signature(sig.clone()).unwrap();
         }
@@ -15873,17 +16471,17 @@ fn test_avid_voter_state_survives_restart() {
         .unwrap();
 
     let mut vote_sigs = Vec::new();
-    for i in [1usize, 2, 3, 4] {
+    for i in [0usize, 1, 2, 3, 4] {
         let addr = setup.address(i);
         let (_, msg) = dispersals_a
             .iter()
             .find(|(a, _)| *a == addr)
             .unwrap()
             .clone();
-        let mgr = if i == 1 {
-            &mut voter
-        } else {
-            others.get_mut(&i).unwrap()
+        let mgr = match i {
+            0 => &mut dealer,
+            1 => &mut voter,
+            _ => others.get_mut(&i).unwrap(),
         };
         let response = mgr
             .handle_send_messages_request(dealer_addr, &SendMessagesRequest { messages: msg })
@@ -15894,7 +16492,12 @@ fn test_avid_voter_state_survives_restart() {
             response.signature,
         ));
     }
-    let (held_vote, held_echoes) = voter
+    assert_eq!(
+        vote_sigs.len() as u32,
+        MpcManager::avid_vote_quorum(&voter.mpc_config.nodes, voter.mpc_config.max_faulty),
+        "the fixture must supply a full W-f AvidVote quorum",
+    );
+    let (held_vote, held_echoes, _) = voter
         .avid_held_echoes
         .get(&(batch_index, dealer_addr))
         .unwrap()
@@ -15905,7 +16508,9 @@ fn test_avid_voter_state_survives_restart() {
         messages_hash: hash_avid_vote(&held_vote),
         batch_index,
     };
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), vote_target);
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, vote_target);
     for sig in vote_sigs {
         agg.add_signature(sig).unwrap();
     }
@@ -15961,7 +16566,7 @@ fn test_avid_voter_state_survives_restart() {
     for (i, echo) in [(1usize, served_echo)]
         .into_iter()
         .chain([2, 3, 4].map(|i| {
-            let (_, held) = others[&i]
+            let (_, held, _) = others[&i]
                 .avid_held_echoes
                 .get(&(batch_index, dealer_addr))
                 .unwrap()
@@ -16052,11 +16657,9 @@ fn test_handle_avid_nonce_complaint_responds_and_gates() {
         ));
         confirmers.push(mgr);
     }
-    let mut agg = BlsSignatureAggregator::new(
-        TEST_HASHI_ID,
-        setup.committee(),
-        flow.confirm_target.clone(),
-    );
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, flow.confirm_target.clone());
     for sig in &sigs {
         agg.add_signature(sig.clone()).unwrap();
     }
@@ -16078,7 +16681,7 @@ fn test_handle_avid_nonce_complaint_responds_and_gates() {
             addr,
             response.signature,
         ));
-        let (_, held) = mgr
+        let (_, held, _) = mgr
             .avid_held_echoes
             .get(&(batch_index, dealer_addr))
             .unwrap()
@@ -16088,7 +16691,29 @@ fn test_handle_avid_nonce_complaint_responds_and_gates() {
             extract_echo_for(&held, victim),
         ));
     }
-    let (held_vote, _) = confirmers[0]
+    // The dealer also votes on its own dispersal, so the Vote cert reaches W − f.
+    let (_, msg) = dispersals
+        .iter()
+        .find(|(a, _)| *a == dealer_addr)
+        .unwrap()
+        .clone();
+    let response = dealer_mgr
+        .handle_send_messages_request(dealer_addr, &SendMessagesRequest { messages: msg })
+        .unwrap();
+    vote_sigs.push(MemberSignature::new(
+        dealer_mgr.mpc_config.epoch,
+        dealer_addr,
+        response.signature,
+    ));
+    assert_eq!(
+        vote_sigs.len() as u32,
+        MpcManager::avid_vote_quorum(
+            &confirmers[0].mpc_config.nodes,
+            confirmers[0].mpc_config.max_faulty,
+        ),
+        "the fixture must supply a full W-f AvidVote quorum",
+    );
+    let (held_vote, _, _) = confirmers[0]
         .avid_held_echoes
         .get(&(batch_index, dealer_addr))
         .unwrap()
@@ -16098,7 +16723,9 @@ fn test_handle_avid_nonce_complaint_responds_and_gates() {
         messages_hash: hash_avid_vote(&held_vote),
         batch_index,
     };
-    let mut agg = BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), vote_target);
+    let mut agg = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, vote_target);
     for sig in vote_sigs {
         agg.add_signature(sig).unwrap();
     }
@@ -16166,7 +16793,7 @@ fn test_handle_avid_nonce_complaint_responds_and_gates() {
         "a complaint from the wrong accuser must not be answered: {result:?}"
     );
 
-    let (blame_vote, _) = confirmers[0]
+    let (blame_vote, _, _) = confirmers[0]
         .avid_held_echoes
         .get(&(batch_index, dealer_addr))
         .unwrap()
@@ -16176,8 +16803,9 @@ fn test_handle_avid_nonce_complaint_responds_and_gates() {
         messages_hash: hash_avid_vote(&blame_vote),
         batch_index,
     };
-    let mut thin =
-        BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), blame_target.clone());
+    let mut thin = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, blame_target.clone());
     thin.add_signature(setup.signing_keys[0].sign(
         TEST_HASHI_ID,
         setup.epoch(),
@@ -16205,8 +16833,9 @@ fn test_handle_avid_nonce_complaint_responds_and_gates() {
         "a blame complaint carrying a sub-quorum vote cert must be refused: {result:?}"
     );
 
-    let mut full =
-        BlsSignatureAggregator::new(TEST_HASHI_ID, setup.committee(), blame_target.clone());
+    let mut full = setup
+        .committee()
+        .signature_aggregator(TEST_HASHI_ID, blame_target.clone());
     for i in 0..6usize {
         full.add_signature(setup.signing_keys[i].sign(
             TEST_HASHI_ID,
@@ -16372,20 +17001,17 @@ fn make_jumped_committee_set(setup: &mut TestSetup, prev_epoch: u64) {
         TEST_WEIGHT_REDUCTION_ALLOWED_DELTA,
         TEST_MAX_FAULTY_IN_BASIS_POINTS,
     );
-    let current_committee = setup.committee_set.current_committee().unwrap().clone();
-
-    let mut committees = BTreeMap::new();
-    committees.insert(prev_epoch, prev_committee);
-    committees.insert(current_epoch, current_committee);
-    setup.committee_set.set_committees(committees);
+    let committees = setup.committee_set.committees_mut();
+    committees.retain(|&epoch, _| epoch == current_epoch);
+    committees.insert(prev_epoch, prev_committee.into());
 }
 
 fn make_single_committee_set(setup: &mut TestSetup) {
     let current_epoch = setup.committee_set.epoch();
-    let current_committee = setup.committee_set.current_committee().unwrap().clone();
-    let mut committees = BTreeMap::new();
-    committees.insert(current_epoch, current_committee);
-    setup.committee_set.set_committees(committees);
+    setup
+        .committee_set
+        .committees_mut()
+        .retain(|&epoch, _| epoch == current_epoch);
 }
 
 #[test]
@@ -16527,7 +17153,7 @@ async fn test_fetch_public_mpc_output_uses_previous_epoch() {
     };
 
     let mgr_arc = Arc::new(RwLock::new(manager));
-    let _ = MpcManager::fetch_public_mpc_output_from_quorum(&mgr_arc, &spy, 1).await;
+    let _ = MpcManager::fetch_public_mpc_output_from_quorum(&mgr_arc, &spy, 1, &[]).await;
 
     let captured = captured.lock().unwrap();
     assert!(
@@ -16973,12 +17599,13 @@ fn reduced_weights_are_stable_for_a_fixed_committee() {
             )
         })
         .collect();
-    let weighted = Committee::new(
+    let weighted: RuntimeCommittee = Committee::new(
         members,
         setup.epoch(),
         ALLOWED_DELTA,
         TEST_MAX_FAULTY_IN_BASIS_POINTS,
-    );
+    )
+    .into();
 
     let (nodes, threshold, max_faulty) =
         build_reduced_nodes(&weighted, TEST_WEIGHT_DIVISOR, TEST_CHAIN_ID).unwrap();
@@ -17001,6 +17628,373 @@ fn reduced_weights_are_stable_for_a_fixed_committee() {
         "knapsack restores t + 2f <= W here, which prop_reduce violated on this fixture \
          (82 + 2*82 > 242). Recorded, not guaranteed: it still fails on real Sui weights."
     );
+}
+
+const GOLDEN_SUI_EPOCHS: [(&str, &str); 8] = [
+    (
+        "100",
+        include_str!("golden_fixtures/sui_real_all_voting_power_epoch_100_details.txt"),
+    ),
+    (
+        "200",
+        include_str!("golden_fixtures/sui_real_all_voting_power_epoch_200_details.txt"),
+    ),
+    (
+        "400",
+        include_str!("golden_fixtures/sui_real_all_voting_power_epoch_400_details.txt"),
+    ),
+    (
+        "800",
+        include_str!("golden_fixtures/sui_real_all_voting_power_epoch_800_details.txt"),
+    ),
+    (
+        "974",
+        include_str!("golden_fixtures/sui_real_all_voting_power_epoch_974_details.txt"),
+    ),
+    (
+        "1000",
+        include_str!("golden_fixtures/sui_real_all_voting_power_epoch_1000_details.txt"),
+    ),
+    (
+        "1100",
+        include_str!("golden_fixtures/sui_real_all_voting_power_epoch_1100_details.txt"),
+    ),
+    (
+        "1200",
+        include_str!("golden_fixtures/sui_real_all_voting_power_epoch_1200_details.txt"),
+    ),
+];
+
+const GOLDEN_CONFIG_GRID: [(u16, u16); 16] = [
+    (3333, 0),
+    (3333, 400),
+    (3333, 800),
+    (3333, 1200),
+    (3000, 0),
+    (3000, 400),
+    (3000, 800),
+    (3000, 1200),
+    (2500, 0),
+    (2500, 400),
+    (2500, 800),
+    (2500, 1200),
+    (2000, 0),
+    (2000, 400),
+    (2000, 800),
+    (2000, 1200),
+];
+
+const GOLDEN_SUBSET_CONFIGS: [(u16, u16); 4] = [(3333, 800), (3333, 0), (2500, 800), (2000, 1200)];
+
+const GOLDEN_E2E_CONFIGS: [(u16, u16); 5] = [
+    (3333, 800),
+    (3333, 0),
+    (2500, 800),
+    (2000, 1200),
+    (3000, 800),
+];
+
+const GOLDEN_E2E_DIVISOR: u16 = 100;
+
+const GOLDEN_DEV_CHAIN_ID: &str = "testchain";
+
+const GOLDEN_SYNTHETIC_CONFIGS: [(u16, u16); 4] = [(3333, 800), (3333, 0), (3333, 3332), (1, 0)];
+
+#[derive(serde::Serialize)]
+struct ReductionGolden {
+    case: String,
+    committee_weight: u64,
+    divisor: u16,
+    chain_id: &'static str,
+    max_faulty_bps: u16,
+    allowed_delta_bps: u16,
+    outcome: ReductionGoldenOutcome,
+}
+
+#[derive(serde::Serialize)]
+enum ReductionGoldenOutcome {
+    Reduced {
+        weights: String,
+        total_weight: u16,
+        threshold: u16,
+        max_faulty: u16,
+        share_ids_digest: String,
+    },
+    Error(&'static str),
+}
+
+fn golden_sui_weights(contents: &str) -> Vec<u64> {
+    contents
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.rsplit(',').next().unwrap().trim().parse().unwrap())
+        .collect()
+}
+
+fn golden_error_kind(error: &MpcError) -> &'static str {
+    match error {
+        MpcError::InvalidConfig(_) => "InvalidConfig",
+        MpcError::InvalidThreshold(_) => "InvalidThreshold",
+        MpcError::CryptoError(_) => "CryptoError",
+        other => panic!("unexpected reduction error: {other:?}"),
+    }
+}
+
+fn golden_committee(
+    weights: &[u64],
+    (max_faulty_bps, allowed_delta_bps): (u16, u16),
+) -> RuntimeCommittee {
+    let mut rng = rand::thread_rng();
+    let signing_public_key = Bls12381PrivateKey::generate(&mut rng).public_key();
+    let encryption_public_key = EncryptionPrivateKey::new(&mut rng).public_key();
+    let members = weights
+        .iter()
+        .enumerate()
+        .map(|(index, &weight)| {
+            let mut address = [0u8; 32];
+            address[30..].copy_from_slice(&(index as u16).to_be_bytes());
+            CommitteeMember::new(
+                Address::new(address),
+                signing_public_key.clone(),
+                encryption_public_key.clone(),
+                weight,
+            )
+        })
+        .collect();
+    Committee::new(members, 1, allowed_delta_bps, max_faulty_bps).into()
+}
+
+fn golden_reduction(
+    case: String,
+    weights: &[u64],
+    (max_faulty_bps, allowed_delta_bps): (u16, u16),
+    divisor: u16,
+    chain_id: &'static str,
+) -> ReductionGolden {
+    let committee = golden_committee(weights, (max_faulty_bps, allowed_delta_bps));
+    let outcome = match build_reduced_nodes(&committee, divisor, chain_id) {
+        Ok((nodes, threshold, max_faulty)) => {
+            let share_ids: Vec<Vec<u16>> = (0..nodes.num_nodes())
+                .map(|party| {
+                    nodes
+                        .share_ids_of(party as u16)
+                        .unwrap()
+                        .into_iter()
+                        .map(|share| share.get())
+                        .collect()
+                })
+                .collect();
+            let digest = fastcrypto::hash::Sha256::digest(bcs::to_bytes(&share_ids).unwrap());
+            ReductionGoldenOutcome::Reduced {
+                weights: nodes
+                    .iter()
+                    .map(|node| node.weight.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                total_weight: nodes.total_weight(),
+                threshold,
+                max_faulty,
+                share_ids_digest: hex::encode(&digest.digest[..8]),
+            }
+        }
+        Err(error) => ReductionGoldenOutcome::Error(golden_error_kind(&error)),
+    };
+    ReductionGolden {
+        case,
+        committee_weight: weights.iter().sum(),
+        divisor,
+        chain_id,
+        max_faulty_bps,
+        allowed_delta_bps,
+        outcome,
+    }
+}
+
+struct GoldenInput {
+    family: &'static str,
+    case: String,
+    weights: Vec<u64>,
+    config: (u16, u16),
+    divisor: u16,
+    chain_id: &'static str,
+}
+
+fn golden_corpus() -> Vec<GoldenInput> {
+    let mainnet = crate::constants::SUI_MAINNET_CHAIN_ID;
+    let mut corpus = Vec::new();
+    let mut push = |family, case, weights: &[u64], config, divisor, chain_id| {
+        corpus.push(GoldenInput {
+            family,
+            case,
+            weights: weights.to_vec(),
+            config,
+            divisor,
+            chain_id,
+        })
+    };
+    for (epoch, contents) in GOLDEN_SUI_EPOCHS {
+        let weights = golden_sui_weights(contents);
+        for config in GOLDEN_CONFIG_GRID {
+            push(
+                "sui_mainnet",
+                format!("sui_epoch_{epoch}"),
+                &weights,
+                config,
+                1,
+                mainnet,
+            );
+        }
+        for (subset, dropped) in [("keep_90", 9..10), ("keep_70", 7..10)] {
+            let kept: Vec<u64> = weights
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !dropped.contains(&(index % 10)))
+                .map(|(_, &weight)| weight)
+                .collect();
+            for config in GOLDEN_SUBSET_CONFIGS {
+                push(
+                    "sui_mainnet_subsets",
+                    format!("sui_epoch_{epoch}_{subset}"),
+                    &kept,
+                    config,
+                    1,
+                    mainnet,
+                );
+            }
+        }
+    }
+    for members in 1..=100u64 {
+        for config in [(3333, 800), (3333, 0)] {
+            push(
+                "equal_weights",
+                format!("equal_{members}"),
+                &vec![10_000 / members; members as usize],
+                config,
+                1,
+                mainnet,
+            );
+        }
+    }
+    let e2e_shapes: [(&str, Vec<u64>); 6] = [
+        ("e2e_1_node", vec![10_000]),
+        ("e2e_3_nodes", vec![3334, 3333, 3333]),
+        ("e2e_4_nodes", vec![2500; 4]),
+        (
+            "e2e_7_nodes",
+            vec![1429, 1429, 1429, 1429, 1428, 1428, 1428],
+        ),
+        ("e2e_19_of_20_registered", vec![500; 19]),
+        ("e2e_20_nodes", vec![500; 20]),
+    ];
+    for (shape, weights) in &e2e_shapes {
+        for config in GOLDEN_E2E_CONFIGS {
+            push(
+                "dev",
+                shape.to_string(),
+                weights,
+                config,
+                GOLDEN_E2E_DIVISOR,
+                GOLDEN_DEV_CHAIN_ID,
+            );
+        }
+    }
+    for (shape, weights) in &e2e_shapes {
+        for config in GOLDEN_E2E_CONFIGS {
+            push(
+                "edge_cases",
+                format!("{shape}_production"),
+                weights,
+                config,
+                1,
+                mainnet,
+            );
+        }
+    }
+    for (case, weights, config, divisor, chain_id) in [
+        (
+            "threshold_not_above_max_faulty",
+            vec![1, 1, 1],
+            (3333, 0),
+            1,
+            mainnet,
+        ),
+        (
+            "below_production_floor",
+            vec![10; 5],
+            (3333, 800),
+            1,
+            mainnet,
+        ),
+        (
+            "member_below_divisor",
+            vec![40, 3000, 3000, 3960],
+            (3333, 800),
+            GOLDEN_E2E_DIVISOR,
+            GOLDEN_DEV_CHAIN_ID,
+        ),
+        (
+            "member_above_max_weight",
+            vec![10_001, 1],
+            (3333, 800),
+            1,
+            mainnet,
+        ),
+    ] {
+        push(
+            "edge_cases",
+            case.to_string(),
+            &weights,
+            config,
+            divisor,
+            chain_id,
+        );
+    }
+    let synthetic_shapes: [(&str, Vec<u64>); 6] = [
+        ("whale_40pct", [vec![4000], vec![100; 60]].concat()),
+        ("two_whales_33pct", [vec![3300; 2], vec![100; 34]].concat()),
+        (
+            "three_whales_32pct_and_dust",
+            [vec![3200; 3], vec![1; 400]].concat(),
+        ),
+        ("equal_150", vec![66; 150]),
+        ("near_equal_150", [vec![67; 100], vec![66; 50]].concat()),
+        ("ones_at_floor", vec![1; 100]),
+    ];
+    for (shape, weights) in &synthetic_shapes {
+        for config in GOLDEN_SYNTHETIC_CONFIGS {
+            push("synthetic", shape.to_string(), weights, config, 1, mainnet);
+        }
+    }
+    corpus
+}
+
+#[test]
+fn weight_reduction_v1_goldens() {
+    let mut families: BTreeMap<&str, Vec<ReductionGolden>> = BTreeMap::new();
+    for input in golden_corpus() {
+        families
+            .entry(input.family)
+            .or_default()
+            .push(golden_reduction(
+                input.case,
+                &input.weights,
+                input.config,
+                input.divisor,
+                input.chain_id,
+            ));
+    }
+
+    insta::with_settings!({
+        snapshot_path => "golden_snapshots",
+        prepend_module_to_snapshot => false,
+        omit_expression => true,
+        description => "Append-only goldens of build_reduced_nodes: do not re-accept a mismatch.",
+    }, {
+        for (family, goldens) in &families {
+            insta::assert_yaml_snapshot!(format!("weight_reduction_v1_{family}"), goldens);
+        }
+    });
 }
 
 #[test]
@@ -17026,64 +18020,16 @@ fn derived_thresholds_are_accepted_by_the_reducer() {
                     )
                 })
                 .collect();
-            let committee = Committee::new(
+            let committee: RuntimeCommittee = Committee::new(
                 members,
                 setup.epoch(),
                 TEST_WEIGHT_REDUCTION_ALLOWED_DELTA,
                 f_bps,
-            );
+            )
+            .into();
             build_reduced_nodes(&committee, TEST_WEIGHT_DIVISOR, TEST_CHAIN_ID).unwrap();
         }
     }
-}
-
-#[test]
-fn a_legacy_pinned_committee_keeps_its_original_parameters() {
-    let setup = TestSetup::new(4);
-    let stakes: [u64; 4] = [25, 25, 25, 26];
-    let members: Vec<_> = setup
-        .committee()
-        .members()
-        .iter()
-        .zip(stakes)
-        .map(|(m, stake)| {
-            CommitteeMember::new(
-                m.validator_address(),
-                m.public_key().clone(),
-                m.encryption_public_key().clone(),
-                stake,
-            )
-        })
-        .collect();
-
-    let legacy_config = hashi_types::move_types::Config::from_entries(vec![
-        (
-            "mpc_threshold_in_basis_points".to_string(),
-            hashi_types::move_types::ConfigValue::U64(3334),
-        ),
-        (
-            "mpc_weight_reduction_allowed_delta".to_string(),
-            hashi_types::move_types::ConfigValue::U64(0),
-        ),
-        (
-            "mpc_max_faulty_in_basis_points".to_string(),
-            hashi_types::move_types::ConfigValue::U64(3333),
-        ),
-        (
-            "mpc_nonce_accumulation_window_ms".to_string(),
-            hashi_types::move_types::ConfigValue::U64(0),
-        ),
-    ]);
-    let legacy = Committee::with_config(members.clone(), setup.epoch(), legacy_config);
-    let (nodes, t, f) = build_reduced_nodes(&legacy, TEST_WEIGHT_DIVISOR, TEST_CHAIN_ID).unwrap();
-    assert_eq!(nodes.total_weight(), 101);
-    assert_eq!((t, f), (34, 34));
-
-    let fresh = Committee::new(members.clone(), setup.epoch(), 0, 3333);
-    assert!(fresh.config().legacy_pinned_mpc_threshold().is_none());
-    let (nodes, t, f) = build_reduced_nodes(&fresh, TEST_WEIGHT_DIVISOR, TEST_CHAIN_ID).unwrap();
-    assert_eq!(nodes.total_weight(), 100);
-    assert_eq!((t, f), (26, 25));
 }
 
 #[test]
@@ -17095,13 +18041,14 @@ fn an_underivable_previous_committee_does_not_block_startup() {
         members,
         epoch - 1,
         hashi_types::move_types::Config::from_entries(vec![(
-            "mpc_threshold_in_basis_points".to_string(),
-            hashi_types::move_types::ConfigValue::Bool(true),
+            "mpc_max_faulty_in_basis_points".to_string(),
+            hashi_types::move_types::ConfigValue::U64(5000),
         )]),
     );
-    let mut committees = setup.committee_set.committees().clone();
-    committees.insert(epoch - 1, broken);
-    setup.committee_set.set_committees(committees);
+    setup
+        .committee_set
+        .committees_mut()
+        .insert(epoch - 1, broken.into());
 
     let manager = setup.create_manager(0);
     assert!(manager.previous_committee.is_none());
@@ -17109,51 +18056,6 @@ fn an_underivable_previous_committee_does_not_block_startup() {
     assert!(manager.previous_reconfig_output_threshold.is_none());
     assert!(manager.previous_reconfig_output_max_faulty.is_none());
     assert!(manager.mpc_config.threshold > 0);
-}
-
-#[test]
-fn a_legacy_pinned_committee_keeps_the_unscaled_delta() {
-    let setup = TestSetup::new(4);
-    let stakes: [u64; 4] = [51, 52, 52, 52];
-    let members: Vec<_> = setup
-        .committee()
-        .members()
-        .iter()
-        .zip(stakes)
-        .map(|(m, stake)| {
-            CommitteeMember::new(
-                m.validator_address(),
-                m.public_key().clone(),
-                m.encryption_public_key().clone(),
-                stake,
-            )
-        })
-        .collect();
-    let legacy_config = hashi_types::move_types::Config::from_entries(vec![
-        (
-            "mpc_threshold_in_basis_points".to_string(),
-            hashi_types::move_types::ConfigValue::U64(3334),
-        ),
-        (
-            "mpc_weight_reduction_allowed_delta".to_string(),
-            hashi_types::move_types::ConfigValue::U64(100),
-        ),
-        (
-            "mpc_max_faulty_in_basis_points".to_string(),
-            hashi_types::move_types::ConfigValue::U64(3333),
-        ),
-        (
-            "mpc_nonce_accumulation_window_ms".to_string(),
-            hashi_types::move_types::ConfigValue::U64(0),
-        ),
-    ]);
-    let legacy = Committee::with_config(members.clone(), setup.epoch(), legacy_config);
-    let (nodes, t, f) = build_reduced_nodes(&legacy, TEST_WEIGHT_DIVISOR, TEST_CHAIN_ID).unwrap();
-    assert_eq!((nodes.total_weight(), t, f), (100, 35, 34));
-
-    let fresh = Committee::new(members, setup.epoch(), 100, 3333);
-    let (nodes, t, f) = build_reduced_nodes(&fresh, TEST_WEIGHT_DIVISOR, TEST_CHAIN_ID).unwrap();
-    assert_eq!((nodes.total_weight(), t, f), (100, 26, 25));
 }
 
 #[test]
@@ -17172,7 +18074,7 @@ fn a_committee_below_the_reduction_floor_is_rejected_not_panicked_on() {
             )
         })
         .collect();
-    let committee = Committee::new(members, setup.epoch(), 0, 3333);
+    let committee: RuntimeCommittee = Committee::new(members, setup.epoch(), 0, 3333).into();
     let err = build_reduced_nodes(
         &committee,
         TEST_WEIGHT_DIVISOR,
@@ -17202,12 +18104,13 @@ fn derived_threshold_rejects_max_faulty_at_or_above_a_third() {
                 )
             })
             .collect();
-        let committee = Committee::new(
+        let committee: RuntimeCommittee = Committee::new(
             members,
             setup.epoch(),
             TEST_WEIGHT_REDUCTION_ALLOWED_DELTA,
             f_bps,
-        );
+        )
+        .into();
         let err = build_reduced_nodes(&committee, TEST_WEIGHT_DIVISOR, TEST_CHAIN_ID).unwrap_err();
         assert!(
             matches!(err, MpcError::InvalidThreshold(ref m) if m.contains("must exceed max_faulty")),

@@ -78,13 +78,13 @@ pub async fn run(cfg: Config, new_kp_pgp_cert_path: PathBuf) -> anyhow::Result<(
         .await
         .with_context(|| format!("verify active GuardianInfo at {}", cfg.relay_endpoint))?;
     anyhow::ensure!(
-        endpoint_verified.info.lifecycle == WithdrawStage::Activated.into(),
+        endpoint_verified.info().lifecycle == WithdrawStage::Activated.into(),
         "Guardian lifecycle is {:?}; expected withdraw/activated",
-        endpoint_verified.info.lifecycle
+        endpoint_verified.info().lifecycle
     );
-    let session_id = endpoint_verified.session_id;
-    let signing_pub_key = endpoint_verified.signing_pub_key;
-    let endpoint_deployment = endpoint_verified.info.deployment_info()?;
+    let session_id = endpoint_verified.session_id();
+    let signing_pub_key = endpoint_verified.info().signing_pub_key;
+    let endpoint_deployment = endpoint_verified.info().deployment_info()?;
     anyhow::ensure!(
         endpoint_deployment == &cfg.deployment.summary(),
         "Guardian deployment differs from expected configuration"
@@ -95,15 +95,15 @@ pub async fn run(cfg: Config, new_kp_pgp_cert_path: PathBuf) -> anyhow::Result<(
         "guardian S3 attestation signing pubkey differs from gRPC signing pubkey"
     );
     anyhow::ensure!(
-        verified_session.info().deployment_info()? == endpoint_deployment,
+        &verified_session.info().deployment.summary() == endpoint_deployment,
         "guardian S3 session deployment differs from live GuardianInfo"
     );
     let endpoint_btc_pubkey = endpoint_verified
-        .info
+        .info()
         .enclave_btc_pubkey
         .as_ref()
         .context("active GuardianInfo missing enclave_btc_pubkey")?;
-    let guardian_pub_key = EncPubKey::from_bytes(&endpoint_verified.info.encryption_pubkey)
+    let guardian_pub_key = EncPubKey::from_bytes(&endpoint_verified.info().encryption_pubkey)
         .map_err(anyhow::Error::msg)?;
 
     let state = reader.read_latest_ceremony_state().await?;
@@ -116,7 +116,7 @@ pub async fn run(cfg: Config, new_kp_pgp_cert_path: PathBuf) -> anyhow::Result<(
     );
     let sharing_seq = state.secret_sharing_instance.sharing_seq();
 
-    state.encrypted_shares.verify_recipient_set(&certs_roster)?;
+    state.encrypted_shares.verify_recipients(&certs_roster)?;
     let old_cert_seq = state.cert_seq;
     let old_encrypted_shares = state.encrypted_shares.clone();
     let decrypted = decrypt_kp_share(&state, &signing_cert)?;
@@ -169,12 +169,12 @@ pub async fn run(cfg: Config, new_kp_pgp_cert_path: PathBuf) -> anyhow::Result<(
     )?;
 
     let updated_state = reader
-        .read_kp_share_state_log_from_current_build(&session_id, sharing_seq, cert_seq)
+        .read_kp_share_state_log_from_current_build(sharing_seq, cert_seq)
         .await
         .context("read the certificate-rotation kp-shares snapshot")?;
     updated_state
         .encrypted_shares
-        .verify_recipient_set(&expected_certs_roster)
+        .verify_recipients(&expected_certs_roster)
         .context("verify persisted kp-shares snapshot against the rotated certificate roster")?;
     anyhow::ensure!(
         updated_state.encrypted_shares == expected_encrypted_shares,

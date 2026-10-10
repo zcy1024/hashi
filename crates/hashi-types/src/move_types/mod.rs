@@ -82,7 +82,7 @@ impl PackageVersions {
 /// 1. Add the struct in `packages/hashi/`. An upgrade can only *add* types
 ///    — it can never change an existing struct's layout (the CI compat gate
 ///    enforces this) — so a layout change is a *new* type with a *new* name
-///    (`FooV2`, `StampedFoo`, …).
+///    (`FooV2`, …).
 /// 2. Mirror it in this module with serde derives whose field order matches
 ///    the Move declaration exactly (BCS is positional), and `impl MoveType`.
 ///    Types introduced by an upgraded package override [`PACKAGE_VERSION`]
@@ -93,9 +93,13 @@ impl PackageVersions {
 ///    address included — must match the mirror, so a same-name type from a
 ///    foreign package is rejected rather than trusted.
 /// 4. If the new type replaces what a dynamic-field slot holds (a v2 type
-///    in the same bucket), wire it into the dispatch in
-///    `hashi::onchain::versioned_decode`. Readers fail loudly on types they
-///    do not implement; they never guess a layout.
+///    in the same bucket), the type check in
+///    `hashi::onchain::versioned_decode` has to report which type it found,
+///    and both readers need a decode path for it: the bootstrap scrape and
+///    the live apply path in `hashi::onchain`. Accepting the new tag alone
+///    is not enough, because the readers would decode its bytes as the old
+///    layout. Readers fail loudly on types they do not implement; they
+///    never guess a layout.
 ///
 /// The package-wide version the *tree* ships as is a separate axis: see the
 /// `PACKAGE_VERSION` doc in `packages/hashi/sources/core/versioning.move`
@@ -189,10 +193,12 @@ pub struct Hashi {
     pub versioning: Versioning,
     pub treasury: Treasury,
     pub proposals: Proposals,
-    /// TOB certificates by (epoch, batch_index, protocol_type). Values are
-    /// bare `EpochCertsV1` buckets or, for nonce certs, `StampedEpochCertsV1`.
+    /// TOB certificates by (epoch, batch_index, protocol_type). Every value
+    /// is an `EpochCertsV1` bucket.
     pub tob: Bag,
-    /// Number of presignatures consumed in the current epoch.
+    /// Number of presignatures consumed in the current epoch. Mirrors Move's
+    /// `presig_allocator: PresigAllocator`, a one-field struct whose BCS
+    /// encoding is exactly this `u64`.
     pub num_consumed_presigs: u64,
 }
 
@@ -216,6 +222,10 @@ pub struct BitcoinState {
 #[derive(Debug, serde_derive::Deserialize)]
 pub struct CommitteeSet {
     pub members: Bag,
+    /// Reverse index from each registered TLS public key to the validator
+    /// address holding it. The node derives the same mapping from
+    /// `members`, so the table's entries are not read.
+    pub tls_public_keys: Table,
     /// The current epoch.
     pub epoch: u64,
     pub committees: Bag,
@@ -312,6 +322,11 @@ pub struct CommitteeMember {
     pub public_key: Vec<u8>, //Element<UncompressedG1>,
     pub encryption_public_key: Vec<u8>,
     pub weight: u64,
+    /// Open-ended per-member extension slot, BCS-mirroring the Move
+    /// `CommitteeMember.extra_fields: Config`. Always empty today; carried
+    /// verbatim like `Committee::config` so a populated slot can never
+    /// silently change a committee's signed bytes.
+    pub extra_fields: Config,
 }
 
 /// This represents a BLS signing committee for a given epoch.
@@ -383,8 +398,6 @@ pub enum ConfigValue {
 const KEY_MPC_WEIGHT_REDUCTION_ALLOWED_DELTA: &str = "mpc_weight_reduction_allowed_delta";
 const KEY_MPC_MAX_FAULTY_IN_BASIS_POINTS: &str = "mpc_max_faulty_in_basis_points";
 const KEY_MPC_NONCE_ACCUMULATION_WINDOW_MS: &str = "mpc_nonce_accumulation_window_ms";
-
-const LEGACY_KEY_MPC_THRESHOLD_IN_BASIS_POINTS: &str = "mpc_threshold_in_basis_points";
 
 /// Mirrors `DEFAULT_WEIGHT_REDUCTION_ALLOWED_DELTA` in `mpc_config.move`.
 pub const DEFAULT_MPC_WEIGHT_REDUCTION_ALLOWED_DELTA: u16 = 800;
@@ -498,13 +511,6 @@ impl Config {
             KEY_MPC_NONCE_ACCUMULATION_WINDOW_MS,
             DEFAULT_MPC_NONCE_ACCUMULATION_WINDOW_MS,
         )
-    }
-
-    pub fn legacy_pinned_mpc_threshold(&self) -> Option<&ConfigValue> {
-        self.0
-            .iter()
-            .find(|(key, _)| key == LEGACY_KEY_MPC_THRESHOLD_IN_BASIS_POINTS)
-            .map(|(_, value)| value)
     }
 
     fn mpc_param(&self, key: &str, default: u16) -> u16 {
@@ -642,7 +648,9 @@ pub struct CommittedRequestInfo {
 /// MUST match Move (Pending = 0, Signed = 1) for BCS.
 #[derive(Clone, Debug, PartialEq, serde_derive::Deserialize, serde_derive::Serialize)]
 pub enum MpcSig {
-    /// Awaiting signature; holds the presignature index (valid in the batch's epoch).
+    /// Awaiting signature; holds the presignature index (valid in the batch's
+    /// epoch). Mirrors Move's `Pending(Presig)`, a one-field struct whose BCS
+    /// encoding is exactly this `u64`.
     Pending(u64),
     /// Completed per-input MPC Schnorr signature bytes.
     Signed(Vec<u8>),
@@ -774,6 +782,11 @@ impl WithdrawalTransaction {
     pub fn signing_epoch(&self) -> u64 {
         self.signing.epoch
     }
+}
+
+impl MoveType for WithdrawalTransaction {
+    const MODULE: &'static str = "withdrawal_queue";
+    const NAME: &'static str = "WithdrawalTransaction";
 }
 
 /// Rust version of the Move hashi::withdrawal_queue::OutputUtxo type.
@@ -972,12 +985,6 @@ pub struct EmergencyPause {
     pub pause: bool,
 }
 
-/// Rust version of the Move hashi::update_guardian::UpdateGuardian type.
-#[derive(Debug, Clone, serde_derive::Deserialize, serde_derive::Serialize)]
-pub struct UpdateGuardian {
-    pub url: String,
-}
-
 /// Rust version of the Move hashi::ignore_member::IgnoreMember type.
 #[derive(Debug, Clone, serde_derive::Deserialize, serde_derive::Serialize)]
 pub struct IgnoreMember {
@@ -1044,6 +1051,7 @@ pub struct EpochCertsV1 {
     /// Dealer submissions indexed by dealer address (first-submission-wins).
     // LinkedTable<address, DealerSubmissionV1>
     pub certs: LinkedTable<Address>,
+    pub seal: Option<PresigSealV1>,
 }
 
 impl MoveType for EpochCertsV1 {
@@ -1051,15 +1059,24 @@ impl MoveType for EpochCertsV1 {
     const NAME: &'static str = "EpochCertsV1";
 }
 
-/// Marker for the Move hashi::tob::StampedEpochCertsV1 type, the nonce-cert
-/// bucket layout. Identification only: it is BCS-identical to
-/// `EpochCertsV1`, which is what the bucket is decoded as; the layout it names
-/// selects the linked-table node type.
-pub struct StampedEpochCertsV1;
+/// Rust version of the Move hashi::tob::PresigSealV1 type.
+#[derive(Clone, Debug, PartialEq, Eq, serde_derive::Deserialize, serde_derive::Serialize)]
+pub struct PresigSealV1 {
+    pub randomness: Vec<u8>,
+    pub dealer_set_digest: Vec<u8>,
+}
 
-impl MoveType for StampedEpochCertsV1 {
-    const MODULE: &'static str = "tob";
-    const NAME: &'static str = "StampedEpochCertsV1";
+/// Rust version of the Move struct
+/// `hashi::cert_submission::PresigDealerSetMessage`.
+#[derive(Clone, Debug, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+pub struct PresigDealerSetMessage {
+    pub epoch: u64,
+    pub batch_index: u32,
+    pub dealer_set_digest: Vec<u8>,
+}
+
+impl crate::intent::IntentMessage for PresigDealerSetMessage {
+    const INTENT: crate::intent::Intent = crate::intent::Intent::PresigDealerSet;
 }
 
 /// Rust version of the Move sui::linked_table::LinkedTable type.
@@ -1108,23 +1125,13 @@ pub struct CertifiedMessage<T> {
 pub struct DealerSubmissionV1 {
     pub message: DealerMessagesHashV1,
     pub signature: CommitteeSignature,
+    /// Clock timestamp of the transaction that recorded the submission.
+    pub timestamp_ms: u64,
 }
 
 impl MoveType for DealerSubmissionV1 {
     const MODULE: &'static str = "tob";
     const NAME: &'static str = "DealerSubmissionV1";
-}
-
-/// Rust version of the Move hashi::tob::StampedDealerSubmissionV1 type.
-#[derive(Debug, Clone, PartialEq, Eq, serde_derive::Deserialize, serde_derive::Serialize)]
-pub struct StampedDealerSubmissionV1 {
-    pub submission: DealerSubmissionV1,
-    pub timestamp_ms: u64,
-}
-
-impl MoveType for StampedDealerSubmissionV1 {
-    const MODULE: &'static str = "tob";
-    const NAME: &'static str = "StampedDealerSubmissionV1";
 }
 
 #[derive(Debug)]
@@ -1737,7 +1744,6 @@ impl From<WithdrawalInputsSigned> for HashiEvent {
 pub struct WithdrawalPresigsReassigned {
     pub withdrawal_txn_id: Address,
     pub epoch: u64,
-    pub presig_start_index: u64,
 }
 
 impl MoveType for WithdrawalPresigsReassigned {
@@ -1850,6 +1856,10 @@ impl From<&crate::committee::CommitteeMember> for CommitteeMember {
             public_key: bls_public_key_to_uncompressed_g1_bytes(m.public_key()),
             encryption_public_key: m.encryption_public_key().to_bcs().expect("should not fail"),
             weight: m.weight(),
+            // The runtime member carries no extension data, so this rebuild
+            // matches the chain only while the slot is unpopulated, which is
+            // why signing paths use the raw on-chain committee instead.
+            extra_fields: Config::default(),
         }
     }
 }

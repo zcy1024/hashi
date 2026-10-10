@@ -7,6 +7,7 @@
 //! [`KpSigned`] uses detached OpenPGP signatures produced by key provisioners.
 //! Both serialize a payload together with its signing intent so a signature for
 //! one payload type cannot be replayed as another.
+//! Intent wire values are explicit `u8` discriminants, not Serde enum indices.
 
 use crate::guardian::AttestedKpCert;
 use crate::guardian::CeremonyConfirmationRequest;
@@ -38,7 +39,7 @@ use std::path::Path;
 /// All possible signing intent types.
 /// Using an enum ensures no two types can accidentally share the same intent value.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardianSigningIntentType {
     /// Intent for LogEntry.
     LogEntry = 0,
@@ -66,7 +67,7 @@ pub trait GuardianSigningIntent: Serialize {
 /// intent so a signature for one request cannot be replayed as another request
 /// with the same BCS shape.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KpSigningIntentType {
     /// Intent for ProvisionerInitRequest.
     ProvisionerInitRequest = 0,
@@ -164,8 +165,9 @@ impl<T> GuardianResponse<T> {
     }
 }
 
-// Guardian unchecked access is intentionally narrow: LogRecord's custom wire
-// handling and node/proxy/CLI paths that establish trust independently.
+// Guardian unchecked access is intentionally narrow: SignedLogEntry's custom wire
+// handling, reading the claimed key for attested-info verification, and node
+// withdrawal paths that establish trust independently.
 // KpSigned has no unchecked extraction; production KP payloads are always
 // verified before access.
 impl<T> GuardianSigned<T> {
@@ -177,7 +179,7 @@ impl<T> GuardianSigned<T> {
     where
         T: GuardianSigningIntent,
     {
-        bcs::to_bytes(&(T::INTENT, data)).expect("serialization should not fail")
+        bcs::to_bytes(&(T::INTENT as u8, data)).expect("serialization should not fail")
     }
 
     /// Sign a payload with intent-based domain separation.
@@ -240,25 +242,22 @@ impl<T: KpSigningIntent> KpSigned<T> {
     }
 
     /// Sign a KP payload by invoking `gpg --detach-sign` for the
-    /// signer's attested signing-key fingerprint. Includes the KP intent in the signed
-    /// bytes; payload types carry any request-specific replay-binding fields.
+    /// signer's attested primary signing-key fingerprint. Includes the KP intent
+    /// in the signed bytes; payload types carry request-specific replay bindings.
     pub fn sign(
         data: T,
         signer_cert: AttestedKpCert,
         gpg_home: Option<&Path>,
     ) -> GuardianResult<Self> {
         let signing_payload = Self::signed_bytes(&data);
-        let signature = sign_detached_via_gpg_for_key(
-            &signing_payload,
-            signer_cert.signing_fingerprint(),
-            gpg_home,
-        )
-        .map_err(|e| InternalError(format!("KP signing failed: {e}")))?;
+        let fingerprint = signer_cert.fingerprint();
+        let signature = sign_detached_via_gpg_for_key(&signing_payload, &fingerprint, gpg_home)
+            .map_err(|e| InternalError(format!("KP signing failed: {e}")))?;
         verify_detached_signature_for_key(
             &signing_payload,
             &signature,
             signer_cert.cert(),
-            signer_cert.signing_fingerprint(),
+            &fingerprint,
         )
         .map_err(|e| InternalError(format!("KP signing produced an invalid signature: {e}")))?;
         Ok(Self {
@@ -271,19 +270,18 @@ impl<T: KpSigningIntent> KpSigned<T> {
     /// The exact bytes a key provisioner detached-signs for a typed guardian
     /// request. Binds the request intent and request payload.
     pub fn signed_bytes(data: &T) -> Vec<u8> {
-        let tuple = (T::INTENT, data);
-        bcs::to_bytes(&tuple).expect("serialization should not fail")
+        bcs::to_bytes(&(T::INTENT as u8, data)).expect("serialization should not fail")
     }
 
-    /// Verify the signature and borrow the authenticated request.
-    /// Checks the intent byte to ensure the signature is for this request type.
+    /// Verify the signature with the attested primary signing key and borrow the
+    /// authenticated request. Checks the intent byte for this request type.
     pub fn verify_signature(&self) -> CryptoVerificationResult<&T> {
         let msg_bytes = Self::signed_bytes(&self.data);
         verify_detached_signature_for_key(
             &msg_bytes,
             &self.signature,
             self.signer_cert.cert(),
-            self.signer_cert.signing_fingerprint(),
+            &self.signer_cert.fingerprint(),
         )
         .map_err(|e| {
             CryptoVerificationError::new(format!("KP signature verification failed: {e}"))
@@ -317,6 +315,29 @@ mod tests {
     use std::io::Write;
     use std::time::SystemTime;
 
+    /// Intent discriminants are on-wire signing domains. Renumbering them
+    /// invalidates existing Guardian and KP signatures.
+    #[test]
+    fn intent_values_are_stable() {
+        assert_eq!(GuardianSigningIntentType::LogEntry as u8, 0);
+        assert_eq!(GuardianSigningIntentType::SetupNewKeyResponse as u8, 1);
+        assert_eq!(
+            GuardianSigningIntentType::StandardWithdrawalResponse as u8,
+            2
+        );
+        assert_eq!(GuardianSigningIntentType::GuardianInfo as u8, 3);
+        assert_eq!(GuardianSigningIntentType::RotateKpSetResponse as u8, 4);
+        assert_eq!(
+            GuardianSigningIntentType::ProvisionerRotateCertResponse as u8,
+            5
+        );
+
+        assert_eq!(KpSigningIntentType::ProvisionerInitRequest as u8, 0);
+        assert_eq!(KpSigningIntentType::ProvisionerRotateCertRequest as u8, 1);
+        assert_eq!(KpSigningIntentType::ProvisionerRotateKpSetRequest as u8, 2);
+        assert_eq!(KpSigningIntentType::CeremonyConfirmationRequest as u8, 3);
+    }
+
     #[test]
     fn kp_signed_rejects_backdated_signature_from_unattested_expired_subkey() {
         let (attested, secret, signature_time) = mock_attested_kp_keypair_with_expired_signer();
@@ -329,7 +350,7 @@ mod tests {
             .find(|key| key.alive().is_err())
             .expect("fixture must retain an expired signing key");
         let old_fingerprint = old_key.key().fingerprint();
-        assert_ne!(&old_fingerprint, attested.signing_fingerprint());
+        assert_ne!(old_fingerprint, attested.fingerprint());
         assert_eq!(secret.fingerprint(), attested.fingerprint());
 
         // This is a freshly constructed request for the current session, not a
@@ -378,7 +399,7 @@ mod tests {
         // Consuming extraction is also a public authentication boundary.
         assert!(forged.verify_into_data().is_err());
 
-        let signature = sign(attested.signing_fingerprint(), SystemTime::now());
+        let signature = sign(&attested.fingerprint(), SystemTime::now());
         let valid = KpSigned::from_parts(request.clone(), attested, signature);
         assert_eq!(valid.verify_into_data().unwrap(), request);
     }

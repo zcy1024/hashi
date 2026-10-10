@@ -1,12 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+//! Use verified heartbeat logs to check session activity and the required quiet period.
+
 use super::GuardianReader;
-use super::VerifiedLogRecord;
+use super::VerifiedLogEntry;
 use crate::HEARTBEAT_INTERVAL;
 use crate::LIVE_SESSION_LATEST_HEARTBEAT_MAX_AGE;
 use crate::OTHER_SESSION_QUIET_PERIOD;
-use hashi_types::guardian::s3::S3HourScopedDirectory;
+use hashi_types::guardian::s3::S3HourDirectory;
 use hashi_types::guardian::time::now_timestamp_ms;
 use hashi_types::guardian::time::unix_millis_to_seconds;
 use hashi_types::guardian::time::UnixMillis;
@@ -22,10 +24,14 @@ use tracing::info;
 #[derive(Debug)]
 struct HeartbeatScan {
     sessions: Vec<GuardianSessionInfo>,
+    /// Scan start time used to check the quiet period for other sessions.
     started_at: UnixMillis,
+    /// Scan end time used to check the heartbeat age of the live session.
     completed_at: UnixMillis,
 }
 
+/// The earliest and latest heartbeat timestamps for one session in the scan.
+/// These timestamps do not describe the session's complete history.
 #[derive(Debug, Clone)]
 struct GuardianSessionInfo {
     session_id: SessionID,
@@ -34,7 +40,7 @@ struct GuardianSessionInfo {
 }
 
 impl GuardianReader {
-    /// Enforces that `live_session` has heartbeated recently.
+    /// Check that `live_session` has a heartbeat within the permitted age at the end of the scan.
     pub async fn ensure_session_live(&mut self, live_session: &str) -> GuardianResult<()> {
         let scan = self.read_recent_heartbeat_summary().await?;
         let live_session_info =
@@ -52,9 +58,8 @@ impl GuardianReader {
         Ok(())
     }
 
-    /// Enforces that `live_session` has heartbeated recently, while every other
-    /// guardian session has been quiet long enough to no longer be considered
-    /// active.
+    /// Check that `live_session` has a heartbeat within the permitted age at the end of the scan.
+    /// Check that all other sessions in the scan completed the required quiet period by the start of the scan.
     pub async fn ensure_session_live_and_others_quiet(
         &mut self,
         live_session: &str,
@@ -87,33 +92,50 @@ impl GuardianReader {
     async fn read_recent_heartbeat_summary(&mut self) -> GuardianResult<HeartbeatScan> {
         let started_at = now_timestamp_ms();
         let recent_heartbeats = self.read_recent_heartbeat_logs(started_at).await?;
+        let heartbeat_count = recent_heartbeats.len();
         let sessions = summarize_heartbeats_by_session(recent_heartbeats)?;
+        let completed_at = now_timestamp_ms();
+        info!(
+            heartbeat_count,
+            session_count = sessions.len(),
+            scan_started_at_ms = started_at,
+            scan_completed_at_ms = completed_at,
+            "Completed the recent heartbeat scan"
+        );
         Ok(HeartbeatScan {
             sessions,
             started_at,
-            completed_at: now_timestamp_ms(),
+            completed_at,
         })
     }
 
+    /// Read and verify heartbeat logs from three consecutive hour directories.
+    /// Start one hour before `reference_time`, or at the Unix epoch if that time is earlier.
+    /// Include adjacent hours to allow for clock differences near an hour boundary.
     async fn read_recent_heartbeat_logs(
         &mut self,
         reference_time: UnixMillis,
-    ) -> GuardianResult<Vec<VerifiedLogRecord>> {
+    ) -> GuardianResult<Vec<VerifiedLogEntry>> {
         // Read from the previous, current, and next hour-scoped prefixes to
         // cover clock-boundary cases and moderate clock skew.
         let one_hour_ago = unix_millis_to_seconds(reference_time).saturating_sub(60 * 60);
-        let mut cursor = S3HourScopedDirectory::heartbeat(one_hour_ago);
+        let mut cursor = S3HourDirectory::heartbeat(one_hour_ago)
+            .map_err(|e| InvalidS3Log(format!("invalid heartbeat scan timestamp: {e:#}")))?;
         let mut logs = Vec::new();
         for _ in 0..3 {
             logs.extend(self.read_logs_in_dir(&cursor).await?);
-            cursor = cursor.next_dir();
+            cursor = cursor
+                .next_dir()
+                .map_err(|e| InvalidS3Log(format!("invalid heartbeat scan directory: {e:#}")))?;
         }
         Ok(logs)
     }
 }
 
+/// Return the earliest and latest heartbeat timestamps for each session in the supplied logs.
+/// Return an error if any entry is not a heartbeat log.
 fn summarize_heartbeats_by_session(
-    logs: Vec<VerifiedLogRecord>,
+    logs: Vec<VerifiedLogEntry>,
 ) -> GuardianResult<Vec<GuardianSessionInfo>> {
     let mut map: BTreeMap<SessionID, (UnixMillis, UnixMillis)> = BTreeMap::new();
 
@@ -145,6 +167,9 @@ fn summarize_heartbeats_by_session(
         .collect())
 }
 
+/// Check that all sessions except `live_session` completed the quiet period by `scan_started_at`.
+/// Use the latest heartbeat from the other sessions in the summary.
+/// Return success if the summary contains no other session.
 fn validate_other_sessions_quiet(
     summary: &[GuardianSessionInfo],
     scan_started_at: UnixMillis,
@@ -169,6 +194,8 @@ fn validate_other_sessions_quiet(
     Ok(())
 }
 
+/// Return the session summary if its latest heartbeat is within the permitted age at `now`.
+/// Return an error if the session is absent or its heartbeat is too old.
 fn validate_session_live<'a>(
     summary: &'a [GuardianSessionInfo],
     now: UnixMillis,
@@ -203,10 +230,10 @@ mod tests {
     use hashi_types::guardian::LogMessage;
 
     fn build_pcrs() -> BuildPcrs {
-        BuildPcrs::new("current", vec![0])
+        BuildPcrs::mock_for_testing("current", 1)
     }
 
-    fn heartbeat_log(session_id: &str, timestamp_ms: UnixMillis) -> VerifiedLogRecord {
+    fn heartbeat_log(session_id: &str, timestamp_ms: UnixMillis) -> VerifiedLogEntry {
         verified_log(
             session_id,
             timestamp_ms,
@@ -214,30 +241,34 @@ mod tests {
         )
     }
 
-    fn non_heartbeat_log() -> VerifiedLogRecord {
+    fn non_heartbeat_log() -> VerifiedLogEntry {
         verified_log(
             "test-session",
             0,
             LogMessage::Init(Box::new(InitLogMessage::PIEnclaveFullyInitialized {
                 sharing_seq: 0,
                 share_ids: vec![],
-                enclave_btc_pubkey: hashi_types::bitcoin::create_btc_keypair_for_test(&[1; 32])
-                    .x_only_public_key()
-                    .0,
+                enclave_btc_pubkey: hashi_types::bitcoin::BitcoinKeypair::from_seckey_slice(
+                    &hashi_types::bitcoin::BTC_LIB,
+                    &[1; 32],
+                )
+                .expect("valid test secret key")
+                .x_only_public_key()
+                .0,
             })),
         )
     }
 
-    fn verified_log(session_id: &str, timestamp_ms: u64, message: LogMessage) -> VerifiedLogRecord {
+    fn verified_log(session_id: &str, timestamp_ms: u64, message: LogMessage) -> VerifiedLogEntry {
         let signing_key = GuardianSignKeyPair::from([7u8; 32]);
-        let entry = hashi_types::guardian::LogRecord::new_at_timestamp(
+        let entry = hashi_types::guardian::SignedLogEntry::new_at_timestamp(
             session_id.into(),
             message,
             &signing_key,
             timestamp_ms,
         )
         .into_entry_unchecked();
-        VerifiedLogRecord::new_for_test(entry, build_pcrs())
+        VerifiedLogEntry::new_for_test(entry, build_pcrs())
     }
 
     #[test]

@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "object_key": "init/d54207da194977dc/02-oi-guardian-info.json",
+  "session_id": "d54207da194977dc",
+  "timestamp_ms": 1700000000000,
+  "message": {
+    "Init": {
+      "OIGuardianInfo": {
+        "deployment": {
+          "bucket_info": {
+            "name": "test-bucket",
+            "region": "us-east-1"
+          },
+          "retention_environment": "testnet",
+          "bitcoin_network": "regtest",
+          "pcr_allowlist": {
+            "current_build": {
+              "git_revision": "unknown",
+              "pcr0": "010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101"
+            },
+            "prev_builds": [
+              {
+                "git_revision": "previous",
+                "pcr0": "010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101"
+              }
+            ]
+          }
+        },
+        "encryption_pubkey": "0000000000000000000000000000000000000000000000000000000000000000",
+        "mode": {
+          "Withdraw": {
+            "secret_sharing_instance": {
+              "commitments": {
+                "1": "0000000000000000000000000000000000000000000000000000000000000000",
+                "2": "0000000000000000000000000000000000000000000000000000000000000000",
+                "3": "0000000000000000000000000000000000000000000000000000000000000000",
+                "4": "0000000000000000000000000000000000000000000000000000000000000000",
+                "5": "0000000000000000000000000000000000000000000000000000000000000000"
+              },
+              "params": {
+                "num_shares": 5,
+                "threshold": 3
+              },
+              "sharing_seq": 0
+            },
+            "config_hash": "0202020202020202020202020202020202020202020202020202020202020202",
+            "limiter_config": {
+              "refill_rate": 10,
+              "max_bucket_capacity": 1000
+            },
+            "hashi_object_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "mpc_master_g": "jwfd1en1F5z/GUhgNBge12UFuqrVPl2ZQGQSe1bFhBuA",
+            "genesis_state_hash": "a8b2275efd4299ebe9600757629b9fee27da8516a0deadf4e636bdef0e978fe2"
+          }
+        }
+      }
+    }
+  },
+  "signature": "71763e8ac994aa25e99e9e120bc38fdbc793bd698fbd82d00795a163314336d9529395cbae98b046d56f273a947e8b92157c6bd24b5dff780f3033fa28becc09"
+}

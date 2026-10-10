@@ -8,6 +8,19 @@
 /// it can be executed exactly once, releasing the payload to the executing
 /// module and archiving the proposal. Proposals expire after seven days, after
 /// which unexecuted ones may be deleted.
+///
+/// Visibility note: every proposal-type module exposes `propose` and
+/// `execute` as private `entry` functions, as are `vote`, `remove_vote` and
+/// `delete_expired` here. A `public` signature is frozen at publish by Sui's
+/// compatible-upgrade check, an `entry` one may change in any later upgrade,
+/// and no other Move package has a use for these: proposals are authorized
+/// by the sender's registration, not by a calling package. PTBs still build
+/// the `VecMap` and `Value` arguments with public calls, whose results have
+/// `drop` and `store` and are therefore never hot arguments under the
+/// private-entry rules. `upgrade::execute` hands back an `UpgradeTicket`
+/// and a hot potato that the same PTB's `Upgrade` command and
+/// `finalize_upgrade` consume; until then no other private entry may take
+/// `Hashi` in that PTB, which the upgrade PTB never does.
 module hashi::proposal;
 
 use hashi::{hashi::Hashi, threshold};
@@ -36,6 +49,9 @@ const EProposalExpired: vector<u8> = b"Proposal expired";
 const EProposalAlreadyExecuted: vector<u8> = b"Proposal already executed";
 #[error(code = 7)]
 const ENotCommitteeMember: vector<u8> = b"Validator is not a member of the current committee";
+#[error(code = 8)]
+const ENoCommittee: vector<u8> =
+    b"No committee exists for the current epoch; votes cannot be cast before genesis";
 
 // ~~~~~~~ Structs ~~~~~~~
 
@@ -95,6 +111,10 @@ entry fun vote<T: store>(
 ) {
     hashi.versioning().assert_version_enabled();
     assert!(hashi.committee_set().member_authorized(validator_address, ctx), EUnauthorizedCaller);
+    // Before genesis no committee exists yet, so there is nothing to weigh a
+    // vote against. Refuse by name rather than letting the committee lookup
+    // below abort inside the bag.
+    assert!(hashi.committee_set().has_committee(hashi.committee_set().epoch()), ENoCommittee);
     // Registration authorizes the key; only current-committee membership
     // carries weight. A registered validator outside the committee (rotated
     // out, or not yet seated) must not record a weightless vote.
@@ -136,18 +156,17 @@ entry fun remove_vote<T: store>(
     });
 }
 
-// ~~~~~~~ Public Functions ~~~~~~~
-
-public fun delete_expired<T: store>(hashi: &mut Hashi, proposal_id: ID, clock: &Clock): T {
+/// Delete an expired, unexecuted proposal. Permissionless: an expired
+/// proposal can be neither voted nor executed, so nothing is lost. The
+/// payload is returned for the caller to discard; the `drop` bound states
+/// what every proposal payload already has (`execute` requires it too).
+entry fun delete_expired<T: drop + store>(hashi: &mut Hashi, proposal_id: ID, clock: &Clock): T {
     hashi.versioning().assert_version_enabled();
     // Executed proposals are archived in the executed bag and must
     // never be deletable, even after they expire. Refuse explicitly so
     // the caller gets `EProposalAlreadyExecuted` instead of the bag's
     // missing-key abort.
-    assert!(
-        !hashi.proposals().executed().contains(proposal_id.to_address()),
-        EProposalAlreadyExecuted,
-    );
+    assert!(!hashi.proposals().executed().contains(proposal_id), EProposalAlreadyExecuted);
     let proposal: Proposal<T> = hashi.proposals_mut().active_mut().remove(proposal_id);
 
     assert!(proposal.is_expired(clock), EProposalNotExpired);
@@ -227,10 +246,7 @@ public(package) fun execute<T: copy + drop + store>(
     // proposal lives only in the executed bag. Check that explicitly so
     // the failure surface is `EProposalAlreadyExecuted` rather than the
     // ObjectBag's generic missing-key abort.
-    assert!(
-        !hashi.proposals().executed().contains(proposal_id.to_address()),
-        EProposalAlreadyExecuted,
-    );
+    assert!(!hashi.proposals().executed().contains(proposal_id), EProposalAlreadyExecuted);
     let mut proposal: Proposal<T> = hashi.proposals_mut().active_mut().remove(proposal_id);
 
     assert!(!proposal.is_expired(clock), EProposalExpired);
@@ -241,7 +257,7 @@ public(package) fun execute<T: copy + drop + store>(
     let data = proposal.data;
     let id = proposal.id.to_inner();
 
-    hashi.proposals_mut().executed_mut().add(id.to_address(), proposal);
+    hashi.proposals_mut().executed_mut().add(id, proposal);
 
     sui::event::emit(ProposalExecuted<T> { proposal_id: id, data });
     data

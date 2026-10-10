@@ -24,7 +24,8 @@ use crate::guardian_info::verified_ceremony_guardian_info;
 use crate::kp_roster::decrypt_kp_share;
 
 /// Verify this KP can fetch and decrypt its ceremony share, then submit a
-/// signed confirmation to the live ceremony guardian.
+/// signed confirmation to the live ceremony guardian, or, if the ceremony has
+/// already completed, check that the committed S3 state matches.
 ///
 /// The share state is anchored to the guardian's S3 attestation log. The live
 /// confirmation endpoint is independently attestation-verified and
@@ -100,16 +101,16 @@ pub async fn run(cfg: Config, encrypted_shares_path: &Path) -> Result<()> {
     )
     .await?;
     ensure!(
-        verified.info.lifecycle == CeremonyStage::AwaitingKeyProvisionerConfirmations.into()
-            || verified.info.lifecycle == CeremonyStage::Completed.into(),
+        verified.info().lifecycle == CeremonyStage::AwaitingKeyProvisionerConfirmations.into()
+            || verified.info().lifecycle == CeremonyStage::Completed.into(),
         "guardian is not accepting key provisioner ceremony confirmations"
     );
     let deployment = cfg.deployment.clone();
     ensure!(
-        verified.info.deployment_info()? == &deployment.summary(),
+        verified.info().deployment_info()? == &deployment.summary(),
         "ceremony deployment differs from expected configuration"
     );
-    let session_id = verified.session_id;
+    let session_id = verified.session_id();
 
     info!(
         phase = "s3 connect",
@@ -149,7 +150,7 @@ pub async fn run(cfg: Config, encrypted_shares_path: &Path) -> Result<()> {
         share_count = state.encrypted_shares.share_count(),
         "verifying every PGP-encrypted share against the expected KP certs (without decrypting)",
     );
-    state.encrypted_shares.verify_recipient_set(&certs_roster)?;
+    state.encrypted_shares.verify_recipients(&certs_roster)?;
     info!(
         phase = "roster verify",
         "ceremony proposal verified against expected params and KP certs",
@@ -191,6 +192,30 @@ pub async fn run(cfg: Config, encrypted_shares_path: &Path) -> Result<()> {
         share_count = state.encrypted_shares.share_count(),
         "saved ceremony state with encrypted shares",
     );
+
+    // A completed guardian no longer accepts confirmations (e.g. this KP re-runs
+    // after a lost response), so check the committed S3 state instead.
+    if verified.info().lifecycle == CeremonyStage::Completed.into() {
+        let (committed, dealer) = reader
+            .read_latest_ceremony_state_from_current_build()
+            .await?;
+        ensure!(
+            dealer == session_id,
+            "latest committed ceremony was dealt by session {dealer}, not {session_id}"
+        );
+        ensure!(
+            &committed == state,
+            "committed ceremony state differs from this session's verified proposal"
+        );
+        info!(
+            phase = "summary",
+            share_id = share_id.get(),
+            sharing_seq = state.secret_sharing_instance.sharing_seq(),
+            fingerprint = %kp_fingerprint,
+            "ceremony already completed; committed state matches the saved share state",
+        );
+        return Ok(());
+    }
 
     // 5. Submit a signed confirmation only after the verified recovery artifact
     //    is safely stored locally.

@@ -5,6 +5,7 @@
 
 use crate::enclave::Enclave;
 use crate::s3_client::GuardianS3Client;
+use crate::s3_reader::GuardianReader;
 use bitcoin::secp256k1::Keypair;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::secp256k1::SecretKey;
@@ -38,11 +39,16 @@ pub fn mock_logger() -> GuardianS3Client {
 
     let put_ok = mock!(Client::put_object).then_output(|| PutObjectOutput::builder().build());
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_ok]);
-    GuardianS3Client::from_client_for_tests(
+    GuardianS3Client::from_client(
         S3BucketInfo::mock_for_testing(),
         S3RetentionEnvironment::Testnet,
         client,
     )
+}
+
+/// A reader over `mock_logger`, for tests that never read from it.
+pub fn mock_reader(expected_deployment: DeploymentConfig) -> GuardianReader {
+    GuardianReader::from_s3_client(mock_logger(), expected_deployment)
 }
 
 /// Captured `(key, body)` pairs from a `mock_logger_capturing()` logger.
@@ -144,7 +150,7 @@ pub fn mock_logger_capturing() -> (GuardianS3Client, CapturedPuts) {
         RuleMode::MatchAny,
         &[&put_ok, &list_v2, &list_versions]
     );
-    let logger = GuardianS3Client::from_client_for_tests(
+    let logger = GuardianS3Client::from_client(
         S3BucketInfo::mock_for_testing(),
         S3RetentionEnvironment::Testnet,
         client,
@@ -271,7 +277,7 @@ pub fn mock_logger_with_deleted_layout(
         RuleMode::MatchAny,
         &[&list_dirs, &list_versions, &put_ok]
     );
-    GuardianS3Client::from_client_for_tests(
+    GuardianS3Client::from_client(
         S3BucketInfo::mock_for_testing(),
         S3RetentionEnvironment::Testnet,
         client,
@@ -286,6 +292,8 @@ pub struct OperatorInitTestArgs {
     pub config: InitConfig,
     pub ceremony_state: CeremonyState,
     pub genesis_state: Option<GenesisState>,
+    pub hashi_object_id: hashi_types::sui_sdk_types::Address,
+    pub mpc_master_g: HashiMasterG,
 }
 
 const TEST_N: usize = 5;
@@ -325,9 +333,12 @@ fn dummy_ceremony_state() -> CeremonyState {
 
 impl Default for OperatorInitTestArgs {
     fn default() -> Self {
+        let (_, hashi_object_id, mpc_master_g) = GenesisState::mock_for_testing().into_parts();
         Self {
+            hashi_object_id,
+            mpc_master_g,
             s3_logger: mock_logger(),
-            config: InitConfig::mock_for_testing(None),
+            config: InitConfig::mock_for_testing(),
             ceremony_state: dummy_ceremony_state(),
             genesis_state: None,
         }
@@ -335,7 +346,20 @@ impl Default for OperatorInitTestArgs {
 }
 
 impl OperatorInitTestArgs {
+    pub fn with_genesis_bindings(
+        mut self,
+        hashi_object_id: hashi_types::sui_sdk_types::Address,
+        mpc_master_g: HashiMasterG,
+    ) -> Self {
+        self.hashi_object_id = hashi_object_id;
+        self.mpc_master_g = mpc_master_g;
+        self
+    }
+
     pub fn with_genesis_state(mut self, genesis_state: GenesisState) -> Self {
+        let (_, hashi_object_id, mpc_master_g) = genesis_state.clone().into_parts();
+        self.hashi_object_id = hashi_object_id;
+        self.mpc_master_g = mpc_master_g;
         self.genesis_state = Some(genesis_state);
         self
     }
@@ -364,28 +388,23 @@ impl OperatorInitTestArgs {
 }
 
 impl Enclave {
-    /// Enclave in the requested mode with fresh random keys.
-    pub fn create_with_random_keys_for_mode(mode: EnclaveMode) -> Arc<Self> {
+    /// Uninitialized enclave with fresh random keys.
+    pub fn create_with_random_keys() -> Self {
         let signing_keys = GuardianSignKeyPair::new(rand::thread_rng());
         let encryption_keys = GuardianEncKeyPair::random(&mut rand::thread_rng());
-        Arc::new(Enclave::new(signing_keys, encryption_keys, mode))
-    }
-
-    /// Withdraw-mode enclave with fresh random keys.
-    pub fn create_with_random_keys() -> Arc<Self> {
-        Self::create_with_random_keys_for_mode(EnclaveMode::Withdraw)
+        Enclave::new(signing_keys, encryption_keys)
     }
 
     /// Create an enclave post operator_init() but pre provisioner_init().
-    pub async fn create_operator_initialized() -> Arc<Self> {
-        Self::create_operator_initialized_with(OperatorInitTestArgs::default()).await
+    pub fn create_operator_initialized() -> Self {
+        Self::create_operator_initialized_with(OperatorInitTestArgs::default())
     }
 
-    pub async fn create_operator_initialized_with(args: OperatorInitTestArgs) -> Arc<Self> {
-        let enclave = Self::create_with_random_keys();
+    pub fn create_operator_initialized_with(args: OperatorInitTestArgs) -> Self {
+        let mut enclave = Self::create_with_random_keys();
         enclave.install_operator_init_for_testing(args);
         assert_eq!(
-            enclave.lifecycle(),
+            enclave.state.lifecycle(),
             WithdrawStage::OperatorInitialized.into()
         );
         enclave
@@ -393,7 +412,7 @@ impl Enclave {
 
     /// Apply operator_init's installs to an existing enclave (mirrors `operator_init`'s
     /// withdraw-mode commit). Lets a harness defer operator-init until DKG output exists.
-    pub fn install_operator_init_for_testing(&self, args: OperatorInitTestArgs) {
+    pub fn install_operator_init_for_testing(&mut self, args: OperatorInitTestArgs) {
         self.config
             .set_deployment(args.config.deployment().clone())
             .unwrap();
@@ -402,14 +421,16 @@ impl Enclave {
             args.config,
             args.ceremony_state,
             args.genesis_state,
+            args.hashi_object_id,
+            args.mpc_master_g,
         )
         .install_into(self);
         self.advance_lifecycle_into(WithdrawStage::OperatorInitialized.into())
             .expect("operator init test setup should advance lifecycle");
     }
 
-    pub fn create_operator_initialized_ceremony(s3_logger: GuardianS3Client) -> Arc<Self> {
-        let enclave = Self::create_with_random_keys_for_mode(EnclaveMode::Ceremony);
+    pub fn create_operator_initialized_ceremony(s3_logger: GuardianS3Client) -> Self {
+        let mut enclave = Self::create_with_random_keys();
         enclave
             .config
             .set_deployment(DeploymentConfig::mock_for_testing())
@@ -422,8 +443,8 @@ impl Enclave {
     }
 }
 
-pub async fn create_operator_initialized_enclave(args: OperatorInitTestArgs) -> Arc<Enclave> {
-    Enclave::create_operator_initialized_with(args).await
+pub fn create_operator_initialized_enclave(args: OperatorInitTestArgs) -> Enclave {
+    Enclave::create_operator_initialized_with(args)
 }
 
 pub struct FullyInitializedArgs {
@@ -439,7 +460,7 @@ pub struct FullyInitializedArgs {
 /// the rest of provisioner-init has run (i.e. before DKG completes and
 /// `finalize_enclave` can be called). Idempotent: returns the existing
 /// pubkey if the keypair has already been set.
-pub fn set_or_get_enclave_btc_pubkey(enclave: &Arc<Enclave>) -> GuardianResult<BitcoinPubkey> {
+pub fn set_or_get_enclave_btc_pubkey(enclave: &mut Enclave) -> GuardianResult<BitcoinPubkey> {
     if let Ok(pk) = enclave.config.enclave_btc_pubkey() {
         return Ok(pk);
     }
@@ -459,7 +480,7 @@ pub fn set_or_get_enclave_btc_pubkey(enclave: &Arc<Enclave>) -> GuardianResult<B
 /// BTC keypair. The live serving state is installed separately by OA helpers. The
 /// keypair may already exist from an earlier [`set_or_get_enclave_btc_pubkey`]
 /// (idempotent).
-pub fn finalize_enclave(enclave: &Arc<Enclave>) -> GuardianResult<()> {
+pub fn finalize_enclave(enclave: &mut Enclave) -> GuardianResult<()> {
     let _ = set_or_get_enclave_btc_pubkey(enclave)?;
     enclave.advance_lifecycle_into(WithdrawStage::ProvisionerInitialized.into())?;
     Ok(())
@@ -467,21 +488,21 @@ pub fn finalize_enclave(enclave: &Arc<Enclave>) -> GuardianResult<()> {
 
 /// Install activation-derived live state for tests that need normal operation.
 pub fn activate_enclave_for_testing(
-    enclave: &Arc<Enclave>,
-    committee: HashiCommittee,
+    enclave: &mut Enclave,
+    committee: impl Into<RuntimeCommittee>,
     limiter_config: LimiterConfig,
     limiter_state: LimiterState,
 ) -> GuardianResult<()> {
     let rate_limiter = RateLimiter::new(limiter_config, limiter_state)?;
 
-    enclave.state.init(committee, rate_limiter)?;
-    enclave.clear_temporary_init_state();
+    enclave.state.init(committee.into(), rate_limiter)?;
+    enclave.state.clear_temporary_init_state();
     enclave.advance_lifecycle_into(WithdrawStage::Activated.into())?;
     Ok(())
 }
 
 /// Operator-init + finalize in one shot.
-pub async fn create_fully_initialized_enclave(args: FullyInitializedArgs) -> Arc<Enclave> {
+pub fn create_fully_initialized_enclave(args: FullyInitializedArgs) -> Enclave {
     let FullyInitializedArgs {
         network,
         committee,
@@ -490,25 +511,25 @@ pub async fn create_fully_initialized_enclave(args: FullyInitializedArgs) -> Arc
         limiter_state,
     } = args;
 
-    let config = InitConfig::from_parts_for_testing(
-        limiter_config,
-        master_pubkey,
-        network,
-        hashi_types::guardian::test_utils::TEST_HASHI_OBJECT_ID,
+    let config = InitConfig::from_parts_for_testing(limiter_config, network);
+    let mut enclave = create_operator_initialized_enclave(
+        OperatorInitTestArgs::default()
+            .with_config(config)
+            .with_genesis_bindings(
+                hashi_types::guardian::test_utils::TEST_HASHI_OBJECT_ID,
+                master_pubkey,
+            ),
     );
-    let enclave =
-        create_operator_initialized_enclave(OperatorInitTestArgs::default().with_config(config))
-            .await;
 
-    finalize_enclave(&enclave).expect("finalize_enclave should succeed on a fresh enclave");
-    activate_enclave_for_testing(&enclave, committee, limiter_config, limiter_state)
+    finalize_enclave(&mut enclave).expect("finalize_enclave should succeed on a fresh enclave");
+    activate_enclave_for_testing(&mut enclave, committee, limiter_config, limiter_state)
         .expect("activate_enclave_for_testing should succeed on a fresh enclave");
 
     assert_eq!(
-        enclave.lifecycle(),
+        enclave.state.lifecycle(),
         WithdrawStage::Activated.into(),
         "test activation should reach the activated lifecycle"
     );
-    assert!(enclave.temporary_init_state().is_err());
+    assert!(enclave.state.temporary_init_state().is_err());
     enclave
 }

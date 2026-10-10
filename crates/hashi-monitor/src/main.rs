@@ -44,8 +44,8 @@ enum Command {
         config: PathBuf,
 
         /// Start of guardian audit period as UTC, for example 2026-08-04T19:00:00Z.
-        /// Defaults to the earliest time whose checks can still be pending, so a
-        /// restart resumes open checks; violations anchored earlier are not re-reported.
+        /// Defaults to far enough back to audit a monitor outage of up to a week; a
+        /// restart reports findings from that period again.
         #[arg(long, value_parser = parse_utc_timestamp)]
         start: Option<u64>,
 
@@ -70,6 +70,10 @@ async fn main() -> anyhow::Result<()> {
             let end = end.unwrap_or_else(now_timestamp_secs);
             let mut auditor = hashi_monitor::audit::BatchAuditor::new(&cfg, start, end).await?;
             auditor.run().await?;
+            anyhow::ensure!(
+                !auditor.violation_found,
+                "audit produced findings: see logs"
+            );
         }
         Command::Continuous {
             config,

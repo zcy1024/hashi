@@ -49,7 +49,7 @@ pub async fn init(cfg: Config) -> Result<()> {
 
     let state = guardian.reader.read_latest_ceremony_state().await?;
     state.validate_sharing_params(cfg.kp_roster.num_shares, cfg.kp_roster.threshold)?;
-    state.encrypted_shares.verify_recipient_set(&certs_roster)?;
+    state.encrypted_shares.verify_recipients(&certs_roster)?;
     let sharing_seq = state.secret_sharing_instance.sharing_seq();
     let threshold = state.secret_sharing_instance.threshold();
     info!(
@@ -67,7 +67,7 @@ pub async fn init(cfg: Config) -> Result<()> {
         "  enc_pubkey:     {}",
         hex::encode(&guardian.info.encryption_pubkey)
     );
-    println!("  sharing_seq:    {sharing_seq} -> {}", sharing_seq + 1);
+    println!("  current sharing_seq: {sharing_seq}; the enclave selects the next unused sequence");
     println!(
         "  current set:    {threshold}-of-{}",
         state.secret_sharing_instance.num_shares()
@@ -76,8 +76,8 @@ pub async fn init(cfg: Config) -> Result<()> {
         "  new set:        {}-of-{}",
         new_kp_set.threshold, new_kp_set.num_shares
     );
-    for (index, fingerprint) in new_certs_roster.fingerprints().iter().enumerate() {
-        println!("    share {}: {fingerprint}", index + 1);
+    for fingerprint in new_certs_roster.fingerprints() {
+        println!("    recipient: {fingerprint}");
     }
     println!("Need {threshold} submissions from the current KPs (key-provisioner rotate-kp-set).");
     Ok(())
@@ -101,8 +101,7 @@ pub async fn submit(cfg: Config, submission_paths: &[PathBuf]) -> Result<()> {
     // The dealt set, as the enclave will read it with the KPs' allowlist.
     let old = guardian.reader.read_latest_ceremony_state().await?;
     old.validate_sharing_params(cfg.kp_roster.num_shares, cfg.kp_roster.threshold)?;
-    old.encrypted_shares.verify_recipient_set(&certs_roster)?;
-    let new_sharing_seq = old.secret_sharing_instance.sharing_seq() + 1;
+    old.encrypted_shares.verify_recipients(&certs_roster)?;
 
     let submissions = submission_paths
         .iter()
@@ -122,7 +121,6 @@ pub async fn submit(cfg: Config, submission_paths: &[PathBuf]) -> Result<()> {
     info!(
         phase = "rotate_kp_set",
         submissions = batch.submissions().len(),
-        new_sharing_seq,
         "calling RotateKpSet",
     );
     let response_pb = guardian
@@ -136,12 +134,12 @@ pub async fn submit(cfg: Config, submission_paths: &[PathBuf]) -> Result<()> {
         .verify_into_data(&guardian.signing_pub_key)
         .map_err(|e| anyhow!("verify RotateKpSetResponse signature: {e}"))?
         .response;
+    let new_sharing_seq = response.new_instance.sharing_seq();
     ensure!(
-        response.new_instance.sharing_seq() == new_sharing_seq,
-        "RotateKpSet returned sharing_seq {}, expected {new_sharing_seq}",
-        response.new_instance.sharing_seq()
+        new_sharing_seq > old.secret_sharing_instance.sharing_seq(),
+        "RotateKpSet must advance sharing_seq"
     );
-    // Dealt in the proposal's order, so each share is checked at its position.
+    // Verify the proposed certificate set against the recorded share recipients.
     response
         .encrypted_shares
         .verify_recipients(&new_certs_roster)?;
@@ -150,6 +148,15 @@ pub async fn submit(cfg: Config, submission_paths: &[PathBuf]) -> Result<()> {
         share_count = response.encrypted_shares.share_count(),
         "every re-encrypted share verified against the new KP certs (without decrypting)",
     );
+
+    for share in response.encrypted_shares.iter() {
+        info!(
+            phase = "rotate_kp_set",
+            share_id = share.id.get(),
+            recipient_fingerprint = %share.recipient_fingerprint,
+            "verified new share assignment",
+        );
+    }
 
     // The state the new KPs will read, verify and confirm.
     let live = CeremonyState::new(
@@ -195,7 +202,7 @@ pub async fn wait(cfg: Config) -> Result<()> {
     logged.validate_sharing_params(new_kp_set.num_shares, new_kp_set.threshold)?;
     logged
         .encrypted_shares
-        .verify_recipient_set(&new_certs_roster)?;
+        .verify_recipients(&new_certs_roster)?;
     info!(
         phase = "rotate_kp_set",
         lifecycle = ?guardian.info.lifecycle,
@@ -561,7 +568,7 @@ mod tests {
 
         let mut config = Fixture::new();
         config.deployment.pcr_allowlist =
-            PcrAllowlist::new(BuildPcrs::new("other", vec![1]), []).unwrap();
+            PcrAllowlist::new(BuildPcrs::mock_for_testing("other", 2), []).unwrap();
         config.new_certs_roster = f.new_certs_roster.clone();
         let err = validate_batch(
             vec![f.submission(0), f.submission(1)],

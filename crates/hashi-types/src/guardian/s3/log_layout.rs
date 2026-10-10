@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::guardian::GuardianError::InvalidS3Log;
+use crate::guardian::GuardianResult;
 use crate::guardian::time::UnixSeconds;
 use anyhow::Context;
 use std::convert::TryFrom;
@@ -10,24 +12,6 @@ use time::Date;
 use time::OffsetDateTime;
 use time::PrimitiveDateTime;
 use time::Time;
-
-pub enum ObjectKeyPattern {
-    Fixed(String),
-    /// Complete key prefix before the random suffix; finalize() appends the suffix.
-    RandomSuffix(String),
-}
-
-impl ObjectKeyPattern {
-    /// Finalizes the pattern into the complete S3 object key.
-    pub fn finalize(self) -> String {
-        match self {
-            Self::Fixed(key) => key,
-            Self::RandomSuffix(prefix) => {
-                format!("{prefix}{:032x}.json", rand::random::<u128>())
-            }
-        }
-    }
-}
 
 /// S3 sub-prefixes used for guardian log streams.
 /// See `crates/hashi-guardian/README.md` for canonical key layout.
@@ -52,10 +36,132 @@ type Month = u8;
 type Day = u8;
 type Hour = u8;
 
+/// An S3 prefix followed by numeric directory components.
+/// For example, `withdraw/2026/09/` represents prefix `withdraw` with components
+/// `[2026, 9]`, while `kp-shares/00000000000000000003/` represents prefix
+/// `kp-shares` with components `[3]`. Date paths may stop at any level or include
+/// the full year/month/day/hour, e.g. `withdraw/2026/09/28/18/`.
+///
+/// This type ensures directories are sorted by numeric value rather than raw
+/// text: hour `9` sorts before hour `18`, regardless of zero-padding.
+///
+/// Ordering compares the prefix, then numeric components, then the original
+/// path to break ties. Formatting preserves the exact input path; padding and
+/// calendar rules belong to the specific directory layout.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct S3NumericDirectory {
+    prefix: String,
+    components: Vec<u64>,
+    path: String,
+}
+
+impl S3NumericDirectory {
+    pub fn components(&self) -> &[u64] {
+        &self.components
+    }
+
+    /// Parse `{prefix}/{number}/...`, with one optional trailing slash.
+    pub fn from_path(path: &str) -> anyhow::Result<Self> {
+        let mut parts = path.strip_suffix('/').unwrap_or(path).split('/');
+        let prefix = parts.next().context("missing directory prefix")?;
+        anyhow::ensure!(!prefix.is_empty(), "empty directory prefix in {path}");
+        let components = parts
+            .map(|part| {
+                part.parse::<u64>()
+                    .with_context(|| format!("invalid numeric directory component in {path}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            prefix: prefix.to_string(),
+            components,
+            path: path.to_string(),
+        })
+    }
+
+    /// Return the paths in order from the highest to the lowest numeric value.
+    /// Return an error if a path does not have the numeric format.
+    pub fn sort_desc(paths: Vec<String>) -> anyhow::Result<Vec<String>> {
+        let mut dirs = Vec::with_capacity(paths.len());
+        for path in &paths {
+            dirs.push(Self::from_path(path)?);
+        }
+        dirs.sort();
+        dirs.reverse();
+        Ok(dirs.into_iter().map(|dir| dir.path).collect())
+    }
+}
+
+impl fmt::Display for S3NumericDirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.path)
+    }
+}
+
+/// A validated S3 object key for a log record ordered by a numeric sequence.
+///
+/// Each key has the form `<prefix><sequence>.json`. The prefix is a directory path
+/// with a final `/`. The sequence is a `u64` written as 20 decimal digits with leading zeros.
+///
+/// For example, `kp-shares/00000000000000000009/00000000000000000002.json` has:
+///
+/// - Prefix: `kp-shares/00000000000000000009/`.
+/// - Sequence: `2`.
+///
+/// The final number orders records within that directory. Ceremony keys use the
+/// sharing sequence as this number. Committee-update keys use the new committee epoch.
+pub struct S3SequencedKey {
+    object_key: String,
+    sequence: u64,
+}
+
+impl S3SequencedKey {
+    pub fn format(prefix: &str, sequence: u64) -> String {
+        format!("{prefix}{sequence:020}.json")
+    }
+
+    /// Require the exact prefix, a 20-digit `u64` sequence, and the `.json` suffix.
+    /// The caller supplies the complete directory prefix, including the final `/`.
+    fn parse(prefix: &str, key: String) -> GuardianResult<Self> {
+        let sequence = key
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .ok_or_else(|| {
+                InvalidS3Log(format!(
+                    "noncanonical S3 object key {key} for prefix {prefix}"
+                ))
+            })?;
+        let expected_key = Self::format(prefix, sequence);
+        if key != expected_key {
+            return Err(InvalidS3Log(format!(
+                "noncanonical S3 object key: got {key}, expected {expected_key}"
+            )));
+        }
+        Ok(Self {
+            object_key: key,
+            sequence,
+        })
+    }
+
+    /// Return the object key with the highest sequence number under `prefix`.
+    /// Return an error if any key has an invalid format or a different prefix.
+    /// Return `None` if the list is empty.
+    pub fn latest_key(prefix: &str, keys: Vec<String>) -> GuardianResult<Option<String>> {
+        let keys = keys
+            .into_iter()
+            .map(|key| Self::parse(prefix, key))
+            .collect::<GuardianResult<Vec<_>>>()?;
+        Ok(keys
+            .into_iter()
+            .max_by_key(|key| key.sequence)
+            .map(|key| key.object_key))
+    }
+}
+
 /// An S3 directory: prefix/YYYY/MM/DD/HH.
 /// All logs emitted within an hour are stored in the same directory, e.g., logs emitted between 12-1 PM are in `<prefix>`/12 directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct S3HourScopedDirectory {
+pub struct S3HourDirectory {
     prefix: String,
     year: Year,
     month: Month,
@@ -63,31 +169,32 @@ pub struct S3HourScopedDirectory {
     hour: Hour,
 }
 
-impl S3HourScopedDirectory {
-    pub fn new(prefix: &str, t: UnixSeconds) -> Self {
-        let unix_seconds = i64::try_from(t).expect("timestamp should fit i64");
-        let datetime =
-            OffsetDateTime::from_unix_timestamp(unix_seconds).expect("timestamp should be valid");
-        Self {
+impl S3HourDirectory {
+    /// Return an error if `t` is outside the supported calendar range.
+    pub fn new(prefix: &str, t: UnixSeconds) -> anyhow::Result<Self> {
+        let unix_seconds = i64::try_from(t).context("timestamp exceeds i64 range")?;
+        let datetime = OffsetDateTime::from_unix_timestamp(unix_seconds)
+            .context("timestamp outside supported calendar range")?;
+        Ok(Self {
             prefix: prefix.to_string(),
             year: datetime.year(),
             month: u8::from(datetime.month()),
             day: datetime.day(),
             hour: datetime.hour(),
-        }
+        })
     }
 
     /// Construct the withdrawal-log directory containing `t`.
-    pub fn withdraw(t: UnixSeconds) -> Self {
+    pub fn withdraw(t: UnixSeconds) -> anyhow::Result<Self> {
         Self::new(S3_DIR_WITHDRAW, t)
     }
 
     /// Construct the heartbeat-log directory containing `t`.
-    pub fn heartbeat(t: UnixSeconds) -> Self {
+    pub fn heartbeat(t: UnixSeconds) -> anyhow::Result<Self> {
         Self::new(S3_DIR_HEARTBEAT, t)
     }
 
-    pub fn next_dir(&self) -> Self {
+    pub fn next_dir(&self) -> anyhow::Result<Self> {
         Self::new(
             &self.prefix,
             self.to_unix_seconds().saturating_add(SECONDS_PER_HOUR),
@@ -100,13 +207,14 @@ impl S3HourScopedDirectory {
             &self.prefix,
             self.to_unix_seconds().saturating_sub(SECONDS_PER_HOUR),
         )
+        .expect("previous hour is within the validated calendar range")
     }
 
     /// The time at which writes to current S3 directory finish.
     /// DIR_WRITES_COMPLETION_DELAY accounts for any in-flight retries and clock skew.
     pub fn write_completion_time(&self) -> UnixSeconds {
-        self.next_dir()
-            .to_unix_seconds()
+        self.to_unix_seconds()
+            .saturating_add(SECONDS_PER_HOUR)
             .saturating_add(DIR_WRITES_COMPLETION_DELAY.as_secs())
     }
 
@@ -121,41 +229,47 @@ impl S3HourScopedDirectory {
 
     /// Parses a directory path of the form `{prefix}/{yyyy}/{mm}/{dd}/{hh}/`
     /// (with or without the trailing slash) back into a directory value.
-    /// Inverse of the `Display` impl.
+    /// Requires the canonical zero-padding emitted by `Display`, so formatting
+    /// the parsed value cannot redirect a read to a different S3 prefix.
     pub fn from_path(path: &str) -> anyhow::Result<Self> {
-        let parts: Vec<&str> = path.trim_end_matches('/').split('/').collect();
-        anyhow::ensure!(
-            parts.len() == 5,
-            "expected `{{prefix}}/YYYY/MM/DD/HH/` in {path}"
-        );
-        let prefix = parts[0];
-        let year: Year = parts[1]
-            .parse()
-            .with_context(|| format!("invalid year in {path}"))?;
-        let month: Month = parts[2]
-            .parse()
-            .with_context(|| format!("invalid month in {path}"))?;
-        let day: Day = parts[3]
-            .parse()
-            .with_context(|| format!("invalid day in {path}"))?;
-        let hour: Hour = parts[4]
-            .parse()
-            .with_context(|| format!("invalid hour in {path}"))?;
-        parse_calendar(year, month, day, hour).with_context(|| format!("invalid path {path}"))?;
-        Ok(Self {
-            prefix: prefix.to_string(),
+        S3NumericDirectory::from_path(path)?.try_into()
+    }
+}
+
+impl TryFrom<S3NumericDirectory> for S3HourDirectory {
+    type Error = anyhow::Error;
+
+    fn try_from(dir: S3NumericDirectory) -> anyhow::Result<Self> {
+        let [year, month, day, hour] = dir.components.as_slice() else {
+            anyhow::bail!("expected a complete YYYY/MM/DD/HH directory, got {dir}");
+        };
+        let year = Year::try_from(*year).context("year out of range")?;
+        anyhow::ensure!(year >= 1970, "directory predates the Unix epoch: {dir}");
+        let month = Month::try_from(*month).context("month out of range")?;
+        let day = Day::try_from(*day).context("day out of range")?;
+        let hour = Hour::try_from(*hour).context("hour out of range")?;
+        parse_calendar(year, month, day, hour).with_context(|| format!("invalid path {dir}"))?;
+        let complete = Self {
+            prefix: dir.prefix,
             year,
             month,
             day,
             hour,
-        })
+        };
+        let canonical = complete.to_string();
+        let path = dir.path.strip_suffix('/').unwrap_or(&dir.path);
+        anyhow::ensure!(
+            canonical.strip_suffix('/') == Some(path),
+            "noncanonical directory path {path}; expected {canonical}"
+        );
+        Ok(complete)
     }
 }
 
 /// Validates the (year, month, day, hour) tuple and returns the corresponding
-/// `(Date, Time)` if every component is in range. Shared by [`S3HourScopedDirectory::from_path`]
+/// `(Date, Time)` if every component is in range. Shared by [`S3HourDirectory::from_path`]
 /// (which uses it to validate before construction) and
-/// [`S3HourScopedDirectory::to_unix_seconds`] (which is infallible because the
+/// [`S3HourDirectory::to_unix_seconds`] (which is infallible because the
 /// struct invariant guarantees validity).
 fn parse_calendar(year: Year, month: Month, day: Day, hour: Hour) -> anyhow::Result<(Date, Time)> {
     let month_enum =
@@ -167,7 +281,7 @@ fn parse_calendar(year: Year, month: Month, day: Day, hour: Hour) -> anyhow::Res
     Ok((date, time))
 }
 
-impl fmt::Display for S3HourScopedDirectory {
+impl fmt::Display for S3HourDirectory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -180,29 +294,140 @@ impl fmt::Display for S3HourScopedDirectory {
 #[cfg(test)]
 mod tests {
     use super::DIR_WRITES_COMPLETION_DELAY;
-    use super::S3HourScopedDirectory;
+    use super::S3HourDirectory;
+    use super::S3NumericDirectory;
+    use crate::guardian::CeremonyLogMessage;
+    use crate::guardian::CommitteeUpdateLogMessage;
+    use crate::guardian::GuardianResult;
+    use crate::guardian::KpShareStateLogMessage;
+    use crate::guardian::SecretSharingInstance;
+    use crate::guardian::SetupNewKeyResponse;
+    use crate::guardian::StandardWithdrawalRequest;
+
+    #[test]
+    fn numeric_directory_sort_preserves_original_paths() {
+        let paths = [
+            "withdraw/2026/09/28/09/",
+            "withdraw/2026/09/28/18/",
+            "withdraw/2026/09/28/9/",
+            "withdraw/2026/09/28/02/",
+        ];
+        let mut dirs = paths
+            .iter()
+            .map(|path| S3NumericDirectory::from_path(path).unwrap())
+            .collect::<Vec<_>>();
+        dirs.sort();
+        dirs.reverse();
+        let sorted = dirs.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(sorted, [paths[1], paths[2], paths[0], paths[3]]);
+    }
+
+    #[test]
+    fn numeric_directory_preserves_paths_at_every_depth() {
+        for path in [
+            "withdraw/",
+            "withdraw/2026/",
+            "withdraw/2026/9/",
+            "withdraw/2026/09/28/",
+            "withdraw/2026/09/28/9/",
+            "kp-shares/00000000004294967296/",
+        ] {
+            let dir = S3NumericDirectory::from_path(path).unwrap();
+            assert_eq!(dir.to_string(), path);
+            let without_slash = path.strip_suffix('/').unwrap();
+            let dir = S3NumericDirectory::from_path(without_slash).unwrap();
+            assert_eq!(dir.to_string(), without_slash);
+        }
+    }
+
+    #[test]
+    fn numeric_directory_order_compares_all_components() {
+        for (older, newer) in [
+            ("withdraw/999/", "withdraw/2026/"),
+            ("withdraw/2026/9/", "withdraw/2026/10/"),
+            ("withdraw/2026/09/9/", "withdraw/2026/09/18/"),
+            ("withdraw/2026/09/28/9/", "withdraw/2026/09/28/18/"),
+            ("withdraw/2025/12/31/23/", "withdraw/2026/01/01/00/"),
+            ("kp-shares/9/", "kp-shares/4294967296/"),
+        ] {
+            assert!(
+                S3NumericDirectory::from_path(older).unwrap()
+                    < S3NumericDirectory::from_path(newer).unwrap(),
+                "{older} must sort before {newer}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_directory_rejects_invalid_components() {
+        for path in [
+            "",
+            "/2026/",
+            "withdraw//",
+            "withdraw/not-a-number/",
+            "withdraw/-1/",
+            "withdraw/18446744073709551616/",
+        ] {
+            assert!(S3NumericDirectory::from_path(path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn numeric_directory_conversion_requires_a_canonical_complete_date() {
+        for path in [
+            "withdraw/",
+            "withdraw/2026/09/28/",
+            "withdraw/2026/09/28/9/",
+            "withdraw/2026/02/30/09/",
+        ] {
+            let dir = S3NumericDirectory::from_path(path).unwrap();
+            assert!(S3HourDirectory::try_from(dir).is_err(), "{path}");
+        }
+        let path = "withdraw/2026/09/28/09/";
+        let dir = S3HourDirectory::try_from(S3NumericDirectory::from_path(path).unwrap()).unwrap();
+        assert_eq!(dir.to_string(), path);
+    }
 
     #[test]
     fn test_epoch_directory_format() {
-        let dir = S3HourScopedDirectory::new("heartbeat", 0);
+        let dir = S3HourDirectory::new("heartbeat", 0).unwrap();
         assert_eq!(dir.to_string(), "heartbeat/1970/01/01/00/");
     }
 
     #[test]
+    fn rejects_out_of_range_timestamps() {
+        for timestamp in [i64::MAX as u64, u64::MAX] {
+            assert!(S3HourDirectory::new("heartbeat", timestamp).is_err());
+        }
+        let max_timestamp = time::Date::MAX
+            .with_hms(23, 59, 59)
+            .unwrap()
+            .assume_utc()
+            .unix_timestamp() as u64;
+        let last_hour = S3HourDirectory::withdraw(max_timestamp).unwrap();
+        assert!(S3HourDirectory::withdraw(max_timestamp + 1).is_err());
+        assert!(last_hour.next_dir().is_err());
+        assert_eq!(
+            last_hour.write_completion_time(),
+            max_timestamp + 1 + DIR_WRITES_COMPLETION_DELAY.as_secs()
+        );
+    }
+
+    #[test]
     fn test_hour_and_day_rollover_format() {
-        let before_hour_boundary = S3HourScopedDirectory::new("withdraw", 3_599);
+        let before_hour_boundary = S3HourDirectory::new("withdraw", 3_599).unwrap();
         assert_eq!(before_hour_boundary.to_string(), "withdraw/1970/01/01/00/");
 
-        let next_hour = S3HourScopedDirectory::new("withdraw", 3_600);
+        let next_hour = S3HourDirectory::new("withdraw", 3_600).unwrap();
         assert_eq!(next_hour.to_string(), "withdraw/1970/01/01/01/");
 
-        let next_day = S3HourScopedDirectory::new("withdraw", 86_400);
+        let next_day = S3HourDirectory::new("withdraw", 86_400).unwrap();
         assert_eq!(next_day.to_string(), "withdraw/1970/01/02/00/");
     }
 
     #[test]
     fn test_prev_dir_walks_back_and_saturates_at_epoch() {
-        let mut dir = S3HourScopedDirectory::new("withdraw", 86_400 + 3_600);
+        let mut dir = S3HourDirectory::new("withdraw", 86_400 + 3_600).unwrap();
         assert_eq!(dir.to_string(), "withdraw/1970/01/02/01/");
         dir = dir.prev_dir();
         assert_eq!(dir.to_string(), "withdraw/1970/01/02/00/");
@@ -210,35 +435,58 @@ mod tests {
         assert_eq!(dir.to_string(), "withdraw/1970/01/01/23/");
 
         // Saturates at epoch.
-        let epoch = S3HourScopedDirectory::new("withdraw", 0);
+        let epoch = S3HourDirectory::new("withdraw", 0).unwrap();
         assert_eq!(epoch.prev_dir(), epoch);
     }
 
     #[test]
     fn test_from_path_roundtrips_with_display() {
-        let dir = S3HourScopedDirectory::new("withdraw", 1_700_000_000);
+        let dir = S3HourDirectory::new("withdraw", 1_700_000_000).unwrap();
         let displayed = dir.to_string();
-        let parsed = S3HourScopedDirectory::from_path(&displayed).expect("roundtrip");
+        let parsed = S3HourDirectory::from_path(&displayed).expect("roundtrip");
         assert_eq!(parsed, dir);
         // Also accept the trailing-slash-stripped form.
-        let parsed_nopfx = S3HourScopedDirectory::from_path(displayed.trim_end_matches('/'))
+        let parsed_nopfx = S3HourDirectory::from_path(displayed.trim_end_matches('/'))
             .expect("roundtrip without trailing slash");
         assert_eq!(parsed_nopfx, dir);
     }
 
     #[test]
     fn test_from_path_rejects_wrong_shape() {
-        assert!(S3HourScopedDirectory::from_path("withdraw/2024/03/15/").is_err()); // missing hour
-        assert!(S3HourScopedDirectory::from_path("withdraw/2024/03/15/14/extra/").is_err()); // too many parts
-        assert!(S3HourScopedDirectory::from_path("withdraw/2024/13/15/14/").is_err()); // invalid month
-        assert!(S3HourScopedDirectory::from_path("withdraw/2024/02/30/14/").is_err()); // invalid day
-        assert!(S3HourScopedDirectory::from_path("withdraw/2024/02/15/24/").is_err()); // invalid hour
-        assert!(S3HourScopedDirectory::from_path("withdraw/notayear/03/15/14/").is_err()); // non-numeric
+        assert!(S3HourDirectory::from_path("withdraw/1969/12/31/23/").is_err());
+        assert!(S3HourDirectory::from_path("withdraw/2024/03/15/").is_err()); // missing hour
+        assert!(S3HourDirectory::from_path("withdraw/2024/03/15/14/extra/").is_err()); // too many parts
+        assert!(S3HourDirectory::from_path("withdraw/2024/13/15/14/").is_err()); // invalid month
+        assert!(S3HourDirectory::from_path("withdraw/2024/02/30/14/").is_err()); // invalid day
+        assert!(S3HourDirectory::from_path("withdraw/2024/02/15/24/").is_err()); // invalid hour
+        assert!(S3HourDirectory::from_path("withdraw/notayear/03/15/14/").is_err()); // non-numeric
+    }
+
+    #[test]
+    fn test_from_path_rejects_noncanonical_names() {
+        for path in [
+            "withdraw/026/09/28/09/",
+            "withdraw/2026/9/28/09/",
+            "withdraw/2026/09/8/09/",
+            "withdraw/2026/09/28/9/",
+            "withdraw/02026/09/28/09/",
+            "withdraw/2026/009/28/09/",
+            "withdraw/2026/09/028/09/",
+            "withdraw/2026/09/28/009/",
+            "withdraw/2026/09/28/+9/",
+        ] {
+            assert!(S3HourDirectory::from_path(path).is_err(), "{path}");
+            assert!(
+                S3HourDirectory::from_path(path.strip_suffix('/').unwrap()).is_err(),
+                "{path} without its trailing slash"
+            );
+        }
+        assert!(S3HourDirectory::from_path("withdraw/2026/09/28/09//").is_err());
     }
 
     #[test]
     fn test_next_dir_and_completion_time() {
-        let mut dir = S3HourScopedDirectory::new("withdraw", 3_599);
+        let mut dir = S3HourDirectory::new("withdraw", 3_599).unwrap();
         assert_eq!(dir.to_string(), "withdraw/1970/01/01/00/");
         assert_eq!(dir.to_unix_seconds(), 0);
         assert_eq!(
@@ -248,8 +496,138 @@ mod tests {
 
         for i in 0..24 {
             assert_eq!(dir.to_string(), format!("withdraw/1970/01/01/{:02}/", i));
-            dir = dir.next_dir();
+            dir = dir.next_dir().unwrap();
         }
         assert_eq!(dir.to_string(), "withdraw/1970/01/02/00/");
+    }
+
+    #[test]
+    fn latest_key_validates_all_keys() {
+        type SelectKey = fn(Vec<String>) -> GuardianResult<Option<String>>;
+        let streams: [(&str, SelectKey); 3] = [
+            ("ceremony/", CeremonyLogMessage::latest_key),
+            ("committee-update/", CommitteeUpdateLogMessage::latest_key),
+            ("kp-shares/00000000000000000009/", |keys| {
+                KpShareStateLogMessage::latest_key(9, keys)
+            }),
+        ];
+        for (prefix, select) in streams {
+            let valid_key = format!("{prefix}18446744073709551615.json");
+            assert_eq!(select(vec![]).unwrap(), None);
+            assert_eq!(
+                select(vec![valid_key.clone()]).unwrap(),
+                Some(valid_key.clone())
+            );
+            assert_eq!(
+                select(vec![valid_key.clone(), valid_key.clone()]).unwrap(),
+                Some(valid_key.clone())
+            );
+
+            let mut invalid_keys: Vec<String> = [
+                "",
+                "9.json",
+                "0000000000000000009.json",
+                "000000000000000000009.json",
+                "+0000000000000000009.json",
+                "-0000000000000000009.json",
+                "18446744073709551616.json",
+                "00000000000000000009",
+                "00000000000000000009.json.bak",
+                "nested/00000000000000000009.json",
+                "not-a-number.json",
+            ]
+            .into_iter()
+            .map(|suffix| format!("{prefix}{suffix}"))
+            .collect();
+            invalid_keys.push("other/00000000000000000009.json".into());
+            invalid_keys.push(KpShareStateLogMessage::object_key_for_sequences(8, 0));
+
+            for invalid_key in invalid_keys {
+                for keys in [
+                    vec![invalid_key.clone(), valid_key.clone()],
+                    vec![valid_key.clone(), invalid_key.clone()],
+                ] {
+                    assert!(select(keys).is_err(), "accepted {invalid_key}");
+                }
+            }
+        }
+    }
+
+    fn assert_numeric_key_order(
+        mut key_for: impl FnMut(u64) -> String,
+        select: impl Fn(Vec<String>) -> GuardianResult<Option<String>>,
+    ) {
+        let boundaries = std::iter::once((0, 1))
+            .chain((1..=19).map(|exponent| {
+                let power = 10u64.pow(exponent);
+                (power - 1, power)
+            }))
+            .chain(std::iter::once((u64::MAX - 1, u64::MAX)));
+
+        for (lower, upper) in boundaries {
+            let lower_key = key_for(lower);
+            let upper_key = key_for(upper);
+            assert!(
+                lower_key < upper_key,
+                "numeric order differs from key order: {lower_key} >= {upper_key}"
+            );
+            for keys in [
+                vec![lower_key.clone(), upper_key.clone()],
+                vec![upper_key.clone(), lower_key.clone()],
+            ] {
+                assert_eq!(select(keys).unwrap(), Some(upper_key.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn ceremony_keys_follow_sharing_sequence_order() {
+        let setup = SetupNewKeyResponse::mock_for_testing();
+        let instance = setup.secret_sharing_instance;
+        assert_numeric_key_order(
+            |sharing_seq| {
+                CeremonyLogMessage::NewKey {
+                    instance: SecretSharingInstance::new(
+                        instance.commitments().clone(),
+                        instance.num_shares(),
+                        instance.threshold(),
+                        sharing_seq,
+                    )
+                    .unwrap(),
+                    btc_master_pubkey: setup.btc_master_pubkey,
+                }
+                .object_key()
+            },
+            CeremonyLogMessage::latest_key,
+        );
+    }
+
+    #[test]
+    fn kp_share_keys_follow_numeric_sequence_order() {
+        assert_numeric_key_order(
+            |cert_seq| KpShareStateLogMessage::object_key_for_sequences(9, cert_seq),
+            |keys| KpShareStateLogMessage::latest_key(9, keys),
+        );
+    }
+
+    #[test]
+    fn committee_update_keys_follow_epoch_order() {
+        let (signed_request, committee) =
+            StandardWithdrawalRequest::mock_signed_and_committee_for_testing(
+                bitcoin::Network::Regtest,
+            );
+        let (request_sign, _) = signed_request.into_parts();
+        let mut message = CommitteeUpdateLogMessage {
+            from_epoch: 0,
+            new_committee: (&committee).into(),
+            request_sign,
+        };
+        assert_numeric_key_order(
+            |epoch| {
+                message.new_committee.epoch = epoch;
+                message.object_key()
+            },
+            CommitteeUpdateLogMessage::latest_key,
+        );
     }
 }

@@ -6,15 +6,15 @@
 //! internet-facing and `OperatorInit` is one-shot and unauthenticated, so
 //! exposing it would let anyone wedge the guardian. KP-signed RPCs are
 //! forwarded after a signature and roster check; `ConfirmCeremony` goes to the
-//! ceremony guardian, which is the relay's backend. Wrapped by
-//! [`crate::cache::CachingGuardianGrpc`] to cache `StandardWithdrawal`.
+//! ceremony guardian, which is the relay's backend. A committee handoff is
+//! forwarded only once the chain stores one between the same two epochs
+//! ([`crate::node::handoffs`]). Wrapped by
+//! [`crate::node::cache::CachingGuardianGrpc`] to cache `StandardWithdrawal`
+//! and `GetGuardianInfo`.
 
 use std::sync::Arc;
 
 use hashi_types::guardian::CeremonyConfirmationRequest;
-use hashi_types::guardian::GuardianError;
-use hashi_types::guardian::KpSigned;
-use hashi_types::guardian::KpSigningIntent;
 use hashi_types::guardian::ProvisionerRotateCertRequest;
 use hashi_types::proto;
 use hashi_types::proto::guardian_service_client::GuardianServiceClient;
@@ -24,8 +24,10 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
-use crate::roster::RosterCache;
-use crate::widlog::LogStore;
+use crate::kp;
+use crate::kp::roster::RosterCache;
+use crate::log_store::LogStore;
+use crate::node::handoffs::HandoffGate;
 
 /// Holds a plain [`Channel`] rather than the node's boxed transport: the generated
 /// server trait requires `Send + Sync + 'static`, and `BoxCloneService` is not `Sync`.
@@ -38,27 +40,22 @@ pub struct Forwarding<L> {
     /// Shared with the relay: one gate admits every KP-signed RPC, and a cert
     /// rotation drops the cached roster for both.
     roster: Arc<RosterCache<L>>,
+    handoffs: Arc<HandoffGate>,
 }
 
 impl<L: LogStore> Forwarding<L> {
-    pub fn new(channel: Channel, ceremony_channel: Channel, roster: Arc<RosterCache<L>>) -> Self {
+    pub fn new(
+        channel: Channel,
+        ceremony_channel: Channel,
+        roster: Arc<RosterCache<L>>,
+        handoffs: Arc<HandoffGate>,
+    ) -> Self {
         Self {
             client: GuardianServiceClient::new(channel),
             ceremony_client: GuardianServiceClient::new(ceremony_channel),
             roster,
+            handoffs,
         }
-    }
-
-    /// Admission control only: the enclave repeats both checks. Signature
-    /// first because it needs no roster read.
-    async fn admit<T, P>(&self, request: &P) -> Result<(), Status>
-    where
-        T: KpSigningIntent,
-        P: Clone,
-        KpSigned<T>: TryFrom<P, Error = GuardianError>,
-    {
-        let signer = verify_kp_signature::<T, P>(request)?.signer_fingerprint();
-        self.roster.authorize(&signer).await
     }
 }
 
@@ -67,20 +64,6 @@ fn denied(rpc: &str) -> Status {
         "{rpc} is not served by the guardian proxy; operator calls reach the \
          guardian directly and KP shares use SingleProvisionerInit"
     ))
-}
-
-fn verify_kp_signature<T, P>(request: &P) -> Result<KpSigned<T>, Status>
-where
-    T: KpSigningIntent,
-    P: Clone,
-    KpSigned<T>: TryFrom<P, Error = GuardianError>,
-{
-    let signed_request = KpSigned::<T>::try_from(request.clone())
-        .map_err(|e| Status::invalid_argument(format!("malformed request: {e}")))?;
-    signed_request
-        .verify_signature()
-        .map_err(|e| Status::unauthenticated(e.to_string()))?;
-    Ok(signed_request)
 }
 
 // Each method clones the cheap channel-backed client and forwards the whole
@@ -94,6 +77,16 @@ impl<L: LogStore> GuardianService for Forwarding<L> {
         self.client.clone().get_guardian_info(request).await
     }
 
+    async fn get_attested_guardian_info(
+        &self,
+        request: Request<proto::GetAttestedGuardianInfoRequest>,
+    ) -> Result<Response<proto::GetAttestedGuardianInfoResponse>, Status> {
+        self.client
+            .clone()
+            .get_attested_guardian_info(request)
+            .await
+    }
+
     async fn standard_withdrawal(
         &self,
         request: Request<proto::SignedStandardWithdrawalRequest>,
@@ -105,6 +98,9 @@ impl<L: LogStore> GuardianService for Forwarding<L> {
         &self,
         request: Request<proto::SignedCommitteeTransition>,
     ) -> Result<Response<proto::UpdateCommitteeResponse>, Status> {
+        self.handoffs
+            .admit(std::slice::from_ref(request.get_ref()))
+            .await?;
         self.client.clone().update_committee(request).await
     }
 
@@ -112,6 +108,7 @@ impl<L: LogStore> GuardianService for Forwarding<L> {
         &self,
         request: Request<proto::UpdateCommitteeChainRequest>,
     ) -> Result<Response<proto::UpdateCommitteeResponse>, Status> {
+        self.handoffs.admit(&request.get_ref().transitions).await?;
         self.client.clone().update_committee_chain(request).await
     }
 
@@ -119,8 +116,8 @@ impl<L: LogStore> GuardianService for Forwarding<L> {
         &self,
         request: Request<proto::SignedProvisionerRotateCertRequest>,
     ) -> Result<Response<proto::SignedProvisionerRotateCertResponse>, Status> {
-        self.admit::<ProvisionerRotateCertRequest, _>(request.get_ref())
-            .await?;
+        let signed = kp::parse::<ProvisionerRotateCertRequest, _>(request.get_ref())?;
+        kp::admit(&self.roster, &signed).await?;
         let response = self.client.clone().provisioner_rotate_cert(request).await?;
         // The enclave has committed the replacement cert to the share log, so
         // drop the cached roster: otherwise the new cert is rejected until the
@@ -135,8 +132,8 @@ impl<L: LogStore> GuardianService for Forwarding<L> {
         &self,
         request: Request<proto::SignedCeremonyConfirmationRequest>,
     ) -> Result<Response<proto::CeremonyConfirmationResponse>, Status> {
-        self.admit::<CeremonyConfirmationRequest, _>(request.get_ref())
-            .await?;
+        let signed = kp::parse::<CeremonyConfirmationRequest, _>(request.get_ref())?;
+        kp::admit_confirmation(&self.roster, &signed).await?;
         self.ceremony_client.clone().confirm_ceremony(request).await
     }
 
@@ -179,9 +176,8 @@ impl<L: LogStore> GuardianService for Forwarding<L> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_utils {
     use super::*;
-    use crate::cache::CachingGuardianGrpc;
     use hashi_types::proto::guardian_service_server::GuardianServiceServer;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -192,14 +188,35 @@ mod tests {
     use tonic::transport::Server;
 
     #[derive(Clone, Default)]
-    struct StubGuardian {
-        standard_withdrawal_calls: Arc<AtomicUsize>,
-        get_guardian_info_calls: Arc<AtomicUsize>,
-        confirm_ceremony_calls: Arc<AtomicUsize>,
+    pub(crate) struct StubGuardian {
+        pub(crate) standard_withdrawal_calls: Arc<AtomicUsize>,
+        pub(crate) get_guardian_info_calls: Arc<AtomicUsize>,
+        pub(crate) get_attested_guardian_info_calls: Arc<AtomicUsize>,
+        pub(crate) confirm_ceremony_calls: Arc<AtomicUsize>,
+        pub(crate) update_committee_calls: Arc<AtomicUsize>,
+        /// Served by `GetGuardianInfo`; the default response when unset.
+        pub(crate) info: Arc<std::sync::Mutex<Option<proto::GetGuardianInfoResponse>>>,
     }
 
     #[tonic::async_trait]
     impl GuardianService for StubGuardian {
+        async fn get_attested_guardian_info(
+            &self,
+            request: Request<proto::GetAttestedGuardianInfoRequest>,
+        ) -> Result<Response<proto::GetAttestedGuardianInfoResponse>, Status> {
+            assert_eq!(
+                request.metadata().get("x-attestation-test").unwrap(),
+                "forwarded"
+            );
+            let call = self
+                .get_attested_guardian_info_calls
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(Response::new(proto::GetAttestedGuardianInfoResponse {
+                attestation: Some(vec![call as u8].into()),
+                ..Default::default()
+            }))
+        }
+
         async fn standard_withdrawal(
             &self,
             _: Request<proto::SignedStandardWithdrawalRequest>,
@@ -220,7 +237,8 @@ mod tests {
             _: Request<proto::GetGuardianInfoRequest>,
         ) -> Result<Response<proto::GetGuardianInfoResponse>, Status> {
             self.get_guardian_info_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Response::new(proto::GetGuardianInfoResponse::default()))
+            let info = self.info.lock().unwrap().clone();
+            Ok(Response::new(info.unwrap_or_default()))
         }
 
         async fn setup_new_key(
@@ -268,13 +286,15 @@ mod tests {
             &self,
             _: Request<proto::SignedCommitteeTransition>,
         ) -> Result<Response<proto::UpdateCommitteeResponse>, Status> {
-            unimplemented!("not exercised by tests")
+            self.update_committee_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Response::new(proto::UpdateCommitteeResponse::default()))
         }
         async fn update_committee_chain(
             &self,
             _: Request<proto::UpdateCommitteeChainRequest>,
         ) -> Result<Response<proto::UpdateCommitteeResponse>, Status> {
-            unimplemented!("not exercised by tests")
+            self.update_committee_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Response::new(proto::UpdateCommitteeResponse::default()))
         }
         async fn rotate_kp_set(
             &self,
@@ -284,21 +304,7 @@ mod tests {
         }
     }
 
-    fn mock_request(wid: [u8; 32], seq: u64) -> Request<proto::SignedStandardWithdrawalRequest> {
-        Request::new(proto::SignedStandardWithdrawalRequest {
-            data: Some(proto::StandardWithdrawalRequestData {
-                wid: Some(wid.to_vec().into()),
-                utxos: None,
-                timestamp_secs: Some(100),
-                seq: Some(seq),
-            }),
-            committee_signature: None,
-        })
-    }
-
-    type StubStore = crate::widlog::test_store::MemStore;
-
-    async fn spawn_stub() -> (StubGuardian, tonic::transport::Channel) {
+    pub(crate) async fn spawn_stub() -> (StubGuardian, tonic::transport::Channel) {
         let stub = StubGuardian::default();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -319,16 +325,56 @@ mod tests {
         (stub, channel)
     }
 
-    fn proxy_over(
+    pub(crate) fn mock_request(
+        wid: [u8; 32],
+        seq: u64,
+    ) -> Request<proto::SignedStandardWithdrawalRequest> {
+        Request::new(proto::SignedStandardWithdrawalRequest {
+            data: Some(proto::StandardWithdrawalRequestData {
+                wid: Some(wid.to_vec().into()),
+                utxos: None,
+                timestamp_secs: Some(100),
+                seq: Some(seq),
+            }),
+            committee_signature: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_utils::*;
+    use super::*;
+    use crate::node::cache::CachingGuardianGrpc;
+    use crate::node::handoffs::test_utils::gate_over;
+    use crate::node::handoffs::test_utils::transition;
+    use crate::node::widlog::test_utils::withdrawal_log_json;
+    use crate::node::widlog::WidLogIndex;
+    use hashi_types::guardian::now_timestamp_ms;
+    use hashi_types::guardian::StandardWithdrawalResponse;
+    use hashi_types::guardian::WithdrawalID;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    type StubStore = crate::log_store::test_store::MemStore;
+
+    /// A proxy whose chain stores `handoffs`, each as `(from_epoch, next_epoch)`.
+    async fn proxy_over(
         active: tonic::transport::Channel,
         ceremony: tonic::transport::Channel,
         store: StubStore,
+        handoffs: &[(u64, u64)],
     ) -> CachingGuardianGrpc<Forwarding<StubStore>, StubStore> {
+        let metrics = Arc::new(crate::metrics::ProxyMetrics::new());
         CachingGuardianGrpc::new(
-            Forwarding::new(active, ceremony, Arc::new(RosterCache::new(store))),
-            StubStore::default(),
-            bitcoin::Network::Regtest,
-            std::sync::Arc::new(crate::metrics::ProxyMetrics::new()),
+            Forwarding::new(
+                active,
+                ceremony,
+                Arc::new(RosterCache::new(store)),
+                gate_over(handoffs),
+            ),
+            WidLogIndex::ready_for_tests(StubStore::default(), metrics.clone()).await,
+            metrics,
         )
     }
 
@@ -340,33 +386,68 @@ mod tests {
         CachingGuardianGrpc<Forwarding<StubStore>, StubStore>,
     ) {
         let (stub, channel) = spawn_stub().await;
-        (stub, proxy_over(channel.clone(), channel, store))
+        (stub, proxy_over(channel.clone(), channel, store, &[]).await)
     }
 
     #[tokio::test]
-    async fn forwards_and_caches_over_real_grpc() {
+    async fn forwards_and_replays_over_real_grpc() {
         let (stub, proxy) = spawn_stub_proxy(StubStore::default()).await;
 
-        // First withdrawal forwards to the stub; a same-wid retry at a bumped
-        // seq replays the cached response without re-calling the stub.
-        let r1 = proxy
+        // The first withdrawal forwards to the stub. The enclave writes the
+        // withdrawal log, so a same-wid retry at a bumped seq replays it
+        // without a second call to the stub.
+        proxy
             .standard_withdrawal(mock_request([0x11; 32], 0))
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
+        let (key, bytes) = withdrawal_log_json(
+            WithdrawalID::new([0x11; 32]),
+            0,
+            now_timestamp_ms(),
+            StandardWithdrawalResponse {
+                enclave_signatures: vec![],
+            },
+        );
+        proxy.widlog().store().insert(key, bytes);
         let r2 = proxy
             .standard_withdrawal(mock_request([0x11; 32], 1))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(stub.standard_withdrawal_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(r1, r2);
+        assert!(r2.data.unwrap().enclave_signatures.is_empty());
 
         // A non-withdrawal node RPC passes through to the stub.
         proxy
             .get_guardian_info(Request::new(proto::GetGuardianInfoRequest {}))
             .await
             .unwrap();
+        assert_eq!(stub.get_guardian_info_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn attested_info_bypasses_cache_and_preserves_metadata() {
+        let (stub, proxy) = spawn_stub_proxy(StubStore::default()).await;
+        for expected in 0..3u8 {
+            proxy
+                .get_guardian_info(Request::new(proto::GetGuardianInfoRequest {}))
+                .await
+                .unwrap();
+            let mut request = Request::new(proto::GetAttestedGuardianInfoRequest {});
+            request
+                .metadata_mut()
+                .insert("x-attestation-test", "forwarded".parse().unwrap());
+            let response = proxy
+                .get_attested_guardian_info(request)
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.attestation.unwrap().as_ref(), &[expected]);
+        }
+        assert_eq!(
+            stub.get_attested_guardian_info_calls.load(Ordering::SeqCst),
+            3
+        );
         assert_eq!(stub.get_guardian_info_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -382,6 +463,36 @@ mod tests {
             .expect_err("a missing signer attestation must not be forwarded");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert_eq!(stub.confirm_ceremony_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn forwards_only_committee_handoffs_the_chain_stores() {
+        let (stub, channel) = spawn_stub().await;
+        let proxy = proxy_over(channel.clone(), channel, StubStore::default(), &[(5, 7)]).await;
+        let chain = |transitions| Request::new(proto::UpdateCommitteeChainRequest { transitions });
+
+        proxy
+            .update_committee(Request::new(transition(5, 7)))
+            .await
+            .unwrap();
+        proxy
+            .update_committee_chain(chain(vec![transition(5, 7)]))
+            .await
+            .unwrap();
+        assert_eq!(stub.update_committee_calls.load(Ordering::SeqCst), 2);
+
+        // The reconfig out of epoch 7 has not completed.
+        let early = proxy
+            .update_committee(Request::new(transition(7, 9)))
+            .await
+            .unwrap_err();
+        assert_eq!(early.code(), tonic::Code::Unavailable);
+        let early = proxy
+            .update_committee_chain(chain(vec![transition(5, 7), transition(7, 9)]))
+            .await
+            .unwrap_err();
+        assert_eq!(early.code(), tonic::Code::Unavailable);
+        assert_eq!(stub.update_committee_calls.load(Ordering::SeqCst), 2);
     }
 
     // The stub `unimplemented!()`s the rejected RPCs, so a forwarded call would panic

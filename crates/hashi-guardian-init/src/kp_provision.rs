@@ -13,12 +13,13 @@
 //!    configured) — is fetched and verified against the enclave attestation,
 //!    pinning the standby session.
 //! 2. The same session's S3 `init/` log is fetched and required to match the
-//!    endpoint `GuardianInfo`. Bucket, limiter config, `mpc_master_g`, and
+//!    endpoint `GuardianInfo`. Deployment policy, limiter config, and
 //!    `enclave_btc_pubkey == None` are all confirmed.
 //! 3. The authoritative `ceremony/` log is scraped for the secret-sharing
-//!    instance the new guardian was booted with; it must match.
-//! 4. The stable `InitConfig` is recomputed from limiter config, master G, PCR
-//!    allowlist, S3 policy, and network; its `config_hash` is confirmed.
+//!    instance the new guardian was booted with; it must match. The ceremony
+//!    BTC master public key must match the immutable on-chain guardian key.
+//! 4. The stable `InitConfig` is recomputed from limiter config and deployment
+//!    policy; its `config_hash` is confirmed.
 //! 5. The optional genesis state hash is independently derived from S3 and
 //!    current on-chain state and confirmed against the enclave's pin.
 //! 6. This KP's PGP-encrypted share is read from the latest
@@ -56,7 +57,6 @@ use rand::thread_rng;
 use tracing::info;
 
 use crate::config::Config;
-use crate::guardian_info::ensure_oi_info_matches_post_init;
 use crate::guardian_info::verified_provisioning_target_info;
 use crate::kp_roster::decrypt_kp_share;
 
@@ -93,19 +93,6 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
         .await
         .context("connect to guardian log bucket")?;
     info!(phase = "s3 connect", "connected to guardian log bucket");
-
-    info!(
-        phase = "sui connect",
-        sui_rpc = %cfg.hashi.sui_rpc,
-        package_id = %cfg.hashi.hashi_ids.package_id,
-        hashi_object_id = %cfg.hashi.hashi_ids.hashi_object_id,
-        "connecting to Sui RPC for Hashi on-chain state",
-    );
-    let onchain_state = cfg.hashi.onchain_state().await?;
-    info!(phase = "sui connect", "connected to Sui RPC");
-
-    let master_g = onchain_state.onchain_verifying_key_g()?;
-    info!(phase = "setup", master_g = ?master_g, "fetched on-chain MPC master G");
 
     info!(
         phase = "roster load",
@@ -145,22 +132,23 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
     );
     let endpoint_verified =
         verified_endpoint_guardian_info(&cfg.relay_endpoint, allowlist.current_build()).await?;
-    let session_id = endpoint_verified.session_id;
-    let guardian_info = endpoint_verified.info;
+    let session_id = endpoint_verified.session_id();
+    let guardian_info = endpoint_verified.into_info();
     info!(
         phase = "guardian endpoint",
         session_id = %session_id,
         "relay endpoint GuardianInfo verified; pinned standby session",
     );
 
-    // 2. Fetch + verify the same session's signed `GuardianInfo` from S3.
+    // 2. Fetch + verify the same session's signed operator-init record from S3.
     info!(
         phase = "guardian info",
         session_id = %session_id,
-        "fetching + verifying pinned standby session's signed GuardianInfo from S3",
+        "fetching + verifying pinned standby session's signed operator-init record from S3",
     );
     let verified_session = reader.get_current_session_info(&session_id).await?;
     let GuardianInfo {
+        signing_pub_key: _,
         lifecycle,
         secret_sharing_instance,
         deployment_info: deployment,
@@ -171,15 +159,9 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
         limiter_state: enclave_limiter_state,
         limiter_config,
         current_committee_epoch: enclave_current_committee_epoch,
-        mpc_master_g,
-        hashi_object_id: enclave_hashi_object_id,
+        mpc_master_g: _,
+        hashi_object_id: _,
     } = &guardian_info;
-    anyhow::ensure!(
-        *enclave_hashi_object_id == Some(cfg.hashi.hashi_ids.hashi_object_id),
-        "Guardian hashi_object_id mismatch: enclave reports {:?}, expected {}",
-        enclave_hashi_object_id,
-        cfg.hashi.hashi_ids.hashi_object_id,
-    );
     anyhow::ensure!(
         *lifecycle == WithdrawStage::OperatorInitialized.into(),
         "Guardian lifecycle is {lifecycle:?}; expected withdraw/operator_initialized"
@@ -205,9 +187,6 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
         .as_ref()
         .copied()
         .context("Guardian info missing limiter_config")?;
-    let enclave_mpc_master_g = mpc_master_g
-        .as_ref()
-        .context("Guardian info missing mpc_master_g")?;
     info!(
         phase = "guardian info",
         session_id = %session_id,
@@ -239,18 +218,14 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
         enclave_current_committee_epoch.is_none(),
         "Guardian has current_committee_epoch => operator activation already ran"
     );
-    ensure_oi_info_matches_post_init(verified_session.info(), &guardian_info)
-        .with_context(|| format!("S3 GuardianInfo mismatch for session {session_id}"))?;
-    anyhow::ensure!(
-        &master_g == enclave_mpc_master_g,
-        "MPC master g mismatch: expected {:?}, got {:?}",
-        master_g,
-        enclave_mpc_master_g
-    );
+    verified_session
+        .info()
+        .match_post_oi_guardian_info(&guardian_info)
+        .with_context(|| format!("S3 operator-init info mismatch for session {session_id}"))?;
     info!(
         phase = "guardian info",
         session_id = %session_id,
-        "guardian info checks passed (bucket, limiter config, mpc_master_g, standby not activated)",
+        "guardian info checks passed (deployment policy, limiter config, standby not activated)",
     );
     info!(
         phase = "heartbeat",
@@ -274,6 +249,17 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
         "scraping authoritative ceremony/ and kp-shares/ logs",
     );
     let state = reader.read_latest_ceremony_state().await?;
+    let onchain_state = cfg.hashi.onchain_state().await?;
+    let onchain_btc_pubkey = onchain_state
+        .guardian_btc_public_key()
+        .context("guardian_btc_public_key is not set on chain; launch Hashi before provisioning")?;
+    anyhow::ensure!(
+        state.btc_master_pubkey.serialize().as_slice() == onchain_btc_pubkey.as_slice(),
+        "ceremony BTC master public key does not match on-chain guardian_btc_public_key: \
+         ceremony {}, on-chain {}",
+        hex::encode(state.btc_master_pubkey.serialize()),
+        hex::encode(&onchain_btc_pubkey),
+    );
     let sharing_seq = state.secret_sharing_instance.sharing_seq();
     info!(
         phase = "ceremony instance",
@@ -297,14 +283,9 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
     //    digest is the `config_hash` bound into the signed PI submission.
     info!(
         phase = "config hash",
-        "recomputing config_hash from limiter config + master G + PCR allowlist + S3 policy + network",
+        "recomputing config_hash from limiter config + deployment policy",
     );
-    let expected_config = InitConfig::new(
-        cfg.limiter_config,
-        master_g,
-        cfg.deployment.clone(),
-        cfg.hashi.hashi_ids.hashi_object_id,
-    );
+    let expected_config = InitConfig::new(cfg.limiter_config, cfg.deployment.clone());
     let config_hash = expected_config.digest();
     anyhow::ensure!(
         config_hash == enclave_config_hash,
@@ -324,11 +305,12 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
     let expected_genesis_state_hash = match (do_genesis, latest_committee) {
         (false, Some(_)) => None,
         (true, None) => {
+            let master_g = onchain_state.onchain_verifying_key_g()?;
             let committee = onchain_state
-                .current_committee()
+                .current_raw_committee()
                 .context("no current committee on chain (DKG not yet complete?)")?;
             Some(
-                GenesisState::new(committee, cfg.hashi.hashi_ids.hashi_object_id, master_g)
+                GenesisState::from_parts(committee, cfg.hashi.hashi_ids.hashi_object_id, master_g)
                     .digest(),
             )
         }
@@ -359,7 +341,7 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
         sharing_seq, "verifying this KP's encrypted share from kp-shares/",
     );
     state.validate_sharing_params(cfg.kp_roster.num_shares, cfg.kp_roster.threshold)?;
-    state.encrypted_shares.verify_recipient_set(&certs_roster)?;
+    state.encrypted_shares.verify_recipients(&certs_roster)?;
     info!(
         phase = "share read",
         cert_seq = state.cert_seq,
@@ -546,7 +528,7 @@ async fn prechecks(
     current_build: &BuildPcrs,
 ) -> anyhow::Result<()> {
     let verified = verified_provisioning_target_info(client, current_build).await?;
-    let actual_session_id = verified.session_id;
+    let actual_session_id = verified.session_id();
     info!(
         phase = "relay submit",
         actual_session_id = %actual_session_id,
@@ -561,10 +543,10 @@ async fn prechecks(
         actual_session_id
     );
     anyhow::ensure!(
-        &verified.info == expected_guardian_info,
+        verified.info() == expected_guardian_info,
         "relay endpoint GuardianInfo mismatch: expected {:?}, got {:?}",
         expected_guardian_info,
-        verified.info
+        verified.info()
     );
     info!(
         phase = "relay submit",

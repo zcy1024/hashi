@@ -8,11 +8,15 @@ mod tests {
     use anyhow::anyhow;
     use bitcoin::Amount;
     use bitcoin::Txid;
+    use bitcoin::hashes::Hash;
 
     use futures::StreamExt;
     use hashi::deposits::UnapprovedDepositError;
+    use hashi::finalize_bitcoin_check::Verdict;
+    use hashi::finalize_bitcoin_check::classify;
     use hashi::sui_tx_executor::SuiTxExecutor;
     use hashi_types::bitcoin::BitcoinAddress;
+    use hashi_types::committee::certificate_threshold;
     use hashi_types::move_types::ProtocolType;
     use hashi_types::move_types::WithdrawalConfirmed;
     use hashi_types::move_types::WithdrawalPickedForProcessing;
@@ -31,6 +35,7 @@ mod tests {
     use crate::TestNetworksBuilder;
 
     use crate::test_helpers::BackgroundMiner;
+    use crate::test_helpers::assert_no_member_refusals;
     use crate::test_helpers::assert_no_unrouted_objects;
     use crate::test_helpers::assert_tob_mirror_parity;
     use crate::test_helpers::create_deposit_and_wait;
@@ -498,6 +503,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_deposit_confirms_while_guardian_is_down() -> Result<()> {
+        init_test_logging();
+        info!("=== Starting Deposit Without Guardian Test ===");
+
+        let mut networks = setup_test_networks(TestNetworksBuilder::new().with_nodes(4)).await?;
+        // Restarted without a guardian, nodes 1-3 can't pin its key, so quorum
+        // needs them to use the on-chain key. Node 0 keeps its pin for the helper.
+        networks.guardian_harness = None;
+        for node in &mut networks.hashi_network_mut().nodes_mut()[1..] {
+            node.restart().await?;
+            node.wait_for_mpc_key(Duration::from_secs(120)).await?;
+        }
+        create_deposit_and_wait(&mut networks, 31_337).await?;
+
+        info!("=== Deposit Without Guardian Test Passed ===");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_passive_bitcoin_deposit_discovery() -> Result<()> {
         init_test_logging();
         info!("=== Starting Passive Bitcoin Deposit Discovery Test ===");
@@ -814,7 +838,7 @@ mod tests {
 
         for node in networks.hashi_network.nodes() {
             // The harness injects no local guardian_endpoint, so a resolved
-            // client proves the lazy on-chain path (guardian_url set by the
+            // client proves the lazy on-chain path (guardian_node_url set by the
             // launch tx after these nodes booted) — guardian set up last.
             assert!(node.hashi().config.guardian_endpoint().is_none());
             assert!(node.hashi().guardian_client().is_some());
@@ -825,7 +849,7 @@ mod tests {
             .guardian_harness
             .as_ref()
             .expect("harness present after 2-of-2 cutover");
-        assert!(harness.enclave().require_fully_initialized().is_ok());
+        assert!(harness.enclave().await.require_fully_initialized().is_ok());
 
         let deposit_amount_sats = 100_000u64;
         let hbtc_recipient = create_deposit_and_wait(&mut networks, deposit_amount_sats).await?;
@@ -925,13 +949,16 @@ mod tests {
         // node's mirror. This pins the deferred-archival GC end-to-end.
         wait_for_withdrawal_archival(&networks, Duration::from_secs(60)).await?;
 
+        assert_finalize_bitcoin_check(&networks).await?;
+
         let guardian_state = networks
             .guardian_harness
             .as_ref()
             .expect("harness present after 2-of-2 cutover")
             .enclave()
+            .await
             .state
-            .limiter_snapshot()
+            .limiter_state()
             .expect("guardian limiter state present after a successful withdrawal");
         assert_eq!(guardian_state.next_seq, 1);
         let local_state = hashi
@@ -955,10 +982,233 @@ mod tests {
             guardian_state.last_updated_at,
         );
 
+        wait_for_presig_seal(
+            &networks,
+            hashi.onchain_state().epoch(),
+            0,
+            Duration::from_secs(60),
+        )
+        .await?;
+
         assert_no_unrouted_objects(&networks);
         assert_tob_mirror_parity(&networks).await?;
+        assert_no_member_refusals(&networks);
 
         info!("=== Bitcoin Withdrawal E2E Test Passed ===");
+        Ok(())
+    }
+
+    /// Cancel a withdrawal through the same PTB the CLI builds. Pins that the
+    /// chain accepts `cancel_withdrawal` as a private `entry` returning a
+    /// `Balance<BTC>` (no `drop`) that a later `balance::send_funds` command
+    /// consumes, and that the refund lands back in the address balance.
+    #[tokio::test]
+    async fn test_withdrawal_cancellation_refunds_hbtc() -> Result<()> {
+        init_test_logging();
+        info!("=== Starting Withdrawal Cancellation E2E Test ===");
+
+        // A batching delay far beyond the test's runtime keeps the leader from
+        // committing the request (which would burn its hBTC and make it
+        // uncancellable), and a zero cooldown lets the requester cancel at once.
+        let builder = TestNetworksBuilder::new()
+            .with_nodes(4)
+            .with_withdrawal_batching_delay_ms(600_000)
+            .with_onchain_config(
+                "withdrawal_cancellation_cooldown_ms",
+                hashi_types::move_types::ConfigValue::U64(0),
+            );
+        let mut networks = setup_test_networks(builder).await?;
+        let package_id = networks.hashi_network.ids().package_id;
+
+        let deposit_amount_sats = 100_000u64;
+        let hbtc_recipient = create_deposit_and_wait(&mut networks, deposit_amount_sats).await?;
+        wait_for_hbtc_balance(
+            &mut networks.sui_network.client,
+            package_id,
+            hbtc_recipient,
+            deposit_amount_sats,
+        )
+        .await?;
+
+        let hashi = networks.hashi_network.nodes()[0].hashi().clone();
+        let user_key = networks.sui_network.user_keys.first().unwrap();
+        let btc_destination = networks.bitcoin_node.get_new_address()?;
+        let destination_bytes = extract_witness_program(&btc_destination)?;
+        let mut executor = SuiTxExecutor::from_config(&hashi.config, hashi.onchain_state())?
+            .with_signer(user_key.clone().into());
+
+        let withdrawal_amount_sats = 30_000u64;
+        let request_id = executor
+            .execute_create_withdrawal_request(withdrawal_amount_sats, destination_bytes)
+            .await?;
+        info!("Withdrawal request created: {request_id}");
+        wait_for_hbtc_balance(
+            &mut networks.sui_network.client,
+            package_id,
+            hbtc_recipient,
+            deposit_amount_sats - withdrawal_amount_sats,
+        )
+        .await?;
+
+        executor.execute_cancel_withdrawal(&request_id).await?;
+        info!("Withdrawal request cancelled: {request_id}");
+        wait_for_hbtc_balance(
+            &mut networks.sui_network.client,
+            package_id,
+            hbtc_recipient,
+            deposit_amount_sats,
+        )
+        .await?;
+
+        info!("=== Withdrawal Cancellation E2E Test Passed ===");
+        Ok(())
+    }
+
+    /// Poll until `owner`'s hBTC balance reads `expected`. Address balances
+    /// settle at checkpoint boundaries, so a read taken right after execution
+    /// can trail the transaction.
+    async fn wait_for_hbtc_balance(
+        client: &mut sui_rpc::Client,
+        package_id: Address,
+        owner: Address,
+        expected: u64,
+    ) -> Result<()> {
+        let timeout = Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let balance = get_hbtc_balance(client, package_id, owner).await?;
+            if balance == expected {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "hBTC balance of {owner} is {balance} sats after {timeout:?}, expected \
+                     {expected}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_presig_seal(
+        networks: &TestNetworks,
+        epoch: u64,
+        batch_index: u32,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let seals: Vec<_> = networks
+                .hashi_network
+                .nodes()
+                .iter()
+                .map(|node| {
+                    node.hashi()
+                        .onchain_state()
+                        .presig_seals(epoch)
+                        .remove(&batch_index)
+                })
+                .collect();
+            if let Some(Some(seal)) = seals.first()
+                && seals.iter().all(|s| s.as_ref() == Some(seal))
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "presig batch {batch_index} of epoch {epoch} is not sealed on every node: \
+                     {seals:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    async fn assert_finalize_bitcoin_check(networks: &TestNetworks) -> Result<()> {
+        let nodes = networks.hashi_network.nodes();
+        let hashi = nodes[0].hashi();
+        let committee = hashi
+            .onchain_state()
+            .current_committee()
+            .context("no current committee")?;
+        wait_until(
+            "every node's probe to pass",
+            Duration::from_secs(180),
+            || {
+                nodes
+                    .iter()
+                    .all(|node| node.hashi().metrics.withdrawal_bitcoin_check_blind.get() == 0)
+            },
+        )
+        .await?;
+        let mut accepted_weight = 0;
+        for node in nodes {
+            let checks = &node.hashi().metrics.withdrawal_bitcoin_check_total;
+            assert_eq!(checks.with_label_values(&["script_failure"]).get(), 0);
+            assert_eq!(
+                node.hashi()
+                    .metrics
+                    .withdrawal_bitcoin_check_script_failures_total
+                    .get(),
+                0
+            );
+            if checks.with_label_values(&["accepted"]).get() > 0 {
+                accepted_weight += committee.weight_of(&node.validator_address())?;
+            }
+        }
+        assert!(
+            accepted_weight >= certificate_threshold(committee.total_weight()),
+            "members whose bitcoind accepted the withdrawal hold only weight {accepted_weight}"
+        );
+
+        hashi.probe_withdrawal_script_check().await?;
+
+        let pool_utxo = hashi
+            .onchain_state()
+            .utxo_records()
+            .into_values()
+            .filter(|record| record.spent_by.is_none())
+            .max_by_key(|record| record.utxo.amount)
+            .context("the withdrawal's change is not in the pool")?
+            .utxo;
+        let destination = networks.bitcoin_node.get_new_address()?.script_pubkey();
+        let spend = |previous_output: bitcoin::OutPoint, script_sig: bitcoin::ScriptBuf| {
+            bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn {
+                    previous_output,
+                    script_sig,
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                }],
+                output: vec![bitcoin::TxOut {
+                    value: Amount::from_sat(pool_utxo.amount / 2),
+                    script_pubkey: destination.clone(),
+                }],
+            }
+        };
+        let monitor = hashi.btc_monitor();
+
+        let unknown_input = spend(
+            bitcoin::OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            bitcoin::ScriptBuf::new(),
+        );
+        assert_eq!(
+            classify(&monitor.test_mempool_accept(unknown_input).await?),
+            Verdict::RejectedOther {
+                reason: "missing-inputs".to_string()
+            }
+        );
+
+        let not_push_only = spend(
+            pool_utxo.id.into(),
+            bitcoin::script::Builder::new()
+                .push_opcode(bitcoin::opcodes::all::OP_NOP)
+                .into_script(),
+        );
+        let verdict = classify(&monitor.test_mempool_accept(not_push_only).await?);
+        assert_eq!(verdict.label(), "script_failure", "{verdict:?}");
         Ok(())
     }
 
@@ -1031,9 +1281,8 @@ mod tests {
                  whether or not governance ever set it. Governance tuning of this key is \
                  not covered by any test — see the update_config insert gap."
             );
-            // On the squashed package every nonce bucket is stamped from
-            // genesis, so the window path is the only one that exists; no
-            // bare-only version guard is needed.
+            // Every nonce submission carries a chain timestamp, so the
+            // window path is the only one that exists.
         }
         let deposit_amount_sats = 100_000u64;
         let withdrawal_amount_sats = 30_000u64;
@@ -1636,6 +1885,7 @@ mod tests {
         // and the guardian's committee-handoff-derived thresholds.
         create_deposit_and_wait(&mut networks, 100_000).await?;
         crate::test_helpers::create_withdrawal_and_wait(&mut networks, 30_000).await?;
+        assert_no_member_refusals(&networks);
 
         Ok(())
     }

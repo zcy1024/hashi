@@ -144,7 +144,7 @@ impl QuorumProgress {
     pub fn new(
         votes: &[Address],
         quorum_threshold_bps: u64,
-        committee: &hashi_types::committee::Committee,
+        committee: &hashi_types::committee::RuntimeCommittee,
     ) -> Self {
         let total_weight = committee.total_weight();
         let voted_weight = votes
@@ -254,7 +254,7 @@ pub fn refuse_vote_state(
 }
 
 fn seated_members(
-    committee: Option<&hashi_types::committee::Committee>,
+    committee: Option<&hashi_types::committee::RuntimeCommittee>,
 ) -> Option<(u64, Vec<Address>)> {
     committee.map(|c| {
         (
@@ -1504,39 +1504,6 @@ pub async fn create_disable_version_proposal(
     Ok(())
 }
 
-/// Create an update guardian proposal
-pub async fn create_update_guardian_proposal(
-    config: &CliConfig,
-    url: &str,
-    metadata: Vec<(String, String)>,
-    tx_opts: &TxOptions,
-) -> Result<()> {
-    print_detail(&format!(
-        "\n{}",
-        "Creating Update Guardian Proposal:".bold()
-    ));
-    print_detail(&format!("  URL:        {}", url));
-    print_metadata(&metadata);
-
-    let mut client = HashiClient::new(config).await?;
-    print_acting_validator(&client)?;
-
-    if !prompt_continue("create this update guardian proposal", tx_opts).await? {
-        crate::cli::print_warning("Aborted.");
-        return Ok(());
-    }
-
-    let tx = client.build_create_proposal_transaction(CreateProposalParams::UpdateGuardian {
-        url: url.to_string(),
-        metadata,
-    })?;
-
-    print_info("Transaction: update_guardian::propose");
-    let response = execute_or_simulate(&mut client, tx, tx_opts).await?;
-    print_created_proposal_id(response.as_ref());
-    Ok(())
-}
-
 /// Create an emergency pause (or, with `unpause == true`, unpause) proposal.
 ///
 /// Pausing uses a deliberately low quorum (default 5%) so a small fraction of
@@ -1657,7 +1624,7 @@ fn print_proposal_detailed(
     proposal: &Proposal,
     status: &str,
     details: Option<&crate::cli::client::ProposalDetails>,
-    committee: Option<&hashi_types::committee::Committee>,
+    committee: Option<&hashi_types::committee::RuntimeCommittee>,
 ) {
     println!("{}", "━".repeat(60).dimmed());
     println!(

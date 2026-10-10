@@ -10,6 +10,7 @@ pub mod proto_conversions;
 pub mod s3;
 pub(crate) mod serde;
 mod session;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 pub mod time;
 
@@ -48,6 +49,7 @@ use crate::bitcoin::TxUTXOs;
 use crate::bitcoin::TxUTXOsWire;
 pub use crate::committee::Committee as HashiCommittee;
 pub use crate::committee::CommitteeMember as HashiCommitteeMember;
+pub use crate::committee::RuntimeCommittee;
 pub use crate::committee::SignedMessage as HashiSigned;
 use ::serde::Deserialize;
 use ::serde::Serialize;
@@ -73,27 +75,25 @@ pub enum OperatorInitRequest {
     Withdraw(Box<WithdrawOperatorInitRequest>),
 }
 
+/// Signed guardian state with a fresh attestation for KP/operator verification.
 #[derive(Debug, PartialEq, Clone)]
-pub struct GetGuardianInfoResponse {
-    /// AWS Nitro attestation
+pub struct AttestedGuardianInfo {
     attestation: NitroAttestation,
-    /// Signing pub key of the guardian
-    signing_pub_key: GuardianPubKey,
     /// Signed guardian info
     signed_info: GuardianSignedResponse<GuardianInfo>,
 }
 
+/// Guardian info whose signature and live attestation have been verified.
 #[derive(Debug, PartialEq, Clone)]
-pub struct VerifiedGuardianInfo {
-    pub info: GuardianInfo,
-    pub signing_pub_key: GuardianPubKey,
-    pub session_id: SessionID,
-}
+pub struct VerifiedGuardianInfo(GuardianInfo);
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct GuardianInfo {
-    /// Signed enclave mode and its current lifecycle stage.
-    pub lifecycle: EnclaveLifecycle,
+    /// Guardian signing public key (Ed25519).
+    #[serde(with = "crate::guardian::serde::guardian_pubkey")]
+    pub signing_pub_key: GuardianPubKey,
+    /// Enclave mode and stage; absent until operator initialization commits.
+    pub lifecycle: Option<EnclaveLifecycle>,
     /// Secret-sharing instance (if set). Used by KPs to check that the right key will be used.
     pub secret_sharing_instance: Option<SecretSharingInstance>,
     /// Public summary of the installed deployment configuration, absent before OI.
@@ -116,10 +116,11 @@ pub struct GuardianInfo {
     pub current_committee_epoch: Option<u64>,
     /// The Hashi shared-object id this guardian serves (set after
     /// operator_init). Certificates verified by this enclave must be bound
-    /// to it; operators/KPs match it against their expected deployment.
+    /// to it. Loaded from verified genesis, or pinned for KP authorization
+    /// during first-deployment bootstrap.
     pub hashi_object_id: Option<sui_sdk_types::Address>,
     /// MPC committee verifying key `G` (the derivation master, NOT the guardian's
-    /// own BTC key). Set after operator_init; lets KPs verify it directly.
+    /// own BTC key). Set after operator_init from the same genesis source.
     #[serde(with = "crate::guardian::serde::option_mpc_master_g")]
     pub mpc_master_g: Option<HashiMasterG>,
     /// Digest of the optional genesis state pinned during operator init. KPs
@@ -143,22 +144,14 @@ pub struct WithdrawOperatorInitRequest {
 
 /// Stable operator-supplied config for arming a withdraw-mode standby. Its
 /// `digest()` is the `config_hash` that KPs authenticate in their PI submissions,
-/// and that the enclave exposes via `GuardianInfo`.
-// TODO(testnet-wipe): Load the immutable Hashi object id and MPC master G from
-// the verified genesis record, then remove their duplicate operator-supplied
-// fields from InitConfig.
+/// and that the enclave exposes via `GuardianInfo`. Immutable deployment bindings
+/// come from genesis rather than this config.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InitConfig {
     /// Limiter config.
     limiter_config: LimiterConfig,
-    /// Raw MPC verifying key (curve point with y-parity preserved).
-    hashi_btc_master_pubkey: HashiMasterG,
     /// Deployment settings shared with ceremony mode.
     deployment: DeploymentConfig,
-    /// The Hashi shared-object id this guardian serves. Bound into every
-    /// committee-certificate preimage the enclave verifies, so certificates
-    /// minted for another Hashi deployment can never verify here.
-    hashi_object_id: sui_sdk_types::Address,
 }
 
 /// Optional first-deploy state pinned by the operator during OI and authorized
@@ -179,7 +172,7 @@ pub struct ActivationState {
     /// Secret-sharing instance pinned during OI and retained through activation.
     secret_sharing_instance: SecretSharingInstance,
     /// Current Hashi committee
-    committee: HashiCommittee,
+    committee: RuntimeCommittee,
     /// Limiter state (tokens available, timestamp, seq)
     limiter_state: LimiterState,
 }
@@ -278,7 +271,7 @@ pub struct CeremonyOperatorInitRequest {
 /// The confirmation also commits to the full deployment configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetupNewKeyRequest {
-    /// One ordered KP certificate per secret share.
+    /// The canonical KP certificate set for fresh dealing.
     key_provisioner_certs_roster: KpCertRoster,
     /// The secret-sharing params (n, t).
     params: SecretSharingParams,
@@ -324,7 +317,7 @@ pub struct ProvisionerRotateKpSetRequest {
     expected_session_id: SessionID,
     expected_deployment_config_hash: [u8; 32],
     encrypted_old_share: GuardianEncryptedShare,
-    /// Ordered OpenPGP certificate roster for the new KPs. Its length equals
+    /// The canonical OpenPGP certificate set for the new KPs. Its length equals
     /// `new_params.num_shares()`.
     new_kp_certs_roster: KpCertRoster,
     /// The new secret-sharing params (n, t).
@@ -458,18 +451,6 @@ impl CeremonyConfirmationResponse {
 }
 
 impl GenesisState {
-    pub fn new(
-        committee: HashiCommittee,
-        hashi_object_id: sui_sdk_types::Address,
-        mpc_master_g: HashiMasterG,
-    ) -> Self {
-        Self {
-            committee: (&committee).into(),
-            hashi_object_id,
-            mpc_master_g,
-        }
-    }
-
     pub fn from_parts(
         committee: crate::move_types::Committee,
         hashi_object_id: sui_sdk_types::Address,
@@ -514,7 +495,7 @@ impl ActivationState {
     pub fn new(
         config_hash: [u8; 32],
         secret_sharing_instance: SecretSharingInstance,
-        committee: HashiCommittee,
+        committee: RuntimeCommittee,
         limiter_state: LimiterState,
     ) -> Self {
         Self {
@@ -530,7 +511,7 @@ impl ActivationState {
     ) -> (
         [u8; 32],
         SecretSharingInstance,
-        HashiCommittee,
+        RuntimeCommittee,
         LimiterState,
     ) {
         (
@@ -541,7 +522,7 @@ impl ActivationState {
         )
     }
 
-    pub fn committee(&self) -> &HashiCommittee {
+    pub fn committee(&self) -> &RuntimeCommittee {
         &self.committee
     }
 
@@ -558,34 +539,15 @@ impl ActivationState {
 }
 
 impl InitConfig {
-    pub fn new(
-        limiter_config: LimiterConfig,
-        hashi_btc_master_pubkey: HashiMasterG,
-        deployment: DeploymentConfig,
-        hashi_object_id: sui_sdk_types::Address,
-    ) -> Self {
+    pub fn new(limiter_config: LimiterConfig, deployment: DeploymentConfig) -> Self {
         Self {
             limiter_config,
-            hashi_btc_master_pubkey,
             deployment,
-            hashi_object_id,
         }
     }
 
-    pub fn into_parts(
-        self,
-    ) -> (
-        LimiterConfig,
-        HashiMasterG,
-        DeploymentConfig,
-        sui_sdk_types::Address,
-    ) {
-        (
-            self.limiter_config,
-            self.hashi_btc_master_pubkey,
-            self.deployment,
-            self.hashi_object_id,
-        )
+    pub fn into_parts(self) -> (LimiterConfig, DeploymentConfig) {
+        (self.limiter_config, self.deployment)
     }
 
     pub fn deployment(&self) -> &DeploymentConfig {
@@ -594,15 +556,6 @@ impl InitConfig {
 
     pub fn limiter_config(&self) -> &LimiterConfig {
         &self.limiter_config
-    }
-
-    pub fn hashi_btc_master_pubkey(&self) -> HashiMasterG {
-        self.hashi_btc_master_pubkey
-    }
-
-    /// Hashi object whose committee certificates this guardian accepts.
-    pub fn hashi_object_id(&self) -> sui_sdk_types::Address {
-        self.hashi_object_id
     }
 
     /// The config hash KPs authenticate, including the entire deployment policy.
@@ -901,66 +854,75 @@ impl StandardWithdrawalRequest {
     }
 }
 
-impl GetGuardianInfoResponse {
+impl AttestedGuardianInfo {
     pub fn new(
         attestation: NitroAttestation,
-        signing_pub_key: GuardianPubKey,
         signed_info: GuardianSignedResponse<GuardianInfo>,
     ) -> Self {
         Self {
             attestation,
-            signing_pub_key,
             signed_info,
         }
     }
 
-    /// Verify a live guardian response.
-    ///
-    /// Used by operator and KP tooling while initializing a guardian (ceremony,
-    /// provisioning, and activation).
+    /// Verify a live guardian response against an independently approved build.
     ///
     /// Checks:
     /// - `signed_info` is signed by `signing_pub_key`;
-    /// - its installed deployment revision, when present, matches `expected_build`;
-    /// - the Nitro attestation has a valid signature;
+    /// - initialized sessions report the expected deployment revision;
+    /// - the Nitro attestation is present and has a valid signature;
     /// - the certificate chain is valid now;
+    /// - the attestation is at most 60 seconds old or 5 seconds in the future;
     /// - the attested public key and PCR0 match `signing_pub_key` and `expected_build`.
+    ///
+    /// Callers check whether the verified lifecycle is appropriate for their operation.
     pub fn verify_live(
         &self,
         expected_build: &BuildPcrs,
     ) -> CryptoVerificationResult<VerifiedGuardianInfo> {
+        // Read the claimed key only to verify this envelope; the attestation
+        // below authenticates it against the approved build before returning info.
+        let signing_pub_key = self.signed_info.data_unchecked().response.signing_pub_key;
         let info = self
             .signed_info
-            .verify_signature(&self.signing_pub_key)?
+            .verify_signature(&signing_pub_key)?
             .response
             .clone();
-        // Before OI only the independently pinned attestation is available.
-        // Once installed, the signed deployment label must agree as well.
-        if let Some(deployment) = &info.deployment_info
-            && deployment.git_revision != expected_build.git_revision()
-        {
-            return Err(CryptoVerificationError::new(format!(
-                "guardian reports build '{}', expected '{}'",
-                deployment.git_revision,
-                expected_build.git_revision()
-            )));
+        if info.lifecycle.is_some() {
+            if info
+                .deployment_info
+                .as_ref()
+                .map(|d| d.git_revision.as_str())
+                != Some(expected_build.git_revision())
+            {
+                return Err(CryptoVerificationError::new(format!(
+                    "guardian reports build '{:?}', expected '{}'",
+                    info.deployment_info.as_ref().map(|d| &d.git_revision),
+                    expected_build.git_revision()
+                )));
+            }
+        } else if info.deployment_info.is_some() {
+            return Err(CryptoVerificationError::new(
+                "expected an uninitialized guardian without deployment configuration",
+            ));
         }
         self.attestation
-            .verify_live(&self.signing_pub_key, expected_build)?;
-        Ok(VerifiedGuardianInfo {
-            info,
-            signing_pub_key: self.signing_pub_key,
-            session_id: SessionID::from_signing_pubkey(&self.signing_pub_key),
-        })
+            .verify_live(&signing_pub_key, expected_build)?;
+        Ok(VerifiedGuardianInfo(info))
+    }
+}
+
+impl VerifiedGuardianInfo {
+    pub fn info(&self) -> &GuardianInfo {
+        &self.0
     }
 
-    /// Extract the guardian's self-reported info and signing key WITHOUT verifying
-    /// the signature or attestation.
-    pub fn into_info_unchecked(self) -> (GuardianInfo, GuardianPubKey) {
-        (
-            self.signed_info.into_data_unchecked().response,
-            self.signing_pub_key,
-        )
+    pub fn into_info(self) -> GuardianInfo {
+        self.0
+    }
+
+    pub fn session_id(&self) -> SessionID {
+        SessionID::from_signing_pubkey(&self.0.signing_pub_key)
     }
 }
 
@@ -988,7 +950,7 @@ pub struct SignedStandardWithdrawalRequestWire {
 struct ActivationStateRepr {
     pub config_hash: [u8; 32],
     pub secret_sharing_instance: SecretSharingInstance,
-    pub committee: crate::move_types::Committee,
+    pub committee: crate::committee::ActivationCommitteeRepr,
     pub limiter_state: LimiterState,
 }
 
@@ -1047,7 +1009,7 @@ impl From<&ActivationState> for ActivationStateRepr {
         Self {
             config_hash,
             secret_sharing_instance,
-            committee: (&committee).into(),
+            committee: committee.activation_digest_repr(),
             limiter_state,
         }
     }
@@ -1062,16 +1024,23 @@ mod tests {
     fn guardian_info_json_encodes_binary_fields_as_strings() {
         let mut info = GuardianInfo::mock_for_testing();
         info.config_hash = Some([0xab; 32]);
-        let btc_pubkey = crate::bitcoin::create_btc_keypair_for_test(&[3u8; 32])
-            .x_only_public_key()
-            .0;
-        info.mpc_master_g = Some(crate::bitcoin::hashi_master_g_from_btc_xonly_for_test(
-            &btc_pubkey,
-        ));
+        let btc_pubkey =
+            crate::bitcoin::BitcoinKeypair::from_seckey_slice(&crate::bitcoin::BTC_LIB, &[3u8; 32])
+                .expect("valid test secret key")
+                .x_only_public_key()
+                .0;
+        info.mpc_master_g = Some(
+            crate::bitcoin::HashiMasterG::with_even_y_from_x_be_bytes(&btc_pubkey.serialize())
+                .expect("valid x-only public key"),
+        );
 
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["lifecycle"]["withdraw"], "operator_initialized");
         assert_eq!(json["encryption_pubkey"], hex::encode([0u8; 32]));
+        assert_eq!(
+            json["signing_pub_key"],
+            hex::encode(info.signing_pub_key.as_bytes())
+        );
         assert_eq!(json["config_hash"], hex::encode([0xab; 32]));
         let mpc_master_g = json["mpc_master_g"].as_str().unwrap();
         assert_eq!(mpc_master_g.len(), 66);
@@ -1086,29 +1055,64 @@ mod tests {
     }
 
     #[test]
-    fn get_guardian_info_into_info_unchecked_returns_info_and_signing_key() {
-        let resp = GetGuardianInfoResponse::mock_for_testing();
-        let expected_info = GuardianInfo::mock_for_testing();
-        let expected_signing_pub_key = resp.signing_pub_key;
-        let (info, signing_pub_key) = resp.into_info_unchecked();
-
-        assert_eq!(info, expected_info);
-        assert_eq!(signing_pub_key, expected_signing_pub_key);
-    }
-
-    #[test]
-    fn get_guardian_info_verify_live_uses_signed_info_verification() {
-        let mut resp = GetGuardianInfoResponse::mock_for_testing();
+    fn get_attested_guardian_info_verify_live_uses_signed_info_verification() {
+        let mut resp = AttestedGuardianInfo::mock_for_testing();
         let mut sig_bytes: [u8; 64] = resp.signed_info.signature.to_bytes();
         sig_bytes[0] ^= 0xff;
         resp.signed_info.signature = GuardianSignature::from(sig_bytes);
 
         assert_eq!(
-            resp.verify_live(&BuildPcrs::new("test-revision", vec![0]))
+            resp.verify_live(&BuildPcrs::mock_for_testing("test-revision", 1))
                 .unwrap_err()
                 .to_string(),
             "signature invalid"
         );
+    }
+
+    #[test]
+    fn attested_guardian_info_rejects_mismatched_signing_key() {
+        let signing_key = GuardianSignKeyPair::from([7; 32]);
+        let info = GuardianInfo::mock_for_testing();
+        assert_ne!(info.signing_pub_key, signing_key.verification_key());
+        let response = AttestedGuardianInfo::new(
+            NitroAttestation::new(vec![]),
+            GuardianSigned::sign(GuardianResponse::new(info, 1234), &signing_key),
+        );
+
+        assert_eq!(
+            response
+                .verify_live(&BuildPcrs::mock_for_testing("test-revision", 1))
+                .unwrap_err()
+                .to_string(),
+            "signature invalid"
+        );
+    }
+
+    #[test]
+    fn guardian_info_verification_distinguishes_boot_from_initialized_sessions() {
+        let key = GuardianSignKeyPair::from([7; 32]);
+        let build = BuildPcrs::mock_for_testing("approved", 1);
+        let response = |mut info: GuardianInfo| {
+            info.signing_pub_key = key.verification_key();
+            AttestedGuardianInfo::new(
+                NitroAttestation::new(vec![]),
+                GuardianSigned::sign(GuardianResponse::new(info, 1234), &key),
+            )
+        };
+        let mut info = GuardianInfo::mock_for_testing();
+        info.lifecycle = None;
+        info.deployment_info = None;
+        assert!(response(info.clone()).verify_live(&build).is_ok());
+        let mut deployment = DeploymentConfig::mock_for_testing().summary();
+        deployment.git_revision = "approved".into();
+        info.deployment_info = Some(deployment);
+        assert!(response(info.clone()).verify_live(&build).is_err());
+        info.lifecycle = CeremonyStage::OperatorInitialized.into();
+        assert!(response(info.clone()).verify_live(&build).is_ok());
+        info.deployment_info.as_mut().unwrap().git_revision = "wrong-label".into();
+        assert!(response(info.clone()).verify_live(&build).is_err());
+        info.deployment_info = None;
+        assert!(response(info).verify_live(&build).is_err());
     }
 
     #[test]
@@ -1147,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn provisioner_rotate_kp_set_signature_commits_to_roster_order() {
+    fn provisioner_rotate_kp_set_signing_payload_is_canonical() {
         let cert_sets = mock_attested_kp_certs(5);
         let reversed: Vec<AttestedKpCert> = cert_sets.iter().rev().cloned().collect();
         let deployment_config_hash = DeploymentConfig::mock_for_testing().digest();
@@ -1176,7 +1180,7 @@ mod tests {
             3,
         )
         .unwrap();
-        assert_ne!(a.new_kp_certs_roster(), b.new_kp_certs_roster());
-        assert_ne!(KpSigned::signed_bytes(&a), KpSigned::signed_bytes(&b));
+        assert_eq!(a.new_kp_certs_roster(), b.new_kp_certs_roster());
+        assert_eq!(KpSigned::signed_bytes(&a), KpSigned::signed_bytes(&b));
     }
 }

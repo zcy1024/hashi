@@ -3,23 +3,33 @@
 
 use super::LEADER_TASK_TIMEOUT;
 use super::LeaderService;
+use super::NoQuorum;
+use super::NoSignature;
+use super::collect_signatures;
+use super::is_already_approved_refusal;
 use super::parse_member_signature;
+use super::retry_peer_call;
 use crate::Hashi;
 use crate::leader::retry::GlobalRetryTracker;
 use crate::leader::retry::RetryTracker;
+use crate::onchain::types::UtxoId;
 use crate::onchain::types::WithdrawalRequest;
 use crate::sui_tx_executor::SuiTxExecutor;
+use crate::withdrawals::CommitmentItem;
+use crate::withdrawals::FeeEstimateUnavailable;
+use crate::withdrawals::RefusedItems;
 use crate::withdrawals::WithdrawalApprovalErrorKind;
+use crate::withdrawals::WithdrawalCommitmentError;
 use crate::withdrawals::WithdrawalCommitmentErrorKind;
 use crate::withdrawals::WithdrawalRequestApproval;
 use crate::withdrawals::WithdrawalTxCommitment;
-use hashi_types::committee::BlsSignatureAggregator;
 use hashi_types::committee::CommitteeMember;
 use hashi_types::committee::CommitteeSignature;
 use hashi_types::committee::MemberSignature;
 use hashi_types::committee::certificate_threshold;
 use hashi_types::proto::SignWithdrawalRequestApprovalRequest;
 use hashi_types::proto::SignWithdrawalTxConstructionRequest;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::sync::Arc;
 use sui_sdk_types::Address;
@@ -191,7 +201,7 @@ impl LeaderService {
         checkpoint_timestamp_ms: u64,
         this_validator_address: Address,
         members: &[CommitteeMember],
-        committee: &hashi_types::committee::Committee,
+        committee: &hashi_types::committee::RuntimeCommittee,
     ) -> anyhow::Result<()> {
         let approval = WithdrawalRequestApproval {
             request_id: request.id,
@@ -220,13 +230,9 @@ impl LeaderService {
         };
 
         let proto_request = approval.to_proto();
-        let required_weight = certificate_threshold(committee.total_weight());
 
-        let mut aggregator = BlsSignatureAggregator::new(
-            inner.config.hashi_ids().hashi_object_id,
-            committee,
-            approval,
-        );
+        let mut aggregator =
+            committee.signature_aggregator(inner.config.hashi_ids().hashi_object_id, approval);
         if let Err(e) = aggregator.add_signature(local_sig) {
             error!("Failed to add local approval signature: {e}");
         }
@@ -241,34 +247,39 @@ impl LeaderService {
             let proto_request = proto_request.clone();
             let member = member.clone();
             sig_tasks.spawn(async move {
-                Self::request_withdrawal_approval_signature(&inner, proto_request, &member).await
+                let reply =
+                    Self::request_withdrawal_approval_signature(&inner, proto_request, &member)
+                        .await;
+                (member.weight(), reply)
             });
         }
 
-        // Collect signatures, stopping once we reach quorum.
-        while let Some(result) = sig_tasks.join_next().await {
-            let Ok(Some(sig)) = result else { continue };
-            if let Err(e) = aggregator.add_signature(sig) {
-                error!("Failed to add approval signature: {e}");
-            }
-            if aggregator.weight() >= required_weight {
-                break;
-            }
-        }
-
-        let weight = aggregator.weight();
-        if weight < required_weight {
+        if let Err(no_quorum) =
+            collect_signatures(&mut sig_tasks, &mut aggregator, committee.total_weight()).await
+        {
+            let kind = match no_quorum {
+                NoQuorum::AlreadyApproved => {
+                    debug!("Peers report the withdrawal request already approved");
+                    WithdrawalApprovalErrorKind::AlreadyApproved
+                }
+                NoQuorum::StaleCommittee { epoch, peer_epoch } => {
+                    warn!("Committee epoch {epoch} is stale: peers signed at epoch {peer_epoch}");
+                    WithdrawalApprovalErrorKind::FailedQuorum
+                }
+                NoQuorum::Short {
+                    weight,
+                    required_weight,
+                } => {
+                    error!("Insufficient approval signatures: weight {weight} < {required_weight}");
+                    WithdrawalApprovalErrorKind::FailedQuorum
+                }
+            };
             inner
                 .metrics
                 .leader_retries_total
-                .with_label_values(&["withdrawal_approval", "FailedQuorum"])
+                .with_label_values(&["withdrawal_approval", &format!("{kind:?}")])
                 .inc();
-            retry_tracker.record_failure(
-                WithdrawalApprovalErrorKind::FailedQuorum,
-                request.id,
-                checkpoint_timestamp_ms,
-            );
-            error!("Insufficient approval signatures: weight {weight} < {required_weight}");
+            retry_tracker.record_failure(kind, request.id, checkpoint_timestamp_ms);
             return Ok(());
         }
 
@@ -329,20 +340,37 @@ impl LeaderService {
         inner: &Arc<Hashi>,
         proto_request: SignWithdrawalRequestApprovalRequest,
         member: &CommitteeMember,
-    ) -> Option<MemberSignature> {
+    ) -> Result<MemberSignature, NoSignature> {
         let validator_address = member.validator_address();
         trace!("Requesting withdrawal request approval signature");
 
-        let response = Self::call_peer_with_retry(
-            inner,
+        let response = match retry_peer_call(
             validator_address,
             "withdrawal request approval signature",
+            || {
+                inner
+                    .onchain_state()
+                    .bridge_service_client(&validator_address)
+            },
             move |mut client| {
                 let request = proto_request.clone();
                 async move { client.sign_withdrawal_request_approval(request).await }
             },
         )
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(status) if is_already_approved_refusal(&status) => {
+                debug!("{validator_address} reports the withdrawal request already approved");
+                return Err(NoSignature::AlreadyApproved);
+            }
+            Err(e) => {
+                error!(
+                    "Failed to get withdrawal request approval signature from {validator_address}: {e}"
+                );
+                return Err(NoSignature::Failed);
+            }
+        };
 
         trace!(
             "Retrieved withdrawal request approval signature from {}",
@@ -360,7 +388,7 @@ impl LeaderService {
                     validator_address
                 );
             })
-            .ok()
+            .map_err(|_| NoSignature::Failed)
     }
 
     // ========================================================================
@@ -485,7 +513,8 @@ impl LeaderService {
             }
             (batch, at_capacity)
         } else {
-            (approved, false)
+            debug!("No local guardian limiter yet; not committing withdrawals");
+            return;
         };
 
         let max_batch = withdrawal_fire_threshold(self.inner.config.withdrawal_max_batch_size());
@@ -554,14 +583,25 @@ impl LeaderService {
             requests.len(),
         );
 
-        // Build the withdrawal tx commitment for the batch.
-        let approval = match inner.build_withdrawal_tx_commitment(&requests).await {
-            Ok(approval) => {
+        let approval = match build_checked_commitment(&inner, requests).await {
+            Ok(Some(approval)) => {
                 retry_tracker.clear();
                 approval
             }
+            Ok(None) => {
+                info!("An unsigned withdrawal appeared; skipping this batch");
+                retry_tracker.clear();
+                return Ok(());
+            }
             Err(e) => {
                 let kind = e.kind();
+                match kind {
+                    WithdrawalCommitmentErrorKind::CommitmentCheckFailed => {
+                        error!("Withdrawal batch not proposed: {e}")
+                    }
+                    WithdrawalCommitmentErrorKind::UtxoSelectionFailed => {}
+                    _ => warn!("Withdrawal commitment attempt failed: {e}"),
+                }
                 inner
                     .metrics
                     .leader_retries_total
@@ -598,11 +638,8 @@ impl LeaderService {
         }
 
         // Collect signatures, stopping once we reach quorum.
-        let mut aggregator = BlsSignatureAggregator::new(
-            inner.config.hashi_ids().hashi_object_id,
-            &committee,
-            approval.clone(),
-        );
+        let mut aggregator = committee
+            .signature_aggregator(inner.config.hashi_ids().hashi_object_id, approval.clone());
         while let Some(result) = sig_tasks.join_next().await {
             let Ok(Some(sig)) = result else { continue };
             if let Err(e) = aggregator.add_signature(sig) {
@@ -776,6 +813,132 @@ impl WithdrawalTxCommitment {
 /// the full batching delay before committing the capped batch anyway.
 fn withdrawal_fire_threshold(config_max: usize) -> usize {
     config_max.min(crate::utxo_pool::CoinSelectionParams::MAX_WITHDRAWAL_REQUESTS)
+}
+
+const COMMITMENT_CHECK_ROUNDS: usize = 4;
+
+async fn build_checked_commitment(
+    inner: &Hashi,
+    mut requests: Vec<WithdrawalRequest>,
+) -> Result<Option<WithdrawalTxCommitment>, WithdrawalCommitmentError> {
+    let commit_gate_open = || !inner.onchain_state().has_unsigned_withdrawal_txn();
+    let mut excluded_inputs = BTreeSet::new();
+    for _ in 0..COMMITMENT_CHECK_ROUNDS {
+        let approval = match inner
+            .build_withdrawal_tx_commitment(&requests, &excluded_inputs)
+            .await
+        {
+            Ok(approval) => approval,
+            Err(e) if !commit_gate_open() => {
+                debug!("Batch build failed, and an unsigned withdrawal has appeared: {e}");
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let refusal = match inner.validate_withdrawal_tx_commitment(&approval).await {
+            Ok(()) => return Ok(commit_gate_open().then_some(approval)),
+            Err(e) if !commit_gate_open() => {
+                debug!(
+                    "Commit check refused the batch, and an unsigned withdrawal has appeared: {e:#}"
+                );
+                return Ok(None);
+            }
+            Err(refusal) => refusal,
+        };
+        if refusal.downcast_ref::<FeeEstimateUnavailable>().is_some() {
+            return Err(WithdrawalCommitmentError::FeeEstimateFailed(refusal));
+        }
+        let Some(refused) = refusal.downcast_ref::<RefusedItems>() else {
+            return Err(WithdrawalCommitmentError::CommitmentCheckFailed(refusal));
+        };
+        warn!(
+            count = refused.0.len(),
+            "Commit check refused items; leaving them out of the withdrawal batch: {refused}"
+        );
+        for item in &refused.0 {
+            inner
+                .metrics
+                .withdrawal_commitment_left_out_total
+                .with_label_values(&[item.item.label(), item.reason])
+                .inc();
+        }
+        leave_out(refused, &mut requests, &mut excluded_inputs);
+        if requests.is_empty() {
+            return Err(WithdrawalCommitmentError::CommitmentCheckFailed(
+                anyhow::anyhow!("the commit check refused every request in the batch"),
+            ));
+        }
+    }
+    Err(WithdrawalCommitmentError::CommitmentCheckFailed(
+        anyhow::anyhow!(
+            "the commit check still refused the batch after {COMMITMENT_CHECK_ROUNDS} rounds"
+        ),
+    ))
+}
+
+fn leave_out(
+    refused: &RefusedItems,
+    requests: &mut Vec<WithdrawalRequest>,
+    excluded_inputs: &mut BTreeSet<UtxoId>,
+) {
+    for item in &refused.0 {
+        match item.item {
+            CommitmentItem::Request(id) => requests.retain(|r| r.id != id),
+            CommitmentItem::Input(id) => {
+                excluded_inputs.insert(id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod checked_commitment_tests {
+    use super::*;
+    use crate::withdrawals::RefusedItem;
+    use hashi_types::bitcoin_txid::BitcoinTxid;
+
+    fn request(id: u8) -> WithdrawalRequest {
+        WithdrawalRequest {
+            id: Address::new([id; 32]),
+            sender: Address::new([0; 32]),
+            btc_amount: 100_000,
+            bitcoin_address: vec![0; 20],
+            created_timestamp_ms: 0,
+            approval_cert: None,
+            approved_timestamp_ms: None,
+            withdrawal_txn_id: None,
+            sui_tx_digest: sui_sdk_types::Digest::new([0; 32]),
+            btc: 100_000,
+        }
+    }
+
+    #[test]
+    fn leaves_out_what_the_commit_check_refuses() {
+        let input = UtxoId {
+            txid: BitcoinTxid::ZERO,
+            vout: 7,
+        };
+        let mut requests = vec![request(1), request(2), request(3)];
+        let mut excluded_inputs = BTreeSet::new();
+        leave_out(
+            &RefusedItems(vec![
+                RefusedItem::new(
+                    CommitmentItem::Request(Address::new([2; 32])),
+                    "request_unapproved",
+                    String::new(),
+                ),
+                RefusedItem::new(CommitmentItem::Input(input), "input_locked", String::new()),
+            ]),
+            &mut requests,
+            &mut excluded_inputs,
+        );
+
+        assert_eq!(
+            requests.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![Address::new([1; 32]), Address::new([3; 32])]
+        );
+        assert_eq!(excluded_inputs, BTreeSet::from([input]));
+    }
 }
 
 #[cfg(test)]

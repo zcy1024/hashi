@@ -16,7 +16,6 @@ use hashi_types::proto::guardian_service_client::GuardianServiceClient;
 use tracing::info;
 
 use crate::config::Config;
-use crate::guardian_info::ensure_oi_info_matches_post_init;
 use crate::guardian_info::verified_live_guardian_info;
 
 /// Initialize a fresh withdraw-mode guardian with operator-supplied stable config.
@@ -57,19 +56,6 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
     info!(phase = "s3 connect", "connected to guardian log bucket");
 
     info!(
-        phase = "sui connect",
-        sui_rpc = %cfg.hashi.sui_rpc,
-        package_id = %cfg.hashi.hashi_ids.package_id,
-        hashi_object_id = %cfg.hashi.hashi_ids.hashi_object_id,
-        "connecting to Sui RPC for Hashi on-chain state",
-    );
-    let onchain_state = cfg.hashi.onchain_state().await?;
-    info!(phase = "sui connect", "connected to Sui RPC");
-
-    let master_g = onchain_state.onchain_verifying_key_g()?;
-    info!(phase = "setup", master_g = ?master_g, "fetched on-chain MPC master G");
-
-    info!(
         phase = "committee",
         "checking latest committee-update/genesis record before operator_init",
     );
@@ -84,15 +70,17 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
             None
         }
         (true, None) => {
+            let onchain_state = cfg.hashi.onchain_state().await?;
+            let master_g = onchain_state.onchain_verifying_key_g()?;
             let committee = onchain_state
-                .current_committee()
+                .current_raw_committee()
                 .context("no current committee on chain (DKG not yet complete?)")?;
             info!(
                 phase = "committee",
-                epoch = committee.epoch(),
+                epoch = committee.epoch,
                 "no committee-update/genesis record; pinning on-chain committee for KP authorization during provisioner_init",
             );
-            Some(GenesisState::new(
+            Some(GenesisState::from_parts(
                 committee,
                 cfg.hashi.hashi_ids.hashi_object_id,
                 master_g,
@@ -122,9 +110,9 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
         "fetching + verifying uninitialized GuardianInfo"
     );
     let preflight = verified_live_guardian_info(&mut client, allowlist.current_build()).await?;
-    ensure_uninitialized(&preflight.info)?;
-    let session_id = preflight.session_id.clone();
-    let signing_pub_key = preflight.signing_pub_key;
+    ensure_uninitialized(preflight.info())?;
+    let session_id = preflight.session_id();
+    let signing_pub_key = preflight.info().signing_pub_key;
     info!(
         phase = "guardian preflight",
         session_id = %session_id,
@@ -152,7 +140,7 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
     ceremony_state.validate_sharing_params(cfg.kp_roster.num_shares, cfg.kp_roster.threshold)?;
     ceremony_state
         .encrypted_shares
-        .verify_recipient_set(&certs_roster)?;
+        .verify_recipients(&certs_roster)?;
     let scraped_instance = ceremony_state.secret_sharing_instance.clone();
     let sharing_seq = scraped_instance.sharing_seq();
     info!(
@@ -165,12 +153,7 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
         "ceremony instance and KP share state verified against expected roster",
     );
 
-    let init_config = InitConfig::new(
-        cfg.limiter_config,
-        master_g,
-        cfg.deployment.clone(),
-        cfg.hashi.hashi_ids.hashi_object_id,
-    );
+    let init_config = InitConfig::new(cfg.limiter_config, cfg.deployment.clone());
     let config_hash = init_config.digest();
     let genesis_state_hash = genesis_state.as_ref().map(GenesisState::digest);
     info!(
@@ -205,17 +188,17 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
     );
     let post = verified_live_guardian_info(&mut client, allowlist.current_build()).await?;
     ensure!(
-        post.session_id == session_id,
+        post.session_id() == session_id,
         "guardian session changed during operator provision: started {}, now {}",
         session_id,
-        post.session_id
+        post.session_id()
     );
     ensure!(
-        post.signing_pub_key == signing_pub_key,
+        post.info().signing_pub_key == signing_pub_key,
         "guardian signing key changed during operator provision"
     );
     verify_initialized_info(
-        post.info.clone(),
+        post.info().clone(),
         &scraped_instance,
         &init_config,
         config_hash,
@@ -239,7 +222,9 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
         verified_session.signing_pubkey() == &signing_pub_key,
         "guardian S3 attestation signing pubkey differs from gRPC signing pubkey"
     );
-    ensure_oi_info_matches_post_init(verified_session.info(), &post.info)?;
+    verified_session
+        .info()
+        .match_post_oi_guardian_info(post.info())?;
     info!(
         phase = "attestation pin",
         session_id = %session_id,
@@ -274,10 +259,7 @@ pub async fn run(cfg: Config, do_genesis: bool) -> anyhow::Result<()> {
 }
 
 fn ensure_uninitialized(info: &GuardianInfo) -> anyhow::Result<()> {
-    ensure!(
-        info.lifecycle == WithdrawStage::Uninitialized.into(),
-        "guardian is not an uninitialized withdraw enclave"
-    );
+    ensure!(info.lifecycle.is_none(), "guardian is not uninitialized");
     ensure!(
         info.secret_sharing_instance.is_none(),
         "guardian already has a secret-sharing instance"
@@ -340,9 +322,6 @@ fn verify_initialized_info(
     let limiter_config = info
         .limiter_config
         .context("Guardian info missing limiter config")?;
-    let mpc_master_g = info
-        .mpc_master_g
-        .context("Guardian info missing MPC master G")?;
 
     ensure!(
         instance == *expected_instance,
@@ -385,12 +364,6 @@ fn verify_initialized_info(
     ensure!(
         info.current_committee_epoch.is_none(),
         "Guardian has committee epoch before operator activation"
-    );
-    ensure!(
-        mpc_master_g == expected_config.hashi_btc_master_pubkey(),
-        "Guardian MPC master G mismatch: expected {:?}, got {:?}",
-        expected_config.hashi_btc_master_pubkey(),
-        mpc_master_g
     );
     Ok(())
 }

@@ -260,7 +260,8 @@ pub enum CreateProposalCommands {
     ///   bitcoin_withdrawal_minimum (u64),
     ///   bitcoin_confirmation_threshold (u64),
     ///   withdrawal_cancellation_cooldown_ms (u64), paused (bool),
-    ///   reconfig_hold (bool)
+    ///   reconfig_hold (bool), guardian_url (string),
+    ///   guardian_node_url (string)
     ///
     /// The MPC parameters live in the epoch config: see `update-epoch-config`
     /// and `update-mpc-config`.
@@ -268,7 +269,8 @@ pub enum CreateProposalCommands {
         /// The config key to update
         key: String,
 
-        /// The new value. Prefix with the type: u64:123, bool:true
+        /// The new value. Prefix with the type: `u64:123`, `bool:true`,
+        /// `string:https://guardian.example`
         value: String,
 
         #[clap(flatten)]
@@ -343,16 +345,6 @@ pub enum CreateProposalCommands {
         metadata: MetadataArgs,
     },
 
-    /// Propose updating the guardian URL
-    UpdateGuardian {
-        /// The guardian gRPC endpoint URL
-        #[clap(long)]
-        url: String,
-
-        #[clap(flatten)]
-        metadata: MetadataArgs,
-    },
-
     /// Propose pausing the protocol (or unpausing it with `--unpause`).
     ///
     /// Pausing uses a deliberately low quorum (default 5% of committee
@@ -373,8 +365,9 @@ pub enum CreateProposalCommands {
     /// An ignored member is treated as no longer part of the committee. The
     /// flag takes effect at the next committee FORMATION: the current
     /// committee is unchanged, and if a reconfiguration is already in
-    /// flight the change lands one epoch later. The member stays registered
-    /// and keeps proposal/vote authorization throughout.
+    /// flight the change lands one epoch later. The member stays registered,
+    /// but once a committee forms without it, it cannot create or vote on
+    /// proposals until it is re-admitted.
     IgnoreMember {
         /// The target member's Sui validator address.
         #[clap(long)]
@@ -499,11 +492,8 @@ pub enum BackupCommands {
 
     /// Restore files from a backup archive.
     ///
-    /// When `--copy-to-original-paths` is set, files are written to the
-    /// absolute paths stored in the manifest at backup time. If the restore
-    /// is running on a different host or with a different filesystem layout,
-    /// those paths will be used verbatim — extract without the flag and copy
-    /// files manually in that case.
+    /// Files are extracted only into the selected output directory. Original
+    /// paths recorded in the manifest are metadata, not restore destinations.
     Restore {
         /// Path to the backup tarball (.tar.asc encrypted or .tar unencrypted)
         backup_tarball: std::path::PathBuf,
@@ -527,13 +517,6 @@ pub enum BackupCommands {
         /// Directory to extract the restored files into
         #[clap(long, default_value = ".")]
         output_dir: std::path::PathBuf,
-
-        /// Copy restored files to their original paths after extraction.
-        ///
-        /// Uses the absolute paths captured in the backup manifest. Intended
-        /// for in-place recovery on the same host the backup came from.
-        #[clap(long)]
-        copy_to_original_paths: bool,
     },
 }
 
@@ -864,10 +847,15 @@ pub struct LaunchOpts {
     #[clap(long, required_unless_present = "status")]
     pub bitcoin_chain_id: Option<String>,
 
-    /// Guardian gRPC endpoint URL. Required — every deposit address is a
-    /// 2-of-2 (mpc, guardian) taproot leaf.
+    /// Guardian's public endpoint URL (`/info`, the key-provisioner relay).
+    /// Required — every deposit address is a 2-of-2 (mpc, guardian) taproot
+    /// leaf.
     #[clap(long, required_unless_present = "status")]
     pub guardian_url: Option<String>,
+
+    /// Guardian endpoint URL nodes call, presenting their registered TLS key.
+    #[clap(long, required_unless_present = "status")]
+    pub guardian_node_url: Option<String>,
 
     /// Guardian BTC pubkey, x-only hex-encoded (32 bytes). Published
     /// on-chain for 2-of-2 deposit address derivation.
@@ -876,11 +864,13 @@ pub struct LaunchOpts {
 
     /// Override `bitcoin_confirmation_threshold` on-chain at launch time.
     /// Falls back to the Move package's `init_defaults` (currently 6) when omitted.
+    /// Sui mainnet refuses a value below the default.
     #[clap(long)]
     pub bitcoin_confirmation_threshold: Option<u64>,
 
     /// Override `bitcoin_deposit_time_delay_ms` on-chain at launch time.
     /// Falls back to the Move package's `init_defaults` (currently 600_000) when omitted.
+    /// Sui mainnet refuses a value below the default.
     #[clap(long)]
     pub bitcoin_deposit_time_delay_ms: Option<u64>,
 
@@ -1201,15 +1191,6 @@ pub async fn run(opts: CliGlobalOpts, command: CliCommand) -> anyhow::Result<()>
                     )
                     .await?;
                 }
-                CreateProposalCommands::UpdateGuardian { url, metadata } => {
-                    commands::proposal::create_update_guardian_proposal(
-                        &config,
-                        &url,
-                        parse_metadata(metadata.metadata),
-                        &tx_opts,
-                    )
-                    .await?;
-                }
                 CreateProposalCommands::EmergencyPause { unpause, metadata } => {
                     commands::proposal::create_emergency_pause_proposal(
                         &config,
@@ -1288,7 +1269,6 @@ pub async fn run(opts: CliGlobalOpts, command: CliCommand) -> anyhow::Result<()>
                 use_gpg_agent,
                 gpg_homedir,
                 output_dir,
-                copy_to_original_paths,
             } => {
                 let decryptor = match crate::backup::archive_format(&backup_tarball)? {
                     crate::backup::BackupArchiveFormat::Unencrypted => {
@@ -1312,12 +1292,7 @@ pub async fn run(opts: CliGlobalOpts, command: CliCommand) -> anyhow::Result<()>
                         }
                     }
                 };
-                commands::backup::restore(
-                    &backup_tarball,
-                    decryptor,
-                    &output_dir,
-                    copy_to_original_paths,
-                )?;
+                commands::backup::restore(&backup_tarball, decryptor, &output_dir)?;
             }
         },
         CliCommand::Deposit { action } => {
@@ -1832,6 +1807,9 @@ pub async fn run_launch(opts: LaunchOpts) -> anyhow::Result<()> {
     let guardian_url = opts
         .guardian_url
         .expect("required unless --status (enforced by clap)");
+    let guardian_node_url = opts
+        .guardian_node_url
+        .expect("required unless --status (enforced by clap)");
     let btc_public_key = hex::decode(
         guardian_btc_public_key
             .strip_prefix("0x")
@@ -1845,6 +1823,7 @@ pub async fn run_launch(opts: LaunchOpts) -> anyhow::Result<()> {
     );
     let guardian = crate::publish::GuardianConfig {
         url: guardian_url,
+        node_url: guardian_node_url,
         btc_public_key,
     };
     let bitcoin_overrides = crate::publish::BitcoinConfigOverrides {
@@ -1854,11 +1833,13 @@ pub async fn run_launch(opts: LaunchOpts) -> anyhow::Result<()> {
 
     // The chain the launch lands on, from the fullnode itself (the RPC URL
     // defaults to mainnet). Refuse a Bitcoin chain the protocol never pairs
-    // with it here, before the UpgradeCap lookup and the confirmation
-    // prompt; the builder's own check only runs after the operator answers.
+    // with it, and overrides it doesn't allow, before the UpgradeCap lookup
+    // and the confirmation prompt; the builder's own checks only run after
+    // the operator answers.
     let sui_chain_id = crate::sui_rpc_client::fetch_sui_chain_id(&mut client).await?;
     print_info(&format!("Sui chain ID: {sui_chain_id}"));
     crate::constants::check_sui_bitcoin_chain_pairing(&sui_chain_id, &bitcoin_chain_id)?;
+    bitcoin_overrides.check_for_sui_chain(&sui_chain_id)?;
 
     // Resolve the sender (the UpgradeCap owner): a local keypair, or an
     // explicit --sender for the serialize-unsigned (multisig) path.

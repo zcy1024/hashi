@@ -19,9 +19,17 @@ use sui::vec_map::{Self, VecMap};
 
 // ~~~~~~~ Constants ~~~~~~~
 
+/// Default share of committee weight, in basis points, that an emergency
+/// pause proposal needs.
+const DEFAULT_EMERGENCY_PAUSE_THRESHOLD_BPS: u64 = 500;
+/// Default share of committee weight, in basis points, that an emergency
+/// unpause proposal needs.
+const DEFAULT_EMERGENCY_UNPAUSE_THRESHOLD_BPS: u64 = 6667;
+
 const PAUSED_KEY: vector<u8> = b"paused";
 const RECONFIG_HOLD_KEY: vector<u8> = b"reconfig_hold";
 const GUARDIAN_URL_KEY: vector<u8> = b"guardian_url";
+const GUARDIAN_NODE_URL_KEY: vector<u8> = b"guardian_node_url";
 const GUARDIAN_BTC_PUBLIC_KEY_KEY: vector<u8> = b"guardian_btc_public_key";
 const GUARDIAN_BTC_PUBLIC_KEY_LEN: u64 = 32;
 const EMERGENCY_PAUSE_THRESHOLD_BPS_KEY: vector<u8> = b"governance_emergency_pause_threshold_bps";
@@ -30,9 +38,9 @@ const EMERGENCY_UNPAUSE_THRESHOLD_BPS_KEY: vector<u8> =
 
 // ~~~~~~~ Errors ~~~~~~~
 
-#[error(code = 3)]
+#[error(code = 0)]
 const EBadGuardianBtcPublicKeyLength: vector<u8> = b"Guardian BTC public key must be 32 bytes";
-#[error(code = 4)]
+#[error(code = 1)]
 const EGuardianBtcPublicKeyImmutable: vector<u8> =
     b"Guardian BTC public key cannot be changed once set";
 
@@ -52,8 +60,14 @@ public(package) fun create(): Config {
     // Core defaults
     config.upsert(PAUSED_KEY, config_value::new_bool(false));
     config.upsert(RECONFIG_HOLD_KEY, config_value::new_bool(false));
-    config.upsert(EMERGENCY_PAUSE_THRESHOLD_BPS_KEY, config_value::new_u64(500));
-    config.upsert(EMERGENCY_UNPAUSE_THRESHOLD_BPS_KEY, config_value::new_u64(6667));
+    config.upsert(
+        EMERGENCY_PAUSE_THRESHOLD_BPS_KEY,
+        config_value::new_u64(DEFAULT_EMERGENCY_PAUSE_THRESHOLD_BPS),
+    );
+    config.upsert(
+        EMERGENCY_UNPAUSE_THRESHOLD_BPS_KEY,
+        config_value::new_u64(DEFAULT_EMERGENCY_UNPAUSE_THRESHOLD_BPS),
+    );
 
     config
 }
@@ -124,9 +138,9 @@ public(package) fun set_paused(self: &mut Config, paused: bool) {
 
 /// Whether governance holds reconfiguration: while set, `start_reconfig`
 /// refuses to form a new committee and the last committed committee keeps
-/// serving. A pending reconfiguration is unaffected. Set and cleared through
-/// `update_config`; absent (a deployment published before the key existed)
-/// means no hold.
+/// serving. A pending reconfiguration is unaffected. Seeded as `false` by
+/// `create`; set and cleared through `update_config`. An absent key reads as
+/// no hold.
 public(package) fun reconfig_hold(self: &Config): bool {
     self.try_get(RECONFIG_HOLD_KEY).map!(|v| v.as_bool()).destroy_or!(false)
 }
@@ -135,14 +149,25 @@ public(package) fun guardian_url(self: &Config): Option<String> {
     self.try_get(GUARDIAN_URL_KEY).map!(|v| v.as_string())
 }
 
+public(package) fun guardian_node_url(self: &Config): Option<String> {
+    self.try_get(GUARDIAN_NODE_URL_KEY).map!(|v| v.as_string())
+}
+
 public(package) fun guardian_btc_public_key(self: &Config): Option<vector<u8>> {
     self.try_get(GUARDIAN_BTC_PUBLIC_KEY_KEY).map!(|v| v.as_bytes())
 }
 
-/// Set the guardian's URL. The ephemeral signing key is intentionally not pinned
-/// onchain; the node authenticates the guardian over TLS + the immutable BTC key.
+/// Set the guardian's public URL: `/info`, the key-provisioner relay and every
+/// other call that isn't a node RPC.
 public(package) fun set_guardian_url(self: &mut Config, url: String) {
     self.upsert(GUARDIAN_URL_KEY, config_value::new_string(url));
+}
+
+/// Set the URL nodes call the guardian on, presenting their registered TLS key.
+/// The ephemeral signing key is intentionally not pinned onchain; the node
+/// authenticates the guardian over TLS + the immutable BTC key.
+public(package) fun set_guardian_node_url(self: &mut Config, url: String) {
+    self.upsert(GUARDIAN_NODE_URL_KEY, config_value::new_string(url));
 }
 
 /// Pin the guardian's x-only BTC pubkey (32 bytes). Immutable once set —
@@ -159,9 +184,15 @@ public(package) fun set_guardian_btc_public_key(self: &mut Config, btc_public_ke
 }
 
 public(package) fun emergency_pause_threshold_bps(self: &Config): u64 {
-    self.try_get(EMERGENCY_PAUSE_THRESHOLD_BPS_KEY).map!(|v| v.as_u64()).destroy_or!(500)
+    self
+        .try_get(EMERGENCY_PAUSE_THRESHOLD_BPS_KEY)
+        .map!(|v| v.as_u64())
+        .destroy_or!(DEFAULT_EMERGENCY_PAUSE_THRESHOLD_BPS)
 }
 
 public(package) fun emergency_unpause_threshold_bps(self: &Config): u64 {
-    self.try_get(EMERGENCY_UNPAUSE_THRESHOLD_BPS_KEY).map!(|v| v.as_u64()).destroy_or!(6667)
+    self
+        .try_get(EMERGENCY_UNPAUSE_THRESHOLD_BPS_KEY)
+        .map!(|v| v.as_u64())
+        .destroy_or!(DEFAULT_EMERGENCY_UNPAUSE_THRESHOLD_BPS)
 }

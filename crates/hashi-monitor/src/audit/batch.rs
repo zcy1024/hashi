@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::domain::Cursors;
 use crate::domain::MonitorEvent;
 use crate::domain::PollOutcome;
+use crate::domain::WithdrawalEventType;
 use crate::domain::utc_timestamp;
 use hashi_types::guardian::time::UnixSeconds;
 use hashi_types::guardian::time::now_timestamp_secs;
@@ -31,7 +32,11 @@ impl BatchAuditWindow {
     pub fn new(cfg: &Config, start: UnixSeconds, end: UnixSeconds, cur_time: UnixSeconds) -> Self {
         // Guardian timeline is authoritative. We still fetch Sui in a relaxed range to validate E2 -> E1.
         let sui_start = start.saturating_sub(cfg.withdrawal_predecessor_lookback);
-        let sui_end = end.saturating_add(cfg.clock_skew).min(cur_time); // guardian_e2@{end} might match sui_e1@{end+clock_skew}
+        let e1_skew = cfg
+            .clock_skews
+            .get_skew(WithdrawalEventType::E1HashiApproved)
+            .expect("E1 has a successor");
+        let sui_end = end.saturating_add(e1_skew).min(cur_time); // guardian_e2@{end} might match sui_e1@{end+e1_skew}
 
         // User [start, end] is interpreted as guardian timestamps.
         let guardian_start = start;
@@ -46,6 +51,19 @@ impl BatchAuditWindow {
             guardian_end,
         }
     }
+
+    /// A batch audit claims its whole Sui range, so it fails if the Sui node pruned the
+    /// start and the scan had to begin later.
+    fn ensure_sui_history(&self, sui_scan_start: UnixSeconds) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            sui_scan_start <= self.sui_start,
+            "the Sui node no longer serves history before {}, but this audit needs it from {}; \
+             use a Sui RPC that keeps it, or a later start",
+            utc_timestamp(sui_scan_start),
+            utc_timestamp(self.sui_start),
+        );
+        Ok(())
+    }
 }
 
 impl AuditWindow for BatchAuditWindow {
@@ -59,8 +77,9 @@ impl AuditWindow for BatchAuditWindow {
 /// It functions as follows:
 ///     - fetch guardian events from `[t1, t2]` (authoritative timeline)
 ///     - fetch withdrawal and deposit events from
-///       `[t1 - withdrawal_predecessor_lookback, t2 + clock_skew]`
+///       `[t1 - withdrawal_predecessor_lookback, t2 + E1's clock skew]`
 ///     - fetch BTC data for in-scope withdrawals and deposits found in the Sui range
+///     - fetch each overdue Hashi approval missing from the Sui range by its withdrawal id
 /// Finally, it logs progress watermarks that identify a safe start for the next audit.
 ///
 /// Notes:
@@ -194,6 +213,8 @@ impl BatchAuditor {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         self.violation_found = false;
         self.fetch_all_sui_guardian_events().await?;
+        self.audit_window
+            .ensure_sui_history(self.inner.get_sui_scan_start())?;
 
         tracing::info!(
             "finished batch polling:\n  start={}\n  end={}\n  sui_start={}\n  sui_target_end={}\n  sui_cursor={}\n  guardian_start={}\n  guardian_target_end={}\n  guardian_cursor={}",
@@ -211,6 +232,15 @@ impl BatchAuditor {
         let btc_findings = self.inner.fetch_btc_info(&self.audit_window)?;
         log_findings("batch", "btc", &btc_findings);
         if !btc_findings.is_empty() {
+            self.violation_found = true;
+        }
+
+        let lookup_findings = self
+            .inner
+            .fetch_missing_hashi_approvals(&self.audit_window)
+            .await;
+        log_findings("batch", "lookup", &lookup_findings);
+        if !lookup_findings.is_empty() {
             self.violation_found = true;
         }
 
@@ -241,5 +271,25 @@ impl BatchAuditor {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_batch_fails_once_the_sui_node_has_pruned_the_start_of_its_range() {
+        let window = BatchAuditWindow {
+            user_start: 200,
+            user_end: 300,
+            sui_start: 100,
+            sui_end: 310,
+            guardian_start: 200,
+            guardian_end: 300,
+        };
+
+        assert!(window.ensure_sui_history(100).is_ok());
+        assert!(window.ensure_sui_history(101).is_err());
     }
 }

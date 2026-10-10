@@ -23,6 +23,7 @@ pub mod constants;
 pub mod db;
 pub(crate) mod deposit_tracker;
 pub mod deposits;
+pub mod finalize_bitcoin_check;
 pub mod grpc;
 pub mod guardian_limiter;
 pub mod keys;
@@ -70,10 +71,13 @@ pub struct Hashi {
     guardian_client: OnceLock<Option<grpc::guardian_client::GuardianClient>>,
     guardian_btc_pubkey: OnceLock<Option<hashi_types::bitcoin::BitcoinPubkey>>,
     local_limiter: OnceLock<Arc<guardian_limiter::LocalLimiter>>,
-    /// `(seq, wid)` of the last guardian-finalized withdrawal, for pacing.
-    guardian_last_finalized: RwLock<Option<(u64, sui_sdk_types::Address)>>,
+    /// The last guardian-finalized withdrawal and the guardian seq read since, for pacing.
+    guardian_pacing: RwLock<guardian_limiter::FinalizePacing>,
+    finalize_bitcoin_check: Arc<finalize_bitcoin_check::FinalizeBitcoinCheck>,
     /// Reconfig completion signatures by epoch.
     reconfig_signatures: RwLock<HashMap<u64, Vec<u8>>>,
+    /// This node's `PresigDealerSet` signatures by (epoch, batch index).
+    presig_dealer_set_signatures: RwLock<HashMap<(u64, u32), Vec<u8>>>,
     reported_registration_aborts: RwLock<HashSet<String>>,
 }
 
@@ -92,6 +96,9 @@ impl Hashi {
         let metrics = Arc::new(metrics::Metrics::new_default());
         let trm_client = trm::TrmClient::from_config(&config)?;
         metrics.trm_enabled.set(i64::from(trm_client.is_some()));
+        let finalize_bitcoin_check = Arc::new(finalize_bitcoin_check::FinalizeBitcoinCheck::new(
+            metrics.clone(),
+        ));
         Ok(Arc::new(Self {
             server_version,
             config_path,
@@ -107,8 +114,10 @@ impl Hashi {
             guardian_client: OnceLock::new(),
             guardian_btc_pubkey: OnceLock::new(),
             local_limiter: OnceLock::new(),
-            guardian_last_finalized: RwLock::new(None),
+            guardian_pacing: RwLock::new(guardian_limiter::FinalizePacing::default()),
+            finalize_bitcoin_check,
             reconfig_signatures: RwLock::new(HashMap::new()),
+            presig_dealer_set_signatures: RwLock::new(HashMap::new()),
             reported_registration_aborts: RwLock::new(HashSet::new()),
         }))
     }
@@ -128,6 +137,9 @@ impl Hashi {
         let metrics = Arc::new(metrics::Metrics::new(registry));
         let trm_client = trm::TrmClient::from_config(&config)?;
         metrics.trm_enabled.set(i64::from(trm_client.is_some()));
+        let finalize_bitcoin_check = Arc::new(finalize_bitcoin_check::FinalizeBitcoinCheck::new(
+            metrics.clone(),
+        ));
         Ok(Arc::new(Self {
             server_version,
             config_path,
@@ -143,8 +155,10 @@ impl Hashi {
             guardian_client: OnceLock::new(),
             guardian_btc_pubkey: OnceLock::new(),
             local_limiter: OnceLock::new(),
-            guardian_last_finalized: RwLock::new(None),
+            guardian_pacing: RwLock::new(guardian_limiter::FinalizePacing::default()),
+            finalize_bitcoin_check,
             reconfig_signatures: RwLock::new(HashMap::new()),
+            presig_dealer_set_signatures: RwLock::new(HashMap::new()),
             reported_registration_aborts: RwLock::new(HashSet::new()),
         }))
     }
@@ -154,17 +168,29 @@ impl Hashi {
         next_seq: u64,
         wid: sui_sdk_types::Address,
     ) -> bool {
-        let last = *self.guardian_last_finalized.read().unwrap();
-        guardian_limiter::should_defer_guardian_finalize(next_seq, last, wid)
+        self.guardian_pacing
+            .read()
+            .unwrap()
+            .should_defer(next_seq, wid)
+    }
+
+    fn guardian_read_generation(&self) -> u64 {
+        self.guardian_pacing.read().unwrap().generation()
+    }
+
+    fn record_guardian_next_seq(&self, next_seq: u64, read_generation: u64) {
+        self.guardian_pacing
+            .write()
+            .unwrap()
+            .record_guardian_next_seq(next_seq, read_generation);
     }
 
     /// Record a successful guardian finalize; monotonic in `seq`.
     pub(crate) fn record_guardian_finalized(&self, seq: u64, wid: sui_sdk_types::Address) {
-        let mut last = self.guardian_last_finalized.write().unwrap();
-        match *last {
-            Some((prev_seq, _)) if seq < prev_seq => {}
-            _ => *last = Some((seq, wid)),
-        }
+        self.guardian_pacing
+            .write()
+            .unwrap()
+            .record_finalized(seq, wid);
     }
 
     pub fn onchain_state(&self) -> &onchain::OnchainState {
@@ -249,6 +275,31 @@ impl Hashi {
             .cloned()
     }
 
+    pub fn store_presig_dealer_set_signature_if_absent(
+        &self,
+        epoch: u64,
+        batch_index: u32,
+        signature: Vec<u8>,
+    ) -> bool {
+        let mut signatures = self.presig_dealer_set_signatures.write().unwrap();
+        signatures.retain(|(e, _), _| *e >= epoch);
+        match signatures.entry((epoch, batch_index)) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(signature);
+                true
+            }
+        }
+    }
+
+    pub fn get_presig_dealer_set_signature(&self, epoch: u64, batch_index: u32) -> Option<Vec<u8>> {
+        self.presig_dealer_set_signatures
+            .read()
+            .unwrap()
+            .get(&(epoch, batch_index))
+            .cloned()
+    }
+
     pub fn mpc_handle(&self) -> Option<&mpc::MpcHandle> {
         self.mpc_handle.get()
     }
@@ -260,16 +311,19 @@ impl Hashi {
     pub fn guardian_client(&self) -> Option<&grpc::guardian_client::GuardianClient> {
         if self.guardian_client.get().is_none() {
             // Pre-launch boot: no guardian endpoint existed at startup.
-            // `guardian_url` lands on-chain with the launch tx
+            // `guardian_node_url` lands on-chain with the launch tx
             // (finish_publish); resolve the client on first use afterwards.
             let endpoint = self.onchain_state_opt().and_then(|onchain| {
                 let state = onchain.state();
-                state.hashi().config.guardian_url().map(|s| s.to_string())
+                state
+                    .hashi()
+                    .config
+                    .guardian_node_url()
+                    .map(|s| s.to_string())
             });
             if let Some(endpoint) = endpoint {
-                match grpc::guardian_client::GuardianClient::new(&endpoint) {
+                match self.new_guardian_client(&endpoint) {
                     Ok(guardian) => {
-                        let guardian = guardian.with_metrics(self.metrics.clone());
                         tracing::info!(
                             "Guardian client configured from on-chain config for {}",
                             guardian.endpoint()
@@ -278,12 +332,21 @@ impl Hashi {
                         let _ = self.guardian_client.set(Some(guardian));
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to configure guardian client for {endpoint}: {e}")
+                        tracing::warn!("Failed to configure guardian client for {endpoint}: {e:#}")
                     }
                 }
             }
         }
         self.guardian_client.get().and_then(|opt| opt.as_ref())
+    }
+
+    fn new_guardian_client(
+        &self,
+        endpoint: &str,
+    ) -> anyhow::Result<grpc::guardian_client::GuardianClient> {
+        let guardian =
+            grpc::guardian_client::GuardianClient::new(endpoint, &self.config.tls_private_key()?)?;
+        Ok(guardian.with_metrics(self.metrics.clone()))
     }
 
     pub fn guardian_btc_pubkey(&self) -> Option<&hashi_types::bitcoin::BitcoinPubkey> {
@@ -435,7 +498,7 @@ impl Hashi {
 
     fn find_encryption_key_for_committee(
         &self,
-        committee: &hashi_types::committee::Committee,
+        committee: &hashi_types::committee::RuntimeCommittee,
         validator_address: sui_sdk_types::Address,
         epoch: u64,
     ) -> anyhow::Result<EncryptionPrivateKey> {
@@ -445,7 +508,7 @@ impl Hashi {
 
     fn try_find_encryption_key_for_committee(
         &self,
-        committee: &hashi_types::committee::Committee,
+        committee: &hashi_types::committee::RuntimeCommittee,
         validator_address: sui_sdk_types::Address,
         epoch: u64,
     ) -> anyhow::Result<Option<EncryptionPrivateKey>> {
@@ -473,7 +536,7 @@ impl Hashi {
 
     pub(crate) fn committee_encryption_key_lost(
         &self,
-        committee: &hashi_types::committee::Committee,
+        committee: &hashi_types::committee::RuntimeCommittee,
         validator_address: sui_sdk_types::Address,
     ) -> bool {
         committee
@@ -491,7 +554,7 @@ impl Hashi {
 
     pub(crate) fn committee_signing_key_lost(
         &self,
-        committee: &hashi_types::committee::Committee,
+        committee: &hashi_types::committee::RuntimeCommittee,
         validator_address: sui_sdk_types::Address,
     ) -> bool {
         committee
@@ -503,7 +566,7 @@ impl Hashi {
 
     pub(crate) fn committee_key_lost(
         &self,
-        committee: &hashi_types::committee::Committee,
+        committee: &hashi_types::committee::RuntimeCommittee,
         validator_address: sui_sdk_types::Address,
     ) -> bool {
         self.committee_encryption_key_lost(committee, validator_address)
@@ -523,7 +586,7 @@ impl Hashi {
 
     pub(crate) fn find_signing_key_for_committee(
         &self,
-        committee: &hashi_types::committee::Committee,
+        committee: &hashi_types::committee::RuntimeCommittee,
         validator_address: sui_sdk_types::Address,
         epoch: u64,
     ) -> anyhow::Result<Bls12381PrivateKey> {
@@ -533,7 +596,7 @@ impl Hashi {
 
     fn try_find_signing_key_for_committee(
         &self,
-        committee: &hashi_types::committee::Committee,
+        committee: &hashi_types::committee::RuntimeCommittee,
         validator_address: sui_sdk_types::Address,
         epoch: u64,
     ) -> anyhow::Result<Option<Bls12381PrivateKey>> {
@@ -691,6 +754,7 @@ impl Hashi {
             self.config.test_weight_divisor,
             batch_size_per_weight,
             self.config.test_corrupt_shares_for,
+            self.config.complaint_response_policy().clone(),
             &self.metrics,
         )?)
     }
@@ -843,17 +907,19 @@ impl Hashi {
         // the launch lands.
         let guardian_endpoint = {
             let state = self.onchain_state().state();
-            state.hashi().config.guardian_url().map(|s| s.to_string())
+            state
+                .hashi()
+                .config
+                .guardian_node_url()
+                .map(|s| s.to_string())
         }
         .or_else(|| self.config.guardian_endpoint().map(|s| s.to_string()));
 
         match guardian_endpoint {
             Some(guardian_endpoint) => {
-                let guardian = grpc::guardian_client::GuardianClient::new(&guardian_endpoint)
-                    .map_err(|e| {
-                        anyhow!("Failed to configure guardian client for {guardian_endpoint}: {e}")
-                    })?
-                    .with_metrics(self.metrics.clone());
+                let guardian = self.new_guardian_client(&guardian_endpoint).map_err(|e| {
+                    anyhow!("Failed to configure guardian client for {guardian_endpoint}: {e:#}")
+                })?;
                 tracing::info!("Guardian client configured for {}", guardian.endpoint());
 
                 self.metrics.guardian_enabled.set(1);
@@ -862,7 +928,7 @@ impl Hashi {
                     .map_err(|_| anyhow!("Guardian client already initialized"))?;
             }
             None => tracing::warn!(
-                "Guardian endpoint not available yet (pre-launch: `guardian_url` lands \
+                "Guardian endpoint not available yet (pre-launch: `guardian_node_url` lands \
                  on-chain with finish_publish and no local `guardian_endpoint` is set); \
                  will configure the guardian client once it appears on-chain"
             ),
@@ -937,6 +1003,8 @@ impl Hashi {
         let backup_service = backup_service.start();
         let mpc_service = mpc_service.start();
         let guardian_bootstrap_service = self.clone().start_guardian_bootstrap();
+        let finalize_bitcoin_check_probe_service =
+            self.clone().start_finalize_bitcoin_check_probe();
         let sui_balance_service = self.clone().start_sui_balance_metric();
         let sui_address_balance_sweeper_service = self.clone().start_sui_address_balance_sweeper();
         let db_metrics_service = self.clone().start_db_metrics();
@@ -950,6 +1018,7 @@ impl Hashi {
             .merge(backup_service)
             .merge(mpc_service)
             .merge(guardian_bootstrap_service)
+            .merge(finalize_bitcoin_check_probe_service)
             .merge(sui_balance_service)
             .merge(sui_address_balance_sweeper_service)
             .merge(db_metrics_service);
@@ -959,6 +1028,7 @@ impl Hashi {
 
     async fn try_seed_guardian_state(&self) -> bool {
         self.metrics.guardian_bootstrap_attempts_total.inc();
+        let read_generation = self.guardian_read_generation();
         let Ok(info) = self.fetch_guardian_info_data().await else {
             return false;
         };
@@ -972,6 +1042,7 @@ impl Hashi {
             tracing::debug!("guardian bootstrap: guardian has no limiter yet");
             return false;
         };
+        self.record_guardian_next_seq(state.next_seq, read_generation);
         let limiter = Arc::new(guardian_limiter::LocalLimiter::new(config, state));
         if self.local_limiter.set(limiter.clone()).is_ok() {
             tracing::info!(
@@ -1030,15 +1101,16 @@ impl Hashi {
                 .record_guardian_bootstrap_outcome(metrics::GUARDIAN_BOOTSTRAP_OUTCOME_RPC_FAILURE);
             anyhow::bail!("GetGuardianInfo RPC failed");
         };
-        let resp =
-            hashi_types::guardian::GetGuardianInfoResponse::try_from(info_pb).map_err(|e| {
-                self.metrics.record_guardian_bootstrap_outcome(
-                    metrics::GUARDIAN_BOOTSTRAP_OUTCOME_PARSE_FAILURE,
-                );
-                anyhow::anyhow!("parse GetGuardianInfoResponse: {e:?}")
-            })?;
-        let (info, _) = resp.into_info_unchecked();
-        Ok(info)
+        let resp = hashi_types::guardian::GuardianResponse::<
+            hashi_types::guardian::GuardianInfo,
+        >::try_from(info_pb)
+        .map_err(|e| {
+            self.metrics.record_guardian_bootstrap_outcome(
+                metrics::GUARDIAN_BOOTSTRAP_OUTCOME_PARSE_FAILURE,
+            );
+            anyhow::anyhow!("parse GuardianInfo: {e:?}")
+        })?;
+        Ok(resp.response)
     }
 
     /// Fetch the guardian's authoritative limiter policy and state, plus the
@@ -1052,12 +1124,16 @@ impl Hashi {
         hashi_types::guardian::LimiterState,
     )> {
         let limiter = self.local_limiter()?;
+        let read_generation = self.guardian_read_generation();
         let info = self.fetch_guardian_info_data().await.ok()?;
         if !self.verify_and_pin_guardian_btc_pubkey(info.enclave_btc_pubkey) {
             return None;
         }
         match (info.limiter_config, info.limiter_state) {
-            (Some(config), Some(state)) => Some((limiter, config, state)),
+            (Some(config), Some(state)) => {
+                self.record_guardian_next_seq(state.next_seq, read_generation);
+                Some((limiter, config, state))
+            }
             // The enclave installs the config at operator_init and builds the
             // limiter from it at operator_activate, so state can never outrun
             // config. Say so rather than stalling every reconcile in silence.
@@ -1366,7 +1442,7 @@ impl Hashi {
         const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
         Service::new().spawn_aborting(async move {
             // The guardian may be set up after this node boots: on a
-            // pre-launch boot the on-chain guardian_url only lands with
+            // pre-launch boot the on-chain guardian_node_url only lands with
             // finish_publish, and an external guardian can be provisioned
             // later still. `guardian_client()` re-resolves from on-chain
             // config on every call, so wait for it rather than giving up —
@@ -1413,6 +1489,20 @@ impl Hashi {
                 }
             }
         })
+    }
+
+    pub(crate) fn committee_for_epoch(
+        &self,
+        epoch: u64,
+    ) -> anyhow::Result<hashi_types::committee::RuntimeCommittee> {
+        self.onchain_state()
+            .state()
+            .hashi()
+            .committees
+            .committees()
+            .get(&epoch)
+            .cloned()
+            .ok_or_else(|| anyhow!("no committee found for epoch {epoch}"))
     }
 
     pub(crate) fn is_in_committee_for(&self, epoch: u64) -> bool {
@@ -1536,6 +1626,7 @@ mod test {
     use hashi_types::committee::CommitteeMember;
     use hashi_types::committee::EncryptionPrivateKey;
     use hashi_types::committee::EncryptionPublicKey;
+    use hashi_types::committee::RuntimeCommittee;
     use hashi_types::pgp::test_utils::mock_pgp_cert;
     use sui_sdk_types::Address;
 
@@ -1871,7 +1962,12 @@ mod test {
         // Committee records a BLS pub key the DB knows nothing about.
         let unknown_bls_pub = Bls12381PrivateKey::generate(&mut rand::thread_rng()).public_key();
         let enc_pub = EncryptionPrivateKey::new(&mut rand::thread_rng()).public_key();
-        let committee = one_member_committee(5, validator_address, unknown_bls_pub, enc_pub);
+        let committee = RuntimeCommittee::from(one_member_committee(
+            5,
+            validator_address,
+            unknown_bls_pub,
+            enc_pub,
+        ));
 
         let err = hashi
             .find_signing_key_for_committee(&committee, validator_address, 5)
@@ -1891,7 +1987,12 @@ mod test {
         // Committee records an encryption pub key the DB knows nothing about.
         let bls_pub = Bls12381PrivateKey::generate(&mut rand::thread_rng()).public_key();
         let unknown_enc_pub = EncryptionPrivateKey::new(&mut rand::thread_rng()).public_key();
-        let committee = one_member_committee(5, validator_address, bls_pub, unknown_enc_pub);
+        let committee = RuntimeCommittee::from(one_member_committee(
+            5,
+            validator_address,
+            bls_pub,
+            unknown_enc_pub,
+        ));
 
         let err = hashi
             .find_encryption_key_for_committee(&committee, validator_address, 5)
@@ -1909,7 +2010,12 @@ mod test {
         let validator_address = Address::new([1u8; 32]);
         let bls_pub = Bls12381PrivateKey::generate(&mut rand::thread_rng()).public_key();
         let unknown_enc_pub = EncryptionPrivateKey::new(&mut rand::thread_rng()).public_key();
-        let committee = one_member_committee(5, validator_address, bls_pub, unknown_enc_pub);
+        let committee = RuntimeCommittee::from(one_member_committee(
+            5,
+            validator_address,
+            bls_pub,
+            unknown_enc_pub,
+        ));
         assert!(hashi.committee_encryption_key_lost(&committee, validator_address));
     }
 
@@ -1919,7 +2025,8 @@ mod test {
         let validator_address = Address::new([1u8; 32]);
         let bls_pub = Bls12381PrivateKey::generate(&mut rand::thread_rng()).public_key();
         let enc_pub = hashi.prepare_encryption_key(5).unwrap();
-        let committee = one_member_committee(5, validator_address, bls_pub, enc_pub);
+        let committee =
+            RuntimeCommittee::from(one_member_committee(5, validator_address, bls_pub, enc_pub));
         assert!(!hashi.committee_encryption_key_lost(&committee, validator_address));
     }
 
@@ -1929,7 +2036,12 @@ mod test {
         let validator_address = Address::new([1u8; 32]);
         let unknown_bls_pub = Bls12381PrivateKey::generate(&mut rand::thread_rng()).public_key();
         let enc_pub = hashi.prepare_encryption_key(5).unwrap();
-        let committee = one_member_committee(5, validator_address, unknown_bls_pub, enc_pub);
+        let committee = RuntimeCommittee::from(one_member_committee(
+            5,
+            validator_address,
+            unknown_bls_pub,
+            enc_pub,
+        ));
         assert!(hashi.committee_signing_key_lost(&committee, validator_address));
         assert!(hashi.committee_key_lost(&committee, validator_address));
         assert!(!hashi.committee_encryption_key_lost(&committee, validator_address));
@@ -1941,7 +2053,8 @@ mod test {
         let validator_address = Address::new([1u8; 32]);
         let bls_pub = hashi.prepare_signing_key(5).unwrap().public_key();
         let enc_pub = hashi.prepare_encryption_key(5).unwrap();
-        let committee = one_member_committee(5, validator_address, bls_pub, enc_pub);
+        let committee =
+            RuntimeCommittee::from(one_member_committee(5, validator_address, bls_pub, enc_pub));
         assert!(!hashi.committee_signing_key_lost(&committee, validator_address));
         assert!(!hashi.committee_key_lost(&committee, validator_address));
     }
@@ -1951,7 +2064,12 @@ mod test {
         let (hashi, _tmpdir) = new_hashi_for_test();
         let bls_pub = Bls12381PrivateKey::generate(&mut rand::thread_rng()).public_key();
         let enc_pub = EncryptionPrivateKey::new(&mut rand::thread_rng()).public_key();
-        let committee = one_member_committee(5, Address::new([2u8; 32]), bls_pub, enc_pub);
+        let committee = RuntimeCommittee::from(one_member_committee(
+            5,
+            Address::new([2u8; 32]),
+            bls_pub,
+            enc_pub,
+        ));
         assert!(!hashi.committee_encryption_key_lost(&committee, Address::new([1u8; 32])));
     }
 
@@ -2133,6 +2251,52 @@ mod test {
         //         }
     }
 
+    #[tokio::test]
+    async fn a_peer_that_cancels_every_open_rpc_at_once_keeps_its_connection() {
+        let (hashi, _tmpdir) = new_hashi_for_test();
+        let (address, _http_service) = crate::grpc::HttpService::new(hashi).start().await;
+
+        let mut tls_config = crate::tls::make_client_config_no_verification();
+        tls_config.alpn_protocols = vec![b"h2".to_vec()];
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config))
+            .connect(address.ip().into(), tcp)
+            .await
+            .unwrap();
+        let (client, connection) = h2::client::handshake(tls).await.unwrap();
+        tokio::spawn(connection);
+        let health = format!("https://{address}/health");
+
+        let mut client = client.ready().await.unwrap();
+        let (response, _) = client
+            .send_request(http::Request::get(&health).body(()).unwrap(), true)
+            .unwrap();
+        assert_eq!(response.await.unwrap().status(), http::StatusCode::OK);
+
+        // The runtime is single-threaded and nothing here yields, so the server reads
+        // every HEADERS and RST_STREAM before it accepts any of these streams.
+        let mut cancelled = Vec::new();
+        for _ in 0..crate::config::DEFAULT_GRPC_PER_PEER_INFLIGHT_LIMIT {
+            client = client.ready().await.unwrap();
+            let (_, stream) = client
+                .send_request(http::Request::post(&health).body(()).unwrap(), false)
+                .unwrap();
+            cancelled.push(stream);
+        }
+        for stream in &mut cancelled {
+            stream.send_reset(h2::Reason::CANCEL);
+        }
+
+        client = client.ready().await.unwrap();
+        let (response, _) = client
+            .send_request(http::Request::get(&health).body(()).unwrap(), true)
+            .unwrap();
+        let response = response
+            .await
+            .expect("the server must keep the connection after the cancellations");
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
     // --- guardian /info pubkey verification ---
 
     fn fresh_metrics() -> std::sync::Arc<crate::metrics::Metrics> {
@@ -2143,7 +2307,11 @@ mod test {
     // --- guardian /info BTC pubkey verification ---
 
     fn random_btc_pubkey() -> hashi_types::bitcoin::BitcoinPubkey {
-        let kp = hashi_types::bitcoin::create_btc_keypair_for_test(&[42u8; 32]);
+        let kp = hashi_types::bitcoin::BitcoinKeypair::from_seckey_slice(
+            &hashi_types::bitcoin::BTC_LIB,
+            &[42u8; 32],
+        )
+        .expect("valid test secret key");
         kp.x_only_public_key().0
     }
 

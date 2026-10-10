@@ -42,12 +42,12 @@ const EInvalidConfigEntry: vector<u8> = b"Proposed entry is not allowed in the e
 #[error(code = 2)]
 const ENoEntriesProvided: vector<u8> = b"AddConfig proposal must contain at least one entry";
 
+#[error(code = 3)]
+const EProtectedConfigKey: vector<u8> = b"Config key cannot be introduced through AddConfig";
+
 #[error(code = 4)]
 const EInconsistentMpcConfig: vector<u8> =
     b"mpc_weight_reduction_allowed_delta must stay below mpc_max_faulty_in_basis_points";
-
-#[error(code = 3)]
-const EProtectedConfigKey: vector<u8> = b"Config key cannot be introduced through AddConfig";
 
 // ~~~~~~~ Structs ~~~~~~~
 
@@ -57,9 +57,10 @@ public struct AddConfig has copy, drop, store {
     entries: VecMap<String, Value>,
 }
 
-// ~~~~~~~ Public Functions ~~~~~~~
+// ~~~~~~~ Entry Functions ~~~~~~~
 
-public fun propose(
+/// Private `entry`: see the visibility note in `hashi::proposal`.
+entry fun propose(
     hashi: &mut Hashi,
     validator_address: address,
     epoch: bool,
@@ -83,7 +84,8 @@ public fun propose(
     )
 }
 
-public fun execute(hashi: &mut Hashi, proposal_id: ID, clock: &Clock) {
+/// Private `entry`: see the visibility note in `hashi::proposal`.
+entry fun execute(hashi: &mut Hashi, proposal_id: ID, clock: &Clock) {
     hashi.versioning().assert_version_enabled();
     let AddConfig { epoch, entries } = proposal::execute(hashi, proposal_id, clock);
     assert_valid_entries(hashi, epoch, &entries);

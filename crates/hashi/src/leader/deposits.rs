@@ -3,7 +3,12 @@
 
 use super::LEADER_TASK_TIMEOUT;
 use super::LeaderService;
+use super::NoQuorum;
+use super::NoSignature;
+use super::collect_signatures;
+use super::is_already_approved_refusal;
 use super::parse_member_signature;
+use super::retry_peer_call;
 use crate::Hashi;
 use crate::deposits::ApprovedDepositError;
 use crate::deposits::UnapprovedDepositError;
@@ -12,10 +17,8 @@ use crate::onchain::types::DepositConfirmationMessage;
 use crate::onchain::types::DepositRequest;
 use crate::onchain::types::UtxoId;
 use crate::sui_tx_executor::SuiTxExecutor;
-use hashi_types::committee::BlsSignatureAggregator;
 use hashi_types::committee::CommitteeMember;
 use hashi_types::committee::MemberSignature;
-use hashi_types::committee::certificate_threshold;
 use hashi_types::proto::SignDepositConfirmationRequest;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -430,7 +433,7 @@ impl LeaderService {
         }
     }
 
-    fn check_halt_deposit_processing(&mut self) -> bool {
+    pub(super) fn check_halt_deposit_processing(&mut self) -> bool {
         // Evaluate all predicates from one consistent state snapshot.
         let halt = {
             let state = self.inner.onchain_state().state();
@@ -446,13 +449,19 @@ impl LeaderService {
         halt
     }
 
-    pub(super) fn stop_deposit_processing(&mut self) {
+    /// Drop queued deposit work but let running tasks finish, so a leader
+    /// rotation keeps the approvals and confirmations already underway.
+    pub(super) fn stop_scheduling_deposits(&mut self) {
         self.last_reload_confirmation_threshold = None;
+        self.pending_unapproved_deposit_requests.clear();
+        self.reset_approved_deposit_metrics();
+    }
+
+    fn stop_deposit_processing(&mut self) {
+        self.stop_scheduling_deposits();
         self.unapproved_deposit_tasks = JoinSet::new();
         self.approved_deposit_tasks = JoinSet::new();
-        self.pending_unapproved_deposit_requests.clear();
         self.inflight_deposits.clear();
-        self.reset_approved_deposit_metrics();
     }
 
     pub(super) fn activate_unapproved_deposits_for_btc_block(&mut self, block_sequence: u64) {
@@ -489,44 +498,42 @@ impl LeaderService {
             .current_committee()
             .expect("No current committee");
 
-        let required_weight = certificate_threshold(committee.total_weight());
-
         // Fan out signature requests to all members in parallel.
         let mut sig_tasks = JoinSet::new();
         for member in members {
             let inner = inner.clone();
             let proto_request = proto_request.clone();
             sig_tasks.spawn(async move {
-                Self::request_deposit_confirmation_signature(&inner, proto_request, &member).await
+                let reply =
+                    Self::request_deposit_confirmation_signature(&inner, proto_request, &member)
+                        .await;
+                (member.weight(), reply)
             });
         }
 
-        // Collect signatures, stopping once we reach quorum.
         let confirmation_message = DepositConfirmationMessage {
             request_id: deposit_request.id,
             utxo: deposit_request.utxo.clone(),
         };
-        let mut aggregator = BlsSignatureAggregator::new(
+        let mut aggregator = committee.signature_aggregator(
             inner.config.hashi_ids().hashi_object_id,
-            &committee,
             confirmation_message,
         );
-        while let Some(result) = sig_tasks.join_next().await {
-            let Ok(Some(sig)) = result else { continue };
-            if let Err(e) = aggregator.add_signature(sig) {
-                error!("Failed to add deposit signature: {e}");
-            }
-            if aggregator.weight() >= required_weight {
-                break;
-            }
-        }
-
-        if aggregator.weight() < required_weight {
-            return Err(UnapprovedDepositError::FailedQuorum {
-                weight: aggregator.weight(),
-                required_weight,
-            });
-        }
+        collect_signatures(&mut sig_tasks, &mut aggregator, committee.total_weight())
+            .await
+            .map_err(|e| match e {
+                NoQuorum::AlreadyApproved => UnapprovedDepositError::AlreadyApprovedThisEpoch,
+                NoQuorum::StaleCommittee { epoch, peer_epoch } => {
+                    UnapprovedDepositError::StaleCommittee { epoch, peer_epoch }
+                }
+                NoQuorum::Short {
+                    weight,
+                    required_weight,
+                } => UnapprovedDepositError::FailedQuorum {
+                    weight,
+                    required_weight,
+                },
+            })?;
 
         let signed_message = match aggregator.finish() {
             Ok(signed_message) => signed_message,
@@ -632,31 +639,38 @@ impl LeaderService {
         inner: &Arc<Hashi>,
         proto_request: SignDepositConfirmationRequest,
         member: &CommitteeMember,
-    ) -> Option<MemberSignature> {
+    ) -> Result<MemberSignature, NoSignature> {
         let validator_address = member.validator_address();
         trace!("Requesting deposit confirmation signature");
 
-        let mut rpc_client = inner
-            .onchain_state()
-            .bridge_service_client(&validator_address)
-            .or_else(|| {
-                error!(
-                    "Cannot find client for validator address: {:?}",
-                    validator_address
-                );
-                None
-            })?;
-
-        let response = rpc_client
-            .sign_deposit_confirmation(proto_request)
-            .await
-            .inspect_err(|e| {
+        let response = match retry_peer_call(
+            validator_address,
+            "deposit confirmation signature",
+            || {
+                inner
+                    .onchain_state()
+                    .bridge_service_client(&validator_address)
+            },
+            move |mut client| {
+                let request = proto_request.clone();
+                async move { client.sign_deposit_confirmation(request).await }
+            },
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(status) if is_already_approved_refusal(&status) => {
+                debug!("{validator_address} reports the deposit already approved");
+                return Err(NoSignature::AlreadyApproved);
+            }
+            Err(e) => {
                 error!(
                     "Failed to get deposit confirmation signature from {}: {e}",
                     validator_address
                 );
-            })
-            .ok()?;
+                return Err(NoSignature::Failed);
+            }
+        };
 
         trace!(
             "Retrieved deposit confirmation signature from {}",
@@ -674,7 +688,7 @@ impl LeaderService {
                     validator_address
                 );
             })
-            .ok()
+            .map_err(|_| NoSignature::Failed)
     }
 
     pub(super) fn reset_approved_deposit_metrics(&self) {
@@ -937,5 +951,107 @@ mod tests {
         );
 
         assert_eq!(selected, vec![actionable]);
+    }
+
+    #[test]
+    fn tells_already_approved_refusals_from_other_refusals() {
+        let refusal = crate::grpc::bridge_service::deposit_refusal_status;
+        assert!(is_already_approved_refusal(&refusal(
+            UnapprovedDepositError::AlreadyApprovedThisEpoch
+        )));
+        for err in [
+            UnapprovedDepositError::BitcoinNotConfirmed(anyhow::anyhow!("1 of 2 confirmations")),
+            UnapprovedDepositError::DuplicateOrSpentOnSui(anyhow::anyhow!("UTXO in pool")),
+            UnapprovedDepositError::FailedQuorum {
+                weight: 0,
+                required_weight: 6667,
+            },
+        ] {
+            assert!(!is_already_approved_refusal(&refusal(err)));
+        }
+        // Older peers send the same refusal as `failed_precondition`.
+        assert!(!is_already_approved_refusal(
+            &tonic::Status::failed_precondition(
+                UnapprovedDepositError::AlreadyApprovedThisEpoch.to_string()
+            )
+        ));
+    }
+
+    fn leader_service() -> (LeaderService, tempfile::TempDir) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::new_for_testing();
+        config.db = Some(tmpdir.path().into());
+        let hashi = Hashi::new_with_registry(
+            crate::ServerVersion::new("unknown", "unknown"),
+            None,
+            config,
+            &prometheus::Registry::new(),
+        )
+        .unwrap();
+        (LeaderService::new(hashi), tmpdir)
+    }
+
+    #[tokio::test]
+    async fn deposit_tasks_finish_after_leadership_moves_on() {
+        let (mut leader, _tmpdir) = leader_service();
+        leader.set_leadership(true);
+        let approval = deposit_request(1, 1);
+        let confirmation = deposit_request(2, 2);
+        leader
+            .unapproved_deposit_tasks
+            .spawn(std::future::ready(UnapprovedDepositTaskResult {
+                deposit_id: approval.id,
+                outpoint: outpoint(&approval),
+                block_sequence: 0,
+                bitcoin_generation: 0,
+                result: Ok(()),
+            }));
+        leader.approved_deposit_tasks.spawn(std::future::ready((
+            confirmation.id,
+            Ok(ApprovedDepositOutcome::UtxoAlreadySpent),
+        )));
+        leader
+            .inflight_deposits
+            .extend([approval.id, confirmation.id]);
+        leader
+            .pending_unapproved_deposit_requests
+            .push_back(deposit_request(3, 3));
+
+        leader.set_leadership(false);
+
+        assert!(leader.pending_unapproved_deposit_requests.is_empty());
+        assert_eq!(
+            leader.inflight_deposits,
+            HashSet::from([approval.id, confirmation.id])
+        );
+        let approved = leader.unapproved_deposit_tasks.join_next().await;
+        leader.handle_completed_unapproved_deposit_task(approved.expect("approval task kept"));
+        let confirmed = leader.approved_deposit_tasks.join_next().await;
+        leader.handle_completed_approved_deposit_task(confirmed.expect("confirmation task kept"));
+
+        assert!(leader.inflight_deposits.is_empty());
+        assert!(leader.never_retry_deposit_ids.contains(&confirmation.id));
+    }
+
+    #[tokio::test]
+    async fn stop_deposit_processing_aborts_tasks_kept_from_an_earlier_turn() {
+        let (mut leader, _tmpdir) = leader_service();
+        leader.set_leadership(true);
+        leader
+            .unapproved_deposit_tasks
+            .spawn(std::future::pending());
+        leader.approved_deposit_tasks.spawn(std::future::pending());
+        leader
+            .inflight_deposits
+            .extend([deposit_request(1, 1).id, deposit_request(2, 2).id]);
+        leader.set_leadership(false);
+        assert_eq!(leader.unapproved_deposit_tasks.len(), 1);
+        assert_eq!(leader.approved_deposit_tasks.len(), 1);
+
+        leader.stop_deposit_processing();
+
+        assert!(leader.unapproved_deposit_tasks.is_empty());
+        assert!(leader.approved_deposit_tasks.is_empty());
+        assert!(leader.inflight_deposits.is_empty());
     }
 }

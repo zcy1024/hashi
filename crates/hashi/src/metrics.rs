@@ -1,6 +1,12 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
+
+use prometheus::Histogram;
 use prometheus::HistogramVec;
 use prometheus::IntCounter;
 use prometheus::IntCounterVec;
@@ -8,6 +14,7 @@ use prometheus::IntGauge;
 use prometheus::IntGaugeVec;
 use prometheus::Registry;
 use prometheus::register_histogram_vec_with_registry;
+use prometheus::register_histogram_with_registry;
 use prometheus::register_int_counter_vec_with_registry;
 use prometheus::register_int_counter_with_registry;
 use prometheus::register_int_gauge_vec_with_registry;
@@ -27,6 +34,8 @@ pub struct Metrics {
     pub(crate) peer_inflight_at_admission: HistogramVec,
     pub(crate) peer_inflight_max: IntGaugeVec,
     pub(crate) peer_requests_shed_total: IntCounterVec,
+    pub(crate) withdrawal_signing_tasks_max: IntGaugeVec,
+    pub(crate) withdrawal_signing_refused_total: IntCounterVec,
 
     // Per-MPC-protocol body-size metrics.
     pub(crate) mpc_request_size_bytes: HistogramVec,
@@ -49,6 +58,7 @@ pub struct Metrics {
     pub guardian_limiter_next_seq: IntGauge,
     pub guardian_limiter_last_updated_at_seconds: IntGauge,
     pub unknown_caller_refused_total: IntCounterVec,
+    pub mpc_rpc_caller_refused_total: IntCounterVec,
     pub validator_registration_aborts_total: IntCounterVec,
     pub guardian_bootstrap_attempts_total: IntCounter,
     pub guardian_bootstrap_outcomes_total: IntCounterVec,
@@ -109,6 +119,7 @@ pub struct Metrics {
     pub deposit_outpoint_confirmations: IntGaugeVec,
     withdrawal_queue_size: IntGaugeVec,
     withdrawal_queue_value: IntGaugeVec,
+    withdrawal_oldest_unsigned_age_seconds: IntGauge,
     utxo_pool_size: IntGaugeVec,
     utxo_pool_value: IntGaugeVec,
     utxo_pool_average_age_blocks: IntGauge,
@@ -128,7 +139,7 @@ pub struct Metrics {
     /// the chain upgrades, so only this gauge can count how much of the fleet
     /// already runs a build that implements the next version.
     package_version_supported_max: IntGauge,
-    /// Unix seconds of each long-running task loop's last iteration. A stale
+    /// Unix seconds of each long-running task's last heartbeat. A stale
     /// entry means that task is wedged or dead inside a process whose other
     /// metrics still look alive.
     task_last_iteration_timestamp_seconds: IntGaugeVec,
@@ -159,6 +170,11 @@ pub struct Metrics {
     /// on-chain (we never auto-reject); operator intervention is
     /// required (raise the cap or have the user cancel).
     pub guardian_limiter_stuck_oversize_skipped_total: IntCounter,
+    pub withdrawal_commitment_left_out_total: IntCounterVec,
+    pub withdrawal_bitcoin_check_total: IntCounterVec,
+    pub withdrawal_bitcoin_check_script_failures_total: IntCounter,
+    pub withdrawal_bitcoin_check_latency_seconds: Histogram,
+    pub withdrawal_bitcoin_check_blind: IntGauge,
 
     pub btc_fee_rate_sat_per_kvb: IntGauge,
 
@@ -176,8 +192,8 @@ pub struct Metrics {
     /// per input before its eval set is inspected, so an empty eval set still
     /// counts; an input the peer omitted entirely is never reached.
     pub mpc_partial_sig_nonce_mismatch_total: IntCounterVec,
-    /// Partial signatures that disagreed with the RS-recovered polynomial,
-    /// by owner.
+    /// Partial signatures that disagreed with the RS-recovered polynomial, by
+    /// owner. Counted only when the decoding could blame that owner for them.
     pub mpc_partial_sig_mismatch_total: IntCounterVec,
     /// Partial-signature lists refused at merge, by peer.
     pub mpc_partial_sig_lists_rejected_total: IntCounterVec,
@@ -202,6 +218,10 @@ pub struct Metrics {
     pub mpc_manager_epoch: IntGauge,
     pub mpc_avid_rounds_total: IntCounterVec,
     pub mpc_avid_complaints_recovered_total: IntCounter,
+    /// Complaints whose response was withheld because the dealer is outside
+    /// the complaint response policy. Should never increase: any increase
+    /// means a verified complaint about such a dealer reached this node.
+    pub mpc_complaints_withheld_total: IntCounter,
     /// Nonce batches abandoned because the checkpoint clock never passed the
     /// accumulation window's cutoff
     pub mpc_nonce_window_cutoff_unreached_total: IntCounter,
@@ -211,7 +231,6 @@ pub struct Metrics {
     pub mpc_nonce_decided_set_window_closed_below_floor_total: IntCounter,
     pub mpc_nonce_local_skip_batches_total: IntCounter,
     pub mpc_presig_batch_repair_total: IntCounterVec,
-    pub mpc_nonce_dealer_signer_set_replay_total: IntCounterVec,
     pub mpc_nonce_cutoff_unsettled_total: IntCounter,
     pub mpc_nonce_size_mismatch_total: IntCounter,
     /// Batch index of the most recent nonce batch this node accepted.
@@ -339,7 +358,7 @@ impl Metrics {
     }
 
     pub fn new(registry: &Registry) -> Self {
-        Self {
+        let metrics = Self {
             inflight_requests: register_int_gauge_vec_with_registry!(
                 "hashi_inflight_requests",
                 "Total in-flight RPC requests per route",
@@ -411,6 +430,20 @@ impl Metrics {
                 "hashi_peer_requests_shed_total",
                 "Requests shed because the peer was at its in-flight limit",
                 &["peer"],
+                registry,
+            )
+            .unwrap(),
+            withdrawal_signing_tasks_max: register_int_gauge_vec_with_registry!(
+                "hashi_withdrawal_signing_tasks_max",
+                "Peak concurrent withdrawal signing tasks per caller since start",
+                &["peer"],
+                registry,
+            )
+            .unwrap(),
+            withdrawal_signing_refused_total: register_int_counter_vec_with_registry!(
+                "hashi_withdrawal_signing_refused_total",
+                "Withdrawal signing calls refused, by caller and reason (committee or cap)",
+                &["peer", "reason"],
                 registry,
             )
             .unwrap(),
@@ -552,6 +585,13 @@ impl Metrics {
                 "hashi_unknown_caller_refused_total",
                 "Requests refused before the body was decoded, because no registered validator could be resolved. Not counted in hashi_requests.",
                 &["reason"],
+                registry,
+            )
+            .unwrap(),
+            mpc_rpc_caller_refused_total: register_int_counter_vec_with_registry!(
+                "hashi_mpc_rpc_caller_refused_total",
+                "MPC RPC calls refused by the committee membership check, by handler, caller and reason",
+                &["handler", "peer", "reason"],
                 registry,
             )
             .unwrap(),
@@ -819,6 +859,13 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            withdrawal_oldest_unsigned_age_seconds: register_int_gauge_with_registry!(
+                "hashi_withdrawal_oldest_unsigned_age_seconds",
+                "How long the oldest unsigned withdrawal has been waiting, in seconds. \
+                 New withdrawals wait behind it.",
+                registry,
+            )
+            .unwrap(),
             utxo_pool_size: register_int_gauge_vec_with_registry!(
                 "hashi_utxo_pool_size",
                 "number of UTXOs in the pool by status",
@@ -892,7 +939,7 @@ impl Metrics {
             .unwrap(),
             task_last_iteration_timestamp_seconds: register_int_gauge_vec_with_registry!(
                 "hashi_task_last_iteration_timestamp_seconds",
-                "unix seconds of each task loop's last iteration; stale = task wedged",
+                "unix seconds of each task's last heartbeat; stale = task wedged",
                 &["task"],
                 registry,
             )
@@ -1018,6 +1065,41 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            withdrawal_commitment_left_out_total: register_int_counter_vec_with_registry!(
+                "hashi_withdrawal_commitment_left_out_total",
+                "Times the leader's commit check refused a request or input in a batch it was \
+                 building.",
+                &["item", "reason"],
+                registry,
+            )
+            .unwrap(),
+            withdrawal_bitcoin_check_total: register_int_counter_vec_with_registry!(
+                "hashi_withdrawal_bitcoin_check_total",
+                "Finalize requests checked with bitcoind, by result.",
+                &["result"],
+                registry,
+            )
+            .unwrap(),
+            withdrawal_bitcoin_check_script_failures_total: register_int_counter_with_registry!(
+                "hashi_withdrawal_bitcoin_check_script_failures_total",
+                "Script failures bitcoind reported for signed withdrawals, once per answer.",
+                registry,
+            )
+            .unwrap(),
+            withdrawal_bitcoin_check_latency_seconds: register_histogram_with_registry!(
+                "hashi_withdrawal_bitcoin_check_latency_seconds",
+                "Latency of a finalize check's testmempoolaccept call, in seconds.",
+                LATENCY_SEC_BUCKETS.to_vec(),
+                registry,
+            )
+            .unwrap(),
+            withdrawal_bitcoin_check_blind: register_int_gauge_with_registry!(
+                "hashi_withdrawal_bitcoin_check_blind",
+                "1 when a probe shows bitcoind cannot check withdrawals, 0 once a spend probe \
+                 passed, -1 before that.",
+                registry,
+            )
+            .unwrap(),
             btc_fee_rate_sat_per_kvb: register_int_gauge_with_registry!(
                 "hashi_btc_fee_rate_sat_per_kvb",
                 "Current estimated Bitcoin fee rate in sat/kvB used for withdrawals",
@@ -1103,8 +1185,9 @@ impl Metrics {
             .unwrap(),
             mpc_partial_sig_mismatch_total: register_int_counter_vec_with_registry!(
                 "hashi_mpc_partial_sig_mismatch_total",
-                "Partial signatures that disagreed with the RS-recovered polynomial, by owner \
-                 (does not establish which side is wrong; nobody is excluded)",
+                "Partial signatures the decoding could attribute to their owner, counted only \
+                 when enough honest shares were kept to rule out a steered decode; nobody is \
+                 excluded on this alone",
                 &["peer"],
                 registry,
             )
@@ -1119,6 +1202,13 @@ impl Metrics {
             mpc_avid_complaints_recovered_total: register_int_counter_with_registry!(
                 "hashi_mpc_avid_complaints_recovered_total",
                 "AVID nonce shares recovered via the complaint protocol",
+                registry,
+            )
+            .unwrap(),
+            mpc_complaints_withheld_total: register_int_counter_with_registry!(
+                "hashi_mpc_complaints_withheld_total",
+                "Verified complaints withheld because the dealer is outside the complaint \
+                 response policy",
                 registry,
             )
             .unwrap(),
@@ -1198,14 +1288,6 @@ impl Metrics {
                 "hashi_mpc_presig_batch_repair_total",
                 "Times this node hit a nonce batch the presig cursor outran, by what it did. \
                  Counts the decision, not whether a dealing round published a cert",
-                &["outcome"],
-                registry,
-            )
-            .unwrap(),
-            mpc_nonce_dealer_signer_set_replay_total: register_int_counter_vec_with_registry!(
-                "hashi_mpc_nonce_dealer_signer_set_replay_total",
-                "AVID nonce dealer rounds for a batch a stored round already fixed a signer \
-                 set for, by outcome",
                 &["outcome"],
                 registry,
             )
@@ -1436,7 +1518,8 @@ impl Metrics {
             .unwrap(),
             mpc_previous_message_unusable_total: register_int_counter_vec_with_registry!(
                 "hashi_mpc_previous_message_unusable_total",
-                "Previous-epoch dealer messages whose local copy was unusable during reconfig.",
+                "Previous-epoch dealer messages reconstruction reads whose local copy could not \
+                 be read or did not match its certificate.",
                 &["protocol"],
                 registry,
             )
@@ -1501,7 +1584,9 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
-        }
+        };
+        metrics.withdrawal_bitcoin_check_blind.set(-1);
+        metrics
     }
 
     pub fn record_limiter_state(
@@ -1722,6 +1807,19 @@ impl Metrics {
                 pending.push(w);
             }
         }
+        let oldest_unsigned_ms = signing
+            .iter()
+            .chain(&pending)
+            .map(|w| w.created_timestamp_ms)
+            .min();
+        self.withdrawal_oldest_unsigned_age_seconds.set(
+            oldest_unsigned_ms.map_or(0, |created_ms| {
+                state
+                    .latest_checkpoint_timestamp_ms()
+                    .saturating_sub(created_ms)
+                    / 1000
+            }) as i64,
+        );
         for (label, class) in [
             ("confirmed", &confirmed),
             ("signed", &signed),
@@ -1953,18 +2051,67 @@ pub fn uptime_metric(
 }
 
 const METRICS_ROUTE: &str = "/metrics";
+const HEALTH_ROUTE: &str = "/health";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+// Load delays the heartbeat by seconds, so one this old means the main runtime
+// has stopped running tasks.
+const MAX_HEARTBEAT_AGE: Duration = Duration::from_secs(120);
 
-// Creates a new http server that has as a sole purpose to expose
-// an endpoint that prometheus agent can use to poll for the metrics.
+// Runs on its own thread so a busy main runtime can't fail the liveness probe.
 pub fn start_prometheus_server(
     addr: std::net::SocketAddr,
     registry: Registry,
 ) -> sui_http::ServerHandle {
+    let last_heartbeat = spawn_heartbeat();
     let router = axum::Router::new()
         .route(METRICS_ROUTE, axum::routing::get(metrics))
-        .with_state(registry);
+        .with_state(registry)
+        .route(
+            HEALTH_ROUTE,
+            axum::routing::get(move || health(last_heartbeat.clone())),
+        );
 
-    sui_http::Builder::new().serve(addr, router).unwrap()
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let server = {
+        let _guard = runtime.enter();
+        sui_http::Builder::new().serve(addr, router).unwrap()
+    };
+    std::thread::Builder::new()
+        .name("metrics-http".to_owned())
+        .spawn(move || runtime.block_on(std::future::pending::<()>()))
+        .unwrap();
+    server
+}
+
+// Spawns onto the caller's runtime, which is the one /health vouches for.
+fn spawn_heartbeat() -> Arc<Mutex<Instant>> {
+    let last_heartbeat = Arc::new(Mutex::new(Instant::now()));
+    let beat = last_heartbeat.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+            *beat.lock().unwrap() = Instant::now();
+        }
+    });
+    last_heartbeat
+}
+
+async fn health(last_heartbeat: Arc<Mutex<Instant>>) -> (http::StatusCode, String) {
+    let age = last_heartbeat.lock().unwrap().elapsed();
+    if age < MAX_HEARTBEAT_AGE {
+        (http::StatusCode::OK, "up".to_owned())
+    } else {
+        (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "main runtime has not run the heartbeat for {}s",
+                age.as_secs()
+            ),
+        )
+    }
 }
 
 async fn metrics(
@@ -2136,5 +2283,67 @@ mod tests {
 
         assert_eq!(metrics.utxo_pool_average_age_blocks.get(), -1);
         assert_eq!(metrics.utxo_pool_oldest_age_blocks.get(), -1);
+    }
+
+    fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+        use std::io::Read;
+        use std::io::Write;
+
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn metrics_server_answers_while_the_main_runtime_is_blocked() {
+        let server = start_prometheus_server(([127, 0, 0, 1], 0).into(), Registry::new());
+        let addr = *server.local_addr();
+
+        // The test runtime has one thread, so joining blocks it for both requests.
+        let responses = std::thread::spawn(move || {
+            [HEALTH_ROUTE, METRICS_ROUTE].map(|path| http_get(addr, path))
+        })
+        .join()
+        .unwrap();
+
+        for response in responses {
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stops_while_its_runtime_is_blocked() {
+        let last_heartbeat = spawn_heartbeat();
+        let first = *last_heartbeat.lock().unwrap();
+
+        std::thread::sleep(2 * HEARTBEAT_INTERVAL);
+        assert_eq!(*last_heartbeat.lock().unwrap(), first);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while *last_heartbeat.lock().unwrap() == first {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the heartbeat resumes once its runtime runs tasks again");
+    }
+
+    #[tokio::test]
+    async fn health_fails_once_the_heartbeat_is_too_old() {
+        let fresh = Arc::new(Mutex::new(Instant::now()));
+        assert_eq!(health(fresh).await.0, http::StatusCode::OK);
+
+        let stale = Instant::now().checked_sub(MAX_HEARTBEAT_AGE).unwrap();
+        let (status, body) = health(Arc::new(Mutex::new(stale))).await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
     }
 }

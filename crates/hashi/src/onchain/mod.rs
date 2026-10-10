@@ -14,11 +14,13 @@ use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
+use std::time::Duration;
 use sui_futures::service::Service;
 use sui_rpc::Client;
 use sui_rpc::client::ResponseExt;
 use sui_rpc::field::FieldMask;
 use sui_rpc::field::FieldMaskUtil;
+use sui_rpc::proto::sui::rpc::v2::Bcs;
 use sui_rpc::proto::sui::rpc::v2::DynamicField;
 use sui_rpc::proto::sui::rpc::v2::GetObjectRequest;
 use sui_rpc::proto::sui::rpc::v2::ListDynamicFieldsRequest;
@@ -34,10 +36,9 @@ use tokio::sync::broadcast;
 use tokio::sync::watch;
 
 use crate::config::HashiIds;
-use crate::mpc::fallback_encryption_public_key;
 use fastcrypto_tbls::threshold_schnorr::G as HashiMasterG;
-use hashi_types::committee::Committee;
 use hashi_types::committee::CommitteeMember;
+use hashi_types::committee::RuntimeCommittee;
 use hashi_types::committee::SignedMessage;
 use hashi_types::guardian::CommitteeTransitionRequest;
 use hashi_types::move_types;
@@ -47,6 +48,10 @@ const BROADCAST_CHANNEL_CAPACITY: usize = 100;
 /// Bounded so a huge queue isn't returned as one oversized page that overflows
 /// the gRPC decode limit; the SDK still pages through every entry.
 const SCRAPE_PAGE_SIZE: u32 = 1000;
+
+const BOOT_SCRAPE_RETRY_WINDOW: Duration = Duration::from_secs(5 * 60);
+const BOOT_SCRAPE_MIN_BACKOFF: Duration = Duration::from_secs(1);
+const BOOT_SCRAPE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -165,14 +170,6 @@ pub struct State {
 }
 
 pub use hashi_types::move_types::TobKey;
-pub use versioned_decode::TobCertLayout;
-
-/// One mirror read of a TOB bucket: its layout plus the dealer
-/// submissions in TOB order, normalized to the stamped form.
-pub type TobBucketRead = (
-    TobCertLayout,
-    Vec<(Address, move_types::StampedDealerSubmissionV1)>,
-);
 
 /// One TOB bucket the leader's GC has selected for on-chain destruction.
 /// `KeyGen` covers both the Dkg and KeyRotation buckets of an epoch — the
@@ -193,14 +190,16 @@ impl OnchainState {
         grpc_max_decoding_message_size: Option<usize>,
         metrics: Option<Arc<crate::metrics::Metrics>>,
     ) -> Result<(Self, Service)> {
-        let (state, seed) = Self::scrape_into_state(
-            sui_rpc_url,
-            ids,
-            ScrapeScope::Full,
-            tls_private_key,
-            grpc_max_decoding_message_size,
-            metrics.clone(),
-        )
+        let (state, seed) = retry_boot_scrape(BOOT_SCRAPE_RETRY_WINDOW, || {
+            Self::scrape_into_state(
+                sui_rpc_url,
+                ids,
+                ScrapeScope::Full,
+                tls_private_key.clone(),
+                grpc_max_decoding_message_size,
+                metrics.clone(),
+            )
+        })
         .await?;
         let seed = seed.context("a full scrape must produce a mirror seed")?;
 
@@ -585,20 +584,19 @@ impl OnchainState {
 
     /// The dealer submissions for one TOB bucket, in on-chain insertion
     /// order (the total order the TOB guarantees), read from the mirror.
-    /// Submissions come back in the normalized stamped form (a bare
-    /// bucket's carry `timestamp_ms: 0`), with the bucket's layout so
-    /// callers can insist on one. Returns `Ok(None)` when the bucket
-    /// does not exist; an incomplete link walk (a convergence gap while
-    /// a bootstrap replay catches up — retryable, recognized by
-    /// [`is_inconsistent_listing`]) or a stamped bucket whose stamps are
-    /// not monotone in TOB order is an error rather than a silent
-    /// truncation.
+    /// Returns `Ok(None)` when the bucket does not exist. An incomplete
+    /// link walk (a convergence gap while a bootstrap replay catches up,
+    /// retryable and recognized by [`is_inconsistent_listing`]) is an
+    /// error rather than a silent truncation, and so is a nonce bucket
+    /// whose timestamps are not monotone in TOB order. Only the nonce
+    /// accumulation window reads the timestamps, so key-generation
+    /// buckets are not checked for it.
     pub fn tob_certs(
         &self,
         epoch: u64,
         batch_index: Option<u32>,
         protocol_type: move_types::ProtocolType,
-    ) -> Result<Option<TobBucketRead>> {
+    ) -> Result<Option<Vec<(Address, move_types::DealerSubmissionV1)>>> {
         let key = move_types::TobKey {
             epoch,
             batch_index,
@@ -608,16 +606,27 @@ impl OnchainState {
         let Some(bucket) = state.hashi.tob.buckets.get(&key) else {
             return Ok(None);
         };
-        let certs: Vec<(Address, move_types::StampedDealerSubmissionV1)> = bucket
+        let certs: Vec<(Address, move_types::DealerSubmissionV1)> = bucket
             .complete_certs_in_order()
             .map_err(|e| inconsistent_listing(format!("mirrored TOB bucket {key:?}: {e}")))?
             .into_iter()
             .map(|(dealer, submission)| (dealer, submission.clone()))
             .collect();
-        if bucket.layout == TobCertLayout::Stamped {
-            ensure_timestamp_ordered(&certs)?;
-        }
-        Ok(Some((bucket.layout, certs)))
+        ensure_tob_read_ordered(protocol_type, &certs)?;
+        Ok(Some(certs))
+    }
+
+    pub fn presig_seals(&self, epoch: u64) -> BTreeMap<u32, move_types::PresigSealV1> {
+        self.state()
+            .hashi
+            .tob
+            .buckets
+            .iter()
+            .filter(|(key, _)| {
+                key.epoch == epoch && key.protocol_type == move_types::ProtocolType::NonceGeneration
+            })
+            .filter_map(|(key, bucket)| Some((key.batch_index?, bucket.seal.clone()?)))
+            .collect()
     }
 
     /// Wait until the object mirror has applied every Hashi transaction
@@ -699,7 +708,7 @@ impl OnchainState {
     pub fn committee_transition(
         &self,
         from_epoch: u64,
-    ) -> Option<(Committee, move_types::Committee)> {
+    ) -> Option<(RuntimeCommittee, move_types::Committee)> {
         let state = self.state();
         let committees = &state.hashi().committees;
         let from = committees.committees().get(&from_epoch)?.clone();
@@ -782,8 +791,15 @@ impl OnchainState {
             .cloned()
     }
 
-    pub fn current_committee(&self) -> Option<Committee> {
+    pub fn current_committee(&self) -> Option<RuntimeCommittee> {
         self.state().hashi.committees.current_committee().cloned()
+    }
+
+    /// The current committee as stored on chain, for records that must match its bytes.
+    pub fn current_raw_committee(&self) -> Option<move_types::Committee> {
+        let state = self.state();
+        let committees = &state.hashi.committees;
+        committees.raw_committee(committees.epoch()).cloned()
     }
 
     /// The next epoch a reconfiguration is currently transitioning to, if
@@ -966,7 +982,7 @@ impl OnchainState {
 
     /// The governed MPC parameters from the epoch config: what the NEXT
     /// committee will be formed with. The active committee reads its own
-    /// pinned copy via [`Committee::config`](hashi_types::committee::Committee::config).
+    /// pinned copy via [`RuntimeCommittee::config`].
     pub fn mpc_weight_reduction_allowed_delta(&self) -> u16 {
         self.state()
             .hashi()
@@ -1073,9 +1089,7 @@ pub struct UnorderedCertTableRead {
     pub later_ms: u64,
 }
 
-fn ensure_timestamp_ordered(
-    certs: &[(Address, move_types::StampedDealerSubmissionV1)],
-) -> Result<()> {
+fn ensure_timestamp_ordered(certs: &[(Address, move_types::DealerSubmissionV1)]) -> Result<()> {
     if let Some(bad) = certs
         .windows(2)
         .find(|w| w[1].1.timestamp_ms < w[0].1.timestamp_ms)
@@ -1087,6 +1101,20 @@ fn ensure_timestamp_ordered(
             later_ms: bad[1].1.timestamp_ms,
         }
         .into());
+    }
+    Ok(())
+}
+
+/// The order check one TOB bucket read must pass. Only the nonce
+/// accumulation window reads the timestamps, and it stops walking at the
+/// first one past its cutoff, so a nonce bucket must be monotone in TOB
+/// order. Key-generation buckets are accepted as read.
+fn ensure_tob_read_ordered(
+    protocol_type: move_types::ProtocolType,
+    certs: &[(Address, move_types::DealerSubmissionV1)],
+) -> Result<()> {
+    if protocol_type == move_types::ProtocolType::NonceGeneration {
+        ensure_timestamp_ordered(certs)?;
     }
     Ok(())
 }
@@ -1119,7 +1147,7 @@ impl State {
         metrics: Option<&crate::metrics::Metrics>,
     ) -> Result<(Self, CheckpointInfo, Option<route::MirrorSeed>)> {
         // Sequenced before the state scrape rather than joined with it:
-        // the TOB scrape identifies each bucket's layout from its
+        // the TOB scrape identifies each bucket's type from its
         // on-chain value type, which resolves through this history.
         let package_versions = move_types::PackageVersions::new(
             scrape_package_versions(client.clone(), ids.package_id).await?,
@@ -1144,6 +1172,48 @@ impl State {
             seed,
         ))
     }
+}
+
+/// `window` opens at the first retryable failure, since a full scrape can take
+/// tens of minutes. It bounds when a retry may start, never a running attempt.
+async fn retry_boot_scrape<T, F, Fut>(window: Duration, mut scrape: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut deadline = None;
+    let mut backoff = BOOT_SCRAPE_MIN_BACKOFF;
+    let mut attempt = 1u32;
+    loop {
+        let error = match scrape().await {
+            Ok(scraped) => return Ok(scraped),
+            Err(error) => error,
+        };
+        if !is_retryable_scrape_error(&error) {
+            return Err(error);
+        }
+        let now = tokio::time::Instant::now();
+        if now + backoff >= *deadline.get_or_insert(now + window) {
+            return Err(error.context(format!(
+                "giving up on the on-chain scrape after attempt {attempt}"
+            )));
+        }
+        tracing::warn!(
+            attempt,
+            backoff_ms = backoff.as_millis() as u64,
+            "On-chain scrape failed: {error:#}; retrying from scratch"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(BOOT_SCRAPE_MAX_BACKOFF);
+        attempt += 1;
+    }
+}
+
+fn is_retryable_scrape_error(error: &anyhow::Error) -> bool {
+    is_inconsistent_listing(error)
+        || error
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(crate::leader::is_retriable_transport)
 }
 
 // List out all the package versions for hashi so that we can stay ontop of upgrades
@@ -1249,6 +1319,17 @@ async fn scrape_dynamic_field_pages(
         "Scraped on-chain container"
     );
     Ok(min_height)
+}
+
+/// The fullnode lists fields from its index and loads each object afterwards,
+/// so a field deleted in between comes back with only its ids.
+fn listed_bcs<'a>(bcs: Option<&'a Bcs>, field: &DynamicField, container: &str) -> Result<&'a Bcs> {
+    bcs.filter(|bcs| !bcs.value().is_empty()).ok_or_else(|| {
+        inconsistent_listing(format!(
+            "{container}: dynamic field {} listed without its object (deleted mid-scrape)",
+            field.field_id()
+        ))
+    })
 }
 
 /// The derived object id of the `BitcoinState` dynamic field hanging
@@ -1395,7 +1476,7 @@ async fn scrape_hashi(
 
     let (
         (member_seed, member_info),
-        (committee_seed, (committees_per_epoch, raw_committees_per_epoch, committee_handoffs)),
+        (committee_seed, (committees_per_epoch, committee_handoffs)),
         (treasury_seed, treasury),
         (proposal_seed, proposals),
         (tob_seed, tob_buckets),
@@ -1437,8 +1518,7 @@ async fn scrape_hashi(
         .set_pending_epoch_change(committees.pending_epoch_change.map(|pending| pending.epoch))
         .set_mpc_public_key(committees.mpc_public_key)
         .set_members(member_info)
-        .set_committees(committees_per_epoch)
-        .set_raw_committees(raw_committees_per_epoch)
+        .set_onchain_committees(committees_per_epoch)
         .set_committee_handoffs(committee_handoffs);
 
     if let Some(metrics) = metrics {
@@ -1500,8 +1580,8 @@ async fn scrape_tob_entries(
     // collection stays small.
     let mut to_scrape: Vec<(
         move_types::TobKey,
-        versioned_decode::TobCertLayout,
         move_types::LinkedTable<Address>,
+        Option<move_types::PresigSealV1>,
     )> = Vec::new();
     seed.height = scrape_dynamic_field_pages(&client, tob_id, mask, "tob", metrics, |fields| {
         for field in fields {
@@ -1521,9 +1601,9 @@ async fn scrape_tob_entries(
                 .name()
                 .deserialize()
                 .map_err(|e| anyhow!("failed to deserialize TobKey: {e}"))?;
-            // The two bucket structs are BCS-identical, so one decode serves
-            // both; the chain-reported value type selects the node layout.
-            let layout = versioned_decode::TobCertLayout::from_struct_tag(
+            // Decode only a bucket whose chain-reported value type is the
+            // one this binary implements; any other type fails the scrape.
+            versioned_decode::ensure_tob_cert_bucket(
                 packages,
                 &versioned_decode::field_value_type(&field)?,
             )?;
@@ -1538,14 +1618,14 @@ async fn scrape_tob_entries(
             ));
             seed.interior.push((certs.certs.id, route::Slot::TobCerts));
             seed.tob_tables.push((certs.certs.id, key));
-            to_scrape.push((key, layout, certs.certs));
+            to_scrape.push((key, certs.certs, certs.seal));
         }
         Ok(())
     })
     .await?;
 
     let mut buckets = BTreeMap::new();
-    for (key, layout, certs) in to_scrape {
+    for (key, certs, seal) in to_scrape {
         let node_mask = FieldMask::from_paths([
             DynamicField::path_builder().name().finish(),
             DynamicField::path_builder().field_id(),
@@ -1575,32 +1655,10 @@ async fn scrape_tob_entries(
                         .name()
                         .deserialize()
                         .map_err(|e| anyhow!("failed to deserialize a tob node dealer: {e}"))?;
-                    let node: move_types::LinkedTableNode<
-                        Address,
-                        move_types::StampedDealerSubmissionV1,
-                    > = match layout {
-                        versioned_decode::TobCertLayout::Stamped => {
-                            value.deserialize().map_err(|e| {
-                                anyhow!("failed to deserialize a stamped tob node: {e}")
-                            })?
-                        }
-                        versioned_decode::TobCertLayout::Bare => {
-                            let bare: move_types::LinkedTableNode<
-                                Address,
-                                move_types::DealerSubmissionV1,
-                            > = value
-                                .deserialize()
-                                .map_err(|e| anyhow!("failed to deserialize a tob node: {e}"))?;
-                            move_types::LinkedTableNode {
-                                prev: bare.prev,
-                                next: bare.next,
-                                value: move_types::StampedDealerSubmissionV1 {
-                                    submission: bare.value,
-                                    timestamp_ms: 0,
-                                },
-                            }
-                        }
-                    };
+                    let node: move_types::LinkedTableNode<Address, move_types::DealerSubmissionV1> =
+                        value
+                            .deserialize()
+                            .map_err(|e| anyhow!("failed to deserialize a tob node: {e}"))?;
                     let node_id: Address = node_field.field_id().parse()?;
                     seed.entries.push((
                         node_id,
@@ -1617,11 +1675,11 @@ async fn scrape_tob_entries(
         buckets.insert(
             key,
             types::TobBucket {
-                layout,
                 certs_id: certs.id,
                 head: certs.head,
                 size: certs.size,
                 nodes,
+                seal,
             },
         );
     }
@@ -1797,10 +1855,10 @@ async fn scrape_all_member_info(
         metrics,
         |fields| {
             for field in fields {
-                let info: move_types::MemberInfo = field
-                    .value()
-                    .deserialize()
-                    .map_err(|e| anyhow!("failed to deserialize MemberInfo: {e}"))?;
+                let info: move_types::MemberInfo =
+                    listed_bcs(field.value_opt(), &field, "members")?
+                        .deserialize()
+                        .map_err(|e| anyhow!("failed to deserialize MemberInfo: {e}"))?;
                 let info = convert_move_member_info(info);
                 let field_id: Address = field.field_id().parse()?;
                 seed.entries.push((
@@ -1857,7 +1915,6 @@ async fn scrape_committees(
 ) -> Result<(
     route::ContainerSeed,
     (
-        BTreeMap<u64, Committee>,
         BTreeMap<u64, move_types::Committee>,
         BTreeMap<u64, SignedMessage<CommitteeTransitionRequest>>,
     ),
@@ -1880,6 +1937,7 @@ async fn scrape_committees(
         metrics,
         |fields| {
             for field in fields {
+                let value = listed_bcs(field.value_opt(), &field, "committees")?;
                 let value_type: TypeTag = field
                     .value_type_opt()
                     .ok_or_else(|| anyhow!("missing dynamic field value_type"))?
@@ -1892,8 +1950,7 @@ async fn scrape_committees(
                 let field_version = field.field_object().version();
                 match struct_tag.name().as_str() {
                     "Committee" => {
-                        let committee: move_types::Committee = field
-                            .value()
+                        let committee: move_types::Committee = value
                             .deserialize()
                             .map_err(|e| anyhow!("failed to deserialize Committee: {e}"))?;
                         seed.entries.push((
@@ -1908,8 +1965,7 @@ async fn scrape_committees(
                             field.name().deserialize().map_err(|e| {
                                 anyhow!("failed to deserialize CommitteeHandoffKey: {e}")
                             })?;
-                        let handoff: move_types::CommitteeHandoff = field
-                            .value()
+                        let handoff: move_types::CommitteeHandoff = value
                             .deserialize()
                             .map_err(|e| anyhow!("failed to deserialize CommitteeHandoff: {e}"))?;
                         seed.entries.push((
@@ -1947,43 +2003,13 @@ async fn scrape_committees(
             Ok((from_epoch, signed))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let committees = move_committees
-        .iter()
-        .map(|(epoch, committee)| (*epoch, convert_move_committee(committee.clone())))
-        .collect();
 
-    Ok((seed, (committees, move_committees, handoffs)))
+    Ok((seed, (move_committees, handoffs)))
 }
 
-fn convert_move_committee_member(
-    move_types::CommitteeMember {
-        validator_address,
-        public_key,
-        encryption_public_key,
-        weight,
-    }: move_types::CommitteeMember,
-) -> CommitteeMember {
-    CommitteeMember::new(
-        validator_address,
-        convert_move_uncompressed_g1_pubkey(&public_key),
-        // Use fallback key for nodes without valid encryption key.
-        // These nodes cannot decrypt shares but still count toward thresholds.
-        parse_encryption_public_key(encryption_public_key.as_slice())
-            .map(Into::into)
-            .unwrap_or_else(fallback_encryption_public_key),
-        weight,
-    )
-}
-
-fn convert_move_committee(c: move_types::Committee) -> Committee {
-    let members = c
-        .members
-        .into_iter()
-        .map(convert_move_committee_member)
-        .collect();
-    // Carry the pinned config verbatim so the rich committee re-serializes to
-    // the exact on-chain bytes (used to verify the signed handoff cert).
-    Committee::with_config(members, c.epoch, c.config)
+fn convert_move_committee(c: move_types::Committee) -> RuntimeCommittee {
+    RuntimeCommittee::from_move_with_encryption_key_fallback(c)
+        .expect("onchain committee BLS keys are uncompressed G1")
 }
 
 fn convert_move_committee_handoff(
@@ -2036,11 +2062,13 @@ where
     let mut values = Vec::new();
     seed.height = scrape_dynamic_field_pages(client, container, mask, label, metrics, |fields| {
         for field in fields {
-            let value: T = field
-                .child_object()
-                .contents()
-                .deserialize()
-                .map_err(|e| anyhow!("failed to deserialize ObjectBag child: {e}"))?;
+            let value: T = listed_bcs(
+                field.child_object_opt().and_then(Object::contents_opt),
+                &field,
+                label,
+            )?
+            .deserialize()
+            .map_err(|e| anyhow!("failed to deserialize ObjectBag child: {e}"))?;
             let wrapper_id: Address = field.field_id().parse()?;
             let child_id: Address = field.child_object().object_id().parse()?;
             seed.entries.push((
@@ -2166,10 +2194,10 @@ async fn scrape_utxo_records(
         metrics,
         |fields| {
             for field in fields {
-                let record: types::UtxoRecord = field
-                    .value()
-                    .deserialize()
-                    .map_err(|e| anyhow!("failed to deserialize UtxoRecord: {e}"))?;
+                let record: types::UtxoRecord =
+                    listed_bcs(field.value_opt(), &field, "utxo_records")?
+                        .deserialize()
+                        .map_err(|e| anyhow!("failed to deserialize UtxoRecord: {e}"))?;
                 let field_id: Address = field.field_id().parse()?;
                 seed.entries.push((
                     field_id,
@@ -2302,7 +2330,6 @@ fn decode_proposal(type_tag: &TypeTag, contents: &[u8]) -> Option<types::Proposa
         types::ProposalType::DisableVersion => parse::<move_types::DisableVersion>(contents),
         types::ProposalType::Upgrade => parse::<move_types::Upgrade>(contents),
         types::ProposalType::EmergencyPause => parse::<move_types::EmergencyPause>(contents),
-        types::ProposalType::UpdateGuardian => parse::<move_types::UpdateGuardian>(contents),
         types::ProposalType::IgnoreMember => parse::<move_types::IgnoreMember>(contents),
         types::ProposalType::Unknown(_) => None,
     }?;
@@ -2339,7 +2366,6 @@ pub(crate) fn parse_proposal_type(type_tag: &TypeTag) -> types::ProposalType {
         ("disable_version", "DisableVersion") => types::ProposalType::DisableVersion,
         ("upgrade", "Upgrade") => types::ProposalType::Upgrade,
         ("emergency_pause", "EmergencyPause") => types::ProposalType::EmergencyPause,
-        ("update_guardian", "UpdateGuardian") => types::ProposalType::UpdateGuardian,
         ("ignore_member", "IgnoreMember") => types::ProposalType::IgnoreMember,
         _ => types::ProposalType::Unknown(format!("{}::{}", inner_tag.module(), inner_tag.name())),
     }
@@ -2404,6 +2430,9 @@ mod tests {
     use fastcrypto::traits::ToFromBytes;
 
     use crate::mpc::EncryptionGroupElement;
+    use hashi_types::committee::Bls12381PrivateKey;
+    use hashi_types::committee::Committee;
+    use hashi_types::committee::EncryptionPrivateKey;
 
     use super::*;
 
@@ -2500,8 +2529,17 @@ mod tests {
         }
     }
 
+    fn one_member_committee(member: move_types::CommitteeMember) -> move_types::Committee {
+        move_types::Committee {
+            epoch: 0,
+            total_weight: member.weight,
+            members: vec![member],
+            config: move_types::Config::from_mpc_params(0, 3333, 0),
+        }
+    }
+
     #[test]
-    fn test_convert_move_committee_member() {
+    fn test_convert_move_committee() {
         let mut rng = rand::thread_rng();
         let validator_address =
             Address::from_hex("0x1234567890abcdef1234567890abcdef12345678").unwrap();
@@ -2516,8 +2554,10 @@ mod tests {
             public_key: signing_keypair.public().as_bytes().to_owned(),
             encryption_public_key: encryption_public_key.as_element().to_byte_array().into(),
             weight: 1,
+            extra_fields: move_types::Config::default(),
         };
-        let committee_member = convert_move_committee_member(move_committee_member);
+        let committee = convert_move_committee(one_member_committee(move_committee_member));
+        let committee_member = &committee.members()[0];
 
         assert_eq!(committee_member.validator_address(), validator_address);
         assert_eq!(committee_member.public_key(), signing_keypair.public());
@@ -2529,26 +2569,37 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_move_committee_member_uses_fallback_key() {
+    fn test_convert_move_committee_uses_fallback_key() {
         let mut rng = rand::thread_rng();
-        let validator_address =
-            Address::from_hex("0x1234567890abcdef1234567890abcdef12345678").unwrap();
-        let signing_keypair = fastcrypto::bls12381::min_pk::BLS12381KeyPair::generate(&mut rng);
+        let members = (1..=3u8)
+            .map(|i| {
+                let encryption_public_key = if i == 2 {
+                    hashi_types::committee::fallback_encryption_public_key()
+                } else {
+                    EncryptionPrivateKey::new(&mut rng).public_key()
+                };
+                CommitteeMember::new(
+                    Address::new([i; 32]),
+                    Bls12381PrivateKey::generate(&mut rng).public_key(),
+                    encryption_public_key,
+                    u64::from(i),
+                )
+            })
+            .collect();
+        let expected = Committee::with_config(
+            members,
+            7,
+            move_types::Config::from_mpc_params(250, 2000, 30),
+        );
+        let mut onchain = move_types::Committee::from(&expected);
         let mut encryption_key_vec = vec![0u8; 32];
         encryption_key_vec[0] = 1;
-
-        let move_committee_member = move_types::CommitteeMember {
-            validator_address,
-            public_key: signing_keypair.public().as_bytes().to_owned(),
-            encryption_public_key: encryption_key_vec,
-            weight: 1,
-        };
-        let committee_member = convert_move_committee_member(move_committee_member);
+        onchain.members[1].encryption_public_key = encryption_key_vec;
 
         assert_eq!(
-            *committee_member.encryption_public_key(),
-            fallback_encryption_public_key()
-        )
+            convert_move_committee(onchain),
+            RuntimeCommittee::from(expected)
+        );
     }
 
     // The Move contract stores the BLS12-381 G1 identity element as a member's
@@ -2608,6 +2659,72 @@ mod key_rotation_epoch_tests {
 }
 
 #[cfg(test)]
+mod tob_read_order_tests {
+    use super::Address;
+    use super::UnorderedCertTableRead;
+    use super::ensure_tob_read_ordered;
+    use super::move_types;
+    use super::move_types::ProtocolType;
+
+    fn submission(dealer: u8, timestamp_ms: u64) -> (Address, move_types::DealerSubmissionV1) {
+        let dealer_address = Address::new([dealer; 32]);
+        (
+            dealer_address,
+            move_types::DealerSubmissionV1 {
+                message: move_types::DealerMessagesHashV1 {
+                    dealer_address,
+                    messages_hash: vec![dealer; 32],
+                },
+                signature: move_types::CommitteeSignature {
+                    epoch: 7,
+                    signature: vec![],
+                    signers_bitmap: vec![],
+                },
+                timestamp_ms,
+            },
+        )
+    }
+
+    #[test]
+    fn an_out_of_order_nonce_bucket_is_rejected() {
+        let certs = [
+            submission(1, 1_000),
+            submission(2, 5_000),
+            submission(3, 4_999),
+        ];
+        let err = ensure_tob_read_ordered(ProtocolType::NonceGeneration, &certs).unwrap_err();
+        let unordered = err
+            .downcast_ref::<UnorderedCertTableRead>()
+            .expect("an unordered nonce read must surface as UnorderedCertTableRead");
+        assert_eq!(unordered.earlier, certs[1].0);
+        assert_eq!(unordered.earlier_ms, 5_000);
+        assert_eq!(unordered.later, certs[2].0);
+        assert_eq!(unordered.later_ms, 4_999);
+    }
+
+    #[test]
+    fn an_out_of_order_key_generation_bucket_is_accepted() {
+        let certs = [submission(1, 5_000), submission(2, 1_000)];
+        ensure_tob_read_ordered(ProtocolType::Dkg, &certs).unwrap();
+        ensure_tob_read_ordered(ProtocolType::KeyRotation, &certs).unwrap();
+    }
+
+    #[test]
+    fn an_ordered_nonce_bucket_is_accepted() {
+        // Submissions recorded in one checkpoint share a timestamp, so
+        // the order is non-decreasing rather than strictly increasing.
+        let certs = [
+            submission(1, 1_000),
+            submission(2, 1_000),
+            submission(3, 2_000),
+        ];
+        ensure_tob_read_ordered(ProtocolType::NonceGeneration, &certs).unwrap();
+        ensure_tob_read_ordered(ProtocolType::NonceGeneration, &[]).unwrap();
+        ensure_tob_read_ordered(ProtocolType::NonceGeneration, &certs[..1]).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod inconsistent_listing_tests {
     #[test]
     fn an_inconsistent_listing_error_is_recognized_for_retry() {
@@ -2620,5 +2737,279 @@ mod inconsistent_listing_tests {
         assert!(!super::is_inconsistent_listing(&anyhow::anyhow!(
             "Sui RPC transport failure"
         )));
+    }
+}
+
+#[cfg(test)]
+mod boot_scrape_retry_tests {
+    use super::*;
+    use sui_rpc::proto::sui::rpc::v2::ListDynamicFieldsResponse;
+    use sui_rpc::proto::sui::rpc::v2::state_service_server::StateService;
+    use sui_rpc::proto::sui::rpc::v2::state_service_server::StateServiceServer;
+    use tokio::time::Instant;
+
+    fn raced() -> anyhow::Error {
+        inconsistent_listing("withdrawal_txns: dynamic field 0x1 listed without its object".into())
+    }
+
+    #[test]
+    fn a_field_listed_without_its_object_is_an_inconsistent_listing() {
+        // What the fullnode returns once the field object is gone: ids only.
+        let vanished = DynamicField::default().with_field_id("0x1");
+        let err = listed_bcs(vanished.value_opt(), &vanished, "utxo_records").unwrap_err();
+        assert!(is_inconsistent_listing(&err), "{err:#}");
+        let err = listed_bcs(
+            vanished.child_object_opt().and_then(Object::contents_opt),
+            &vanished,
+            "withdrawal_txns",
+        )
+        .unwrap_err();
+        assert!(is_inconsistent_listing(&err), "{err:#}");
+
+        let emptied = DynamicField::default()
+            .with_child_object(Object::default().with_contents(Vec::<u8>::new()));
+        let err = listed_bcs(
+            emptied.child_object_opt().and_then(Object::contents_opt),
+            &emptied,
+            "withdrawal_txns",
+        )
+        .unwrap_err();
+        assert!(is_inconsistent_listing(&err), "{err:#}");
+
+        let listed = DynamicField::default().with_value(Bcs::serialize(&7u64).unwrap());
+        let value: u64 = listed_bcs(listed.value_opt(), &listed, "utxo_records")
+            .unwrap()
+            .deserialize()
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+
+    async fn spawn_state_service(service: impl StateService) -> Client {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = futures::stream::unfold(listener, |listener| async move {
+            let result = listener.accept().await.map(|(stream, _)| stream);
+            Some((result, listener))
+        });
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(StateServiceServer::new(service))
+                .serve_with_incoming(incoming),
+        );
+        Client::new(format!("http://{addr}").as_str()).unwrap()
+    }
+
+    struct VanishedFieldListing;
+
+    #[tonic::async_trait]
+    impl StateService for VanishedFieldListing {
+        async fn list_dynamic_fields(
+            &self,
+            request: tonic::Request<ListDynamicFieldsRequest>,
+        ) -> Result<tonic::Response<ListDynamicFieldsResponse>, tonic::Status> {
+            let field = DynamicField::default()
+                .with_parent(request.into_inner().parent.unwrap_or_default())
+                .with_field_id(Address::ZERO.to_string());
+            let mut response = tonic::Response::new(
+                ListDynamicFieldsResponse::default().with_dynamic_fields(vec![field]),
+            );
+            response.metadata_mut().insert(
+                sui_rpc::headers::X_SUI_CHECKPOINT_HEIGHT,
+                "7".parse().unwrap(),
+            );
+            Ok(response)
+        }
+    }
+
+    struct HungListing;
+
+    #[tonic::async_trait]
+    impl StateService for HungListing {
+        async fn list_dynamic_fields(
+            &self,
+            _request: tonic::Request<ListDynamicFieldsRequest>,
+        ) -> Result<tonic::Response<ListDynamicFieldsResponse>, tonic::Status> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_or_hung_fullnode_is_retried() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let refused = Client::new(format!("http://{closed}").as_str()).unwrap();
+        // The deadline layer `new_sui_rpc_client` installs, shortened.
+        let hung = spawn_state_service(HungListing).await.request_layer(
+            tower::timeout::TimeoutLayer::new(Duration::from_millis(200)),
+        );
+        for client in [refused, hung] {
+            let err = scrape_utxo_records(client, Address::ZERO, None)
+                .await
+                .unwrap_err();
+            assert!(is_retryable_scrape_error(&err), "{err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_scrapes_report_a_vanished_field_as_an_inconsistent_listing() {
+        let client = spawn_state_service(VanishedFieldListing).await;
+
+        let errors = [
+            scrape_all_member_info(client.clone(), Address::ZERO, None)
+                .await
+                .err(),
+            scrape_committees(client.clone(), Address::ZERO, None)
+                .await
+                .err(),
+            scrape_utxo_records(client.clone(), Address::ZERO, None)
+                .await
+                .err(),
+            scrape_object_bag::<types::WithdrawalTransaction, _>(
+                &client,
+                Address::ZERO,
+                |txn| route::TrackedKind::WithdrawalTxn(txn.id),
+                "withdrawal_txns",
+                None,
+            )
+            .await
+            .err(),
+        ];
+        for err in errors {
+            let err = err.expect("a vanished field must fail the scrape");
+            assert!(is_inconsistent_listing(&err), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn only_raced_listings_and_transport_failures_are_retried() {
+        assert!(is_retryable_scrape_error(&raced()));
+        assert!(is_retryable_scrape_error(
+            &raced().context("scraping the withdrawal queue")
+        ));
+        // This client's own request deadline surfaces as `Unknown`.
+        for status in [
+            tonic::Status::unavailable("tcp connect error"),
+            tonic::Status::unknown("request timed out"),
+            tonic::Status::deadline_exceeded("timeout expired"),
+            tonic::Status::internal("h2 protocol error: http2 error"),
+            tonic::Status::cancelled("operation was canceled"),
+        ] {
+            let code = status.code();
+            assert!(is_retryable_scrape_error(&status.into()), "{code:?}");
+        }
+        for status in [
+            tonic::Status::not_found("object not found"),
+            tonic::Status::invalid_argument("invalid read_mask path"),
+            tonic::Status::out_of_range("decoded message length too large"),
+        ] {
+            let code = status.code();
+            assert!(!is_retryable_scrape_error(&status.into()), "{code:?}");
+        }
+        let decode = bcs::from_bytes::<move_types::MemberInfo>(&[1, 2, 3])
+            .map_err(|e| anyhow!("failed to deserialize MemberInfo: {e}"))
+            .unwrap_err();
+        assert!(!is_retryable_scrape_error(&decode));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_raced_scrape_is_retried_from_scratch_until_it_succeeds() {
+        let start = Instant::now();
+        let mut attempts = 0;
+        let scraped = retry_boot_scrape(BOOT_SCRAPE_RETRY_WINDOW, || {
+            attempts += 1;
+            std::future::ready(if attempts < 3 {
+                Err(raced())
+            } else {
+                Ok(attempts)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(scraped, 3);
+        assert_eq!(start.elapsed(), Duration::from_secs(1 + 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_decode_error_fails_without_a_retry() {
+        let mut attempts = 0;
+        let err = retry_boot_scrape(BOOT_SCRAPE_RETRY_WINDOW, || {
+            attempts += 1;
+            std::future::ready(Err::<(), _>(anyhow!(
+                "failed to deserialize ObjectBag child: invalid bool"
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(!format!("{err:#}").contains("giving up"), "{err:#}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_first_attempt_that_fails_late_is_still_retried() {
+        let mut attempts = 0;
+        retry_boot_scrape(BOOT_SCRAPE_RETRY_WINDOW, || {
+            attempts += 1;
+            let first = attempts == 1;
+            async move {
+                if first {
+                    tokio::time::sleep(BOOT_SCRAPE_RETRY_WINDOW * 4).await;
+                    Err(raced())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_stop_once_the_window_from_the_first_failure_closes() {
+        let boot = Instant::now();
+        let mut starts = Vec::new();
+        let err = retry_boot_scrape(BOOT_SCRAPE_RETRY_WINDOW, || {
+            starts.push(Instant::now());
+            let first = starts.len() == 1;
+            async move {
+                if first {
+                    tokio::time::sleep(BOOT_SCRAPE_RETRY_WINDOW * 2).await;
+                }
+                Err::<(), _>(tonic::Status::unavailable("tcp connect error").into())
+            }
+        })
+        .await
+        .unwrap_err();
+        let first_failure = boot + BOOT_SCRAPE_RETRY_WINDOW * 2;
+        let deadline = first_failure + BOOT_SCRAPE_RETRY_WINDOW;
+        assert!(starts.len() > 2);
+        assert!(starts.iter().all(|start| *start < deadline));
+        assert!(Instant::now() < deadline);
+        assert!(format!("{err:#}").contains("giving up"), "{err:#}");
+        assert!(err.downcast_ref::<tonic::Status>().is_some(), "{err:#}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_running_past_the_deadline_is_not_cut_short() {
+        let deadline = Instant::now() + BOOT_SCRAPE_RETRY_WINDOW;
+        let mut attempts = 0;
+        retry_boot_scrape(BOOT_SCRAPE_RETRY_WINDOW, || {
+            attempts += 1;
+            let first = attempts == 1;
+            async move {
+                if first {
+                    Err(raced())
+                } else {
+                    tokio::time::sleep(BOOT_SCRAPE_RETRY_WINDOW * 2).await;
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert!(Instant::now() > deadline);
     }
 }

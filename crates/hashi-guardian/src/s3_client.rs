@@ -6,11 +6,11 @@ use aws_credential_types::provider::ProvideCredentials;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::CredentialsBuilder;
 use aws_sdk_s3::error::DisplayErrorContext;
-use hashi_types::guardian::LogRecord;
 use hashi_types::guardian::S3BucketInfo;
 use hashi_types::guardian::S3Credentials;
 use hashi_types::guardian::S3ObjectLockPolicy;
 use hashi_types::guardian::S3RetentionEnvironment;
+use hashi_types::guardian::SignedLogEntry;
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 
@@ -20,7 +20,7 @@ use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::ObjectLockEnabled;
 use aws_sdk_s3::types::ObjectLockMode;
 use aws_sdk_s3::Client as S3Client;
-use hashi_types::guardian::s3::S3HourScopedDirectory;
+use hashi_types::guardian::s3::S3HourDirectory;
 use hashi_types::guardian::GuardianError::InvalidS3Log;
 use hashi_types::guardian::GuardianError::S3Error;
 use hashi_types::guardian::GuardianResult;
@@ -69,11 +69,22 @@ impl GuardianS3Client {
     // Constructors
     // ========================================================================
 
-    /// Construct the client and check S3 access and Object Lock support.
+    /// Construct a client for off-enclave readers (tools, monitor) using normal
+    /// networking, then check S3 access and Object Lock support.
     pub async fn new(
         bucket_info: &S3BucketInfo,
         retention_environment: S3RetentionEnvironment,
         credentials: &S3Credentials,
+    ) -> GuardianResult<Self> {
+        Self::build(bucket_info, retention_environment, credentials, None).await
+    }
+
+    /// Shared constructor body; `http_client` overrides the SDK's default transport.
+    async fn build(
+        bucket_info: &S3BucketInfo,
+        retention_environment: S3RetentionEnvironment,
+        credentials: &S3Credentials,
+        http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     ) -> GuardianResult<Self> {
         info!("S3 Configuration:");
         info!("   Bucket: {}", bucket_info.name);
@@ -95,16 +106,29 @@ impl GuardianS3Client {
             .load()
             .await;
 
+        // Endpoint overrides target local S3-compatible services and may use
+        // plaintext HTTP, so only devnet may use them.
+        if retention_environment != S3RetentionEnvironment::Devnet
+            && ["AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"]
+                .iter()
+                .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err(S3Error(format!(
+                "S3 endpoint overrides are only allowed for devnet, not {retention_environment:?}"
+            )));
+        }
+
         // A custom endpoint implies an S3-compatible service (MinIO, LocalStack), which
         // need path-style addressing.
         let mut s3_builder = aws_sdk_s3::config::Builder::from(&aws_config);
+        if let Some(http_client) = http_client {
+            s3_builder = s3_builder.http_client(http_client);
+        }
         if std::env::var_os("AWS_ENDPOINT_URL_S3").is_some() {
             s3_builder = s3_builder.force_path_style(true);
         }
-        let client = S3Client::from_conf(s3_builder.build());
-
         let client = Self {
-            client,
+            client: S3Client::from_conf(s3_builder.build()),
             bucket_info: bucket_info.clone(),
             object_lock_policy: S3ObjectLockPolicy::for_environment(retention_environment),
         };
@@ -112,10 +136,38 @@ impl GuardianS3Client {
         Ok(client)
     }
 
-    /// Construct an `GuardianS3Client` from an already-configured S3 client.
-    /// This is intended for unit tests that use a mock S3 Client.
-    /// This is not put behind cfg(test) as tests in the enclave crate also use it.
-    pub fn from_client_for_tests(
+    /// Construct the enclave's client, routing AWS S3 hostnames to its VSOCK
+    /// forwarders. Tests and `non-enclave-dev` builds outside an enclave use `new`.
+    pub(crate) async fn new_in_enclave(
+        bucket_info: &S3BucketInfo,
+        retention_environment: S3RetentionEnvironment,
+        credentials: &S3Credentials,
+    ) -> GuardianResult<Self> {
+        // Set by docker/hashi-guardian/run.sh: mock-attestation EIFs run in Nitro
+        // too, where the VSOCK forwarders are the only route to S3.
+        #[cfg(any(test, feature = "non-enclave-dev"))]
+        if std::env::var_os("HASHI_GUARDIAN_ENCLAVE_S3_ROUTES").is_none() {
+            return Self::new(bucket_info, retention_environment, credentials).await;
+        }
+        use aws_smithy_http_client::tls;
+        use aws_smithy_http_client::Builder;
+        let http_client = Builder::new()
+            .tls_provider(tls::Provider::Rustls(
+                tls::rustls_provider::CryptoMode::AwsLc,
+            ))
+            .build_with_resolver(crate::s3_resolver::EnclaveS3Resolver::new(bucket_info));
+        Self::build(
+            bucket_info,
+            retention_environment,
+            credentials,
+            Some(http_client),
+        )
+        .await
+    }
+
+    /// Wrap a preconfigured (mock) S3 client for tests, without network checks.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn from_client(
         bucket_info: S3BucketInfo,
         retention_environment: S3RetentionEnvironment,
         client: S3Client,
@@ -129,20 +181,12 @@ impl GuardianS3Client {
     }
 
     // ========================================================================
-    // Getters
-    // ========================================================================
-
-    pub fn bucket_info(&self) -> &S3BucketInfo {
-        &self.bucket_info
-    }
-
-    // ========================================================================
     // S3 Write
     // ========================================================================
 
     /// Attempt one immutable log PUT. The Guardian log writer owns retries and
     /// deadlines, so SDK retries are disabled for this operation.
-    pub(crate) async fn write_log_record_once(&self, log: &LogRecord) -> GuardianResult<()> {
+    pub(crate) async fn write_log_entry_once(&self, log: &SignedLogEntry) -> GuardianResult<()> {
         let key = log.object_key();
         let expiry_time = DateTime::from(log.object_lock_expiry(self.object_lock_policy));
         self.write_at_key_once(key, log, expiry_time).await
@@ -192,7 +236,7 @@ impl GuardianS3Client {
                     DisplayErrorContext(&e)
                 )));
             }
-            self.verify_existing_write(key, &body).await?;
+            self.verify_existing_write(key, &body, &expiry_time).await?;
             info!("Object {} already contains the intended record", key);
         }
 
@@ -206,9 +250,15 @@ impl GuardianS3Client {
         Ok(())
     }
 
-    /// Similar to `get_object_unsafe`, but compares the raw bytes and treats
-    /// invalid lock metadata as a fatal conflict at this write-once key.
-    async fn verify_existing_write(&self, key: &str, expected_body: &[u8]) -> GuardianResult<()> {
+    /// After a 412, require the existing object to be this exact record under the
+    /// same Compliance-lock rule readers apply; anything else is a fatal conflict.
+    /// Similar to `get_object_unsafe`, but compares the raw bytes.
+    async fn verify_existing_write(
+        &self,
+        key: &str,
+        expected_body: &[u8],
+        expiry_time: &DateTime,
+    ) -> GuardianResult<()> {
         let response = self
             .client
             .get_object()
@@ -223,8 +273,12 @@ impl GuardianS3Client {
                     DisplayErrorContext(&e)
                 ))
             })?;
-        let has_compliance_lock = response.object_lock_mode() == Some(&ObjectLockMode::Compliance)
-            && response.object_lock_retain_until_date().is_some();
+        let has_compliance_lock = has_valid_compliance_lock(
+            response.object_lock_mode(),
+            response.object_lock_retain_until_date(),
+            SystemTime::now(),
+            expiry_time,
+        );
         let actual_body = response.body.collect().await.map_err(|e| {
             S3Error(format!(
                 "Failed to read object body for key {}: {}",
@@ -300,67 +354,23 @@ impl GuardianS3Client {
 
         Ok(())
     }
-
-    /// List up to 10 objects in the bucket.
-    /// This is intended as a lightweight connectivity/debug helper (primarily for testing).
-    pub async fn list_objects_sample(&self) -> GuardianResult<()> {
-        let s3_client = &self.client;
-
-        let bucket_objects = s3_client
-            .list_objects_v2()
-            .bucket(&self.bucket_info.name)
-            .max_keys(10)
-            .send()
-            .await
-            .map_err(|e| {
-                S3Error(format!(
-                    "Failed to list objects: {}",
-                    DisplayErrorContext(&e)
-                ))
-            })?;
-
-        let objects = bucket_objects.contents();
-
-        if objects.is_empty() {
-            info!(
-                "Bucket {} has no objects (or no access to list)",
-                self.bucket_info.name
-            );
-            return Ok(());
-        }
-
-        info!(
-            "Bucket {}: listing {} object(s) (max 10)",
-            self.bucket_info.name,
-            objects.len()
-        );
-
-        for (i, obj) in objects.iter().enumerate() {
-            let key = obj.key().unwrap_or("<missing key>");
-            info!(
-                "  {}. key={} size={:?} last_modified={:?} etag={:?}",
-                i + 1,
-                key,
-                obj.size(),
-                obj.last_modified(),
-                obj.e_tag()
-            );
-        }
-
-        Ok(())
-    }
 }
 
-/// Controls whether an S3 read establishes that the object is still immutable.
+/// Controls whether an S3 read makes sure that the object is still immutable.
+/// An immutable object satisfies two conditions:
+/// 1. The object has an active Compliance lock until the required expiry or later.
+/// 2. The version history of the key shows no overwrite and no delete marker.
+///
+/// `Required` checks the two conditions on the exact key.
+/// `MutationAlreadyChecked` checks condition 1. The caller checks condition 2 for the directory.
+/// Note that checking Condition 2 is meaningless without condition 1.
 #[derive(Clone, Copy)]
 pub(crate) enum ImmutabilityCheck {
     /// Validate the exact key has no mutation history and reject the object
-    /// unless its Compliance lock is still unexpired, except when the
-    /// process-wide temporary testnet override is set.
+    /// unless its Compliance lock is still unexpired.
     Required,
     /// The caller already validated the enclosing prefix has no mutations;
-    /// still reject the object unless its Compliance lock is unexpired, except
-    /// when the process-wide temporary testnet override is set.
+    /// still reject the object unless its Compliance lock is unexpired.
     MutationAlreadyChecked,
     /// Do not claim S3 immutability. Used for signed records whose short locks
     /// are expected to expire, such as KP-share state.
@@ -376,6 +386,9 @@ impl GuardianS3Client {
     /// whose objects are hidden by delete markers. Uses `delimiter='/'` to walk
     /// the hour-partitioned withdraw layout without paginating every object key.
     /// Returned prefixes are unique and sorted lexicographically.
+    ///
+    /// Returns directory names only; callers check history and locks on the keys
+    /// they read inside a chosen directory later.
     pub async fn list_common_prefixes(&self, prefix: &str) -> GuardianResult<Vec<String>> {
         let mut key_marker: Option<String> = None;
         let mut version_id_marker: Option<String> = None;
@@ -418,12 +431,23 @@ impl GuardianS3Client {
         Ok(out.into_iter().collect())
     }
 
-    /// Lists the currently visible keys under `prefix` using S3 version
-    /// history. When `reject_mutations` is true, any overwrite or deletion is
-    /// rejected; otherwise it is logged and only the latest visible versions
-    /// are returned. Mutation validation establishes immutability only when
-    /// each selected object also has an unexpired lock.
-    pub(crate) async fn list_keys(
+    /// Lists keys under `prefix`, rejecting overwrites and deletions in S3
+    /// version history. This establishes immutability only when each selected
+    /// object also has an unexpired lock.
+    pub(crate) async fn list_keys(&self, prefix: &str) -> GuardianResult<Vec<String>> {
+        self.list_keys_inner(prefix, true).await
+    }
+
+    /// Lists only currently visible keys under `prefix`. Overwrites and
+    /// deletions in S3 version history are logged rather than rejected.
+    pub(crate) async fn list_keys_allowing_mutations(
+        &self,
+        prefix: &str,
+    ) -> GuardianResult<Vec<String>> {
+        self.list_keys_inner(prefix, false).await
+    }
+
+    async fn list_keys_inner(
         &self,
         prefix: &str,
         reject_mutations: bool,
@@ -526,19 +550,9 @@ impl GuardianS3Client {
     /// S3 key from which it was read.
     pub async fn list_all_log_records_in_dir(
         &self,
-        dir: &S3HourScopedDirectory,
-    ) -> GuardianResult<Vec<LogRecord>> {
-        let prefix = dir.to_string();
-        self.list_all_log_records_with_prefix(&prefix).await
-    }
-
-    /// Batch read all immutable log records whose keys begin with `prefix`.
-    /// The prefix history is validated before any records are fetched.
-    pub(crate) async fn list_all_log_records_with_prefix(
-        &self,
-        prefix: &str,
-    ) -> GuardianResult<Vec<LogRecord>> {
-        let keys = self.list_keys(prefix, true).await?;
+        dir: &S3HourDirectory,
+    ) -> GuardianResult<Vec<SignedLogEntry>> {
+        let keys = self.list_keys(&dir.to_string()).await?;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             // The prefix history was checked above. Immutable batch logs also
@@ -559,9 +573,9 @@ impl GuardianS3Client {
         &self,
         key: &str,
         immutability_check: ImmutabilityCheck,
-    ) -> GuardianResult<LogRecord> {
+    ) -> GuardianResult<SignedLogEntry> {
         if matches!(immutability_check, ImmutabilityCheck::Required) {
-            let keys = self.list_keys(key, true).await?;
+            let keys = self.list_keys(key).await?;
             if keys.len() != 1 || keys[0] != key {
                 return Err(S3Error(format!(
                     "expected exactly one object for key {}, found {:?}",
@@ -596,12 +610,13 @@ impl GuardianS3Client {
             ))
         })?;
 
-        let record = serde_json::from_slice::<LogRecord>(&bytes.into_bytes()).map_err(|e| {
-            InvalidS3Log(format!(
-                "Failed to deserialize object {} into target type: {}",
-                key, e
-            ))
-        })?;
+        let record =
+            serde_json::from_slice::<SignedLogEntry>(&bytes.into_bytes()).map_err(|e| {
+                InvalidS3Log(format!(
+                    "Failed to deserialize object {} into target type: {}",
+                    key, e
+                ))
+            })?;
         if record.object_key() != key {
             return Err(InvalidS3Log(format!(
                 "S3 object key mismatch: record contains {}, actual key is {key}",
@@ -613,8 +628,7 @@ impl GuardianS3Client {
                 lock_mode.as_ref(),
                 retain_until.as_ref(),
                 SystemTime::now(),
-                &record,
-                self.object_lock_policy,
+                &DateTime::from(record.object_lock_expiry(self.object_lock_policy)),
             )
         {
             return Err(S3Error(format!(
@@ -625,25 +639,28 @@ impl GuardianS3Client {
     }
 
     /// Read an immutable-log object with history and Compliance-lock checks.
-    pub(crate) async fn get_log_record(&self, key: &str) -> GuardianResult<LogRecord> {
+    pub(crate) async fn get_log_record(&self, key: &str) -> GuardianResult<SignedLogEntry> {
         self.get_log_record_inner(key, ImmutabilityCheck::Required)
             .await
     }
 }
 
+/// Make sure that the record has a Compliance lock.
+/// The lock must stay active until `required_expiry` or later.
 fn has_valid_compliance_lock(
     mode: Option<&ObjectLockMode>,
     retain_until: Option<&DateTime>,
     now: SystemTime,
-    record: &LogRecord,
-    policy: S3ObjectLockPolicy,
+    required_expiry: &DateTime,
 ) -> bool {
     let (Some(ObjectLockMode::Compliance), Some(expiry)) = (mode, retain_until) else {
         return false;
     };
 
-    // Retention may be extended beyond the expiry originally requested by the writer.
-    *expiry > DateTime::from(now) && *expiry >= DateTime::from(record.object_lock_expiry(policy))
+    // This check accepts a lock date that is later than the required date.
+    // Thus, an old record can stay valid after the lock on a newer record expires.
+    // This can occur only after the long-lived lock duration.
+    *expiry > DateTime::from(now) && expiry >= required_expiry
 }
 
 #[cfg(test)]
@@ -664,7 +681,7 @@ mod tests {
     use std::time::Duration;
 
     fn mk_logger_with_client(client: Client) -> GuardianS3Client {
-        GuardianS3Client::from_client_for_tests(
+        GuardianS3Client::from_client(
             S3BucketInfo {
                 name: "bucket".to_string(),
                 region: "us-east-1".to_string(),
@@ -683,7 +700,7 @@ mod tests {
     async fn log_put_uses_record_timestamp_for_expiry() {
         let signing_key = GuardianSignKeyPair::from([17u8; 32]);
         let timestamp_ms = 1_700_000_000_123;
-        let record = LogRecord::new_at_timestamp(
+        let record = SignedLogEntry::new_at_timestamp(
             "session".into(),
             LogMessage::Heartbeat(HeartbeatLogMessage::new(42)),
             &signing_key,
@@ -710,13 +727,14 @@ mod tests {
         let logger = mk_logger_with_client(client);
         // Repeated attempts must send the same expiry, including subsecond precision.
         for _ in 0..2 {
-            logger.write_log_record_once(&record).await.unwrap();
+            logger.write_log_entry_once(&record).await.unwrap();
         }
         assert_eq!(put_ok.num_calls(), 2);
     }
 
     #[tokio::test]
     async fn test_412_accepts_identical_locked_object() {
+        let expiry = DateTime::from(SystemTime::now() + Duration::from_mins(5));
         let put_precondition_failed = mock!(Client::put_object)
             .match_requests(|req| req.bucket() == Some("bucket"))
             .sequence()
@@ -724,12 +742,10 @@ mod tests {
             .build();
         let get_existing = mock!(Client::get_object)
             .match_requests(|req| req.bucket() == Some("bucket") && req.key() == Some("key"))
-            .then_output(|| {
+            .then_output(move || {
                 GetObjectOutput::builder()
                     .object_lock_mode(ObjectLockMode::Compliance)
-                    .object_lock_retain_until_date(DateTime::from(
-                        SystemTime::now() + Duration::from_mins(5),
-                    ))
+                    .object_lock_retain_until_date(expiry)
                     .body(ByteStream::from_static(br#"{"a":1}"#))
                     .build()
             });
@@ -742,11 +758,7 @@ mod tests {
         );
         let logger = mk_logger_with_client(client);
         logger
-            .write_at_key_once(
-                "key",
-                &TestPayload { a: 1 },
-                DateTime::from(SystemTime::now() + Duration::from_mins(5)),
-            )
+            .write_at_key_once("key", &TestPayload { a: 1 }, expiry)
             .await
             .unwrap();
 
@@ -838,7 +850,7 @@ mod tests {
         let expiry_time = DateTime::from(SystemTime::now() + Duration::from_mins(5));
         let error = logger
             .write_at_key_once(
-                "init/session/01-oi-attestation-unsigned.json",
+                "init/session/01-oi-attestation.json",
                 &TestPayload { a: 1 },
                 expiry_time,
             )
@@ -852,7 +864,7 @@ mod tests {
     #[test]
     fn compliance_lock_expiry_is_strict() {
         let signing_key = GuardianSignKeyPair::from([15u8; 32]);
-        let record = LogRecord::new_at_timestamp(
+        let record = SignedLogEntry::new_at_timestamp(
             "session".into(),
             LogMessage::Heartbeat(HeartbeatLogMessage::new(42)),
             &signing_key,
@@ -864,27 +876,25 @@ mod tests {
         };
         let expiry_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let expiry = DateTime::from(expiry_time);
+        let required_expiry = DateTime::from(record.object_lock_expiry(policy));
 
         assert!(!has_valid_compliance_lock(
             Some(&ObjectLockMode::Compliance),
             Some(&expiry),
             expiry_time + Duration::from_secs(1),
-            &record,
-            policy,
+            &required_expiry,
         ));
         assert!(!has_valid_compliance_lock(
             Some(&ObjectLockMode::Compliance),
             Some(&expiry),
             expiry_time,
-            &record,
-            policy,
+            &required_expiry,
         ));
         assert!(has_valid_compliance_lock(
             Some(&ObjectLockMode::Compliance),
             Some(&expiry),
             expiry_time - Duration::from_secs(1),
-            &record,
-            policy,
+            &required_expiry,
         ));
 
         // An extension keeps the record readable beyond its original retention period.
@@ -893,8 +903,7 @@ mod tests {
             Some(&ObjectLockMode::Compliance),
             Some(&extended_expiry),
             expiry_time + Duration::from_secs(1),
-            &record,
-            policy,
+            &required_expiry,
         ));
     }
 
@@ -907,14 +916,14 @@ mod tests {
         for (message, retention_days) in [
             (LogMessage::Heartbeat(HeartbeatLogMessage::new(42)), 30),
             (
-                LogMessage::Init(Box::new(InitLogMessage::OIAttestationUnsigned {
+                LogMessage::Init(Box::new(InitLogMessage::OIAttestation {
                     attestation: NitroAttestation::new(vec![1, 2, 3]),
                     signing_public_key: signing_key.verification_key(),
                 })),
                 182,
             ),
         ] {
-            let record = LogRecord::new_at_timestamp(
+            let record = SignedLogEntry::new_at_timestamp(
                 session_id.clone(),
                 message,
                 &signing_key,
@@ -977,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn required_read_rejects_expired_compliance_lock() {
         let signing_key = GuardianSignKeyPair::from([15u8; 32]);
-        let record = LogRecord::new_at_timestamp(
+        let record = SignedLogEntry::new_at_timestamp(
             "session".into(),
             LogMessage::Heartbeat(HeartbeatLogMessage::new(42)),
             &signing_key,
@@ -1014,12 +1023,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsigned_log_replay_is_rejected_during_deserialization() {
+    async fn attestation_log_replay_is_rejected_during_deserialization() {
         let signing_key = GuardianSignKeyPair::from([14u8; 32]);
         let session_id = SessionID::from_signing_pubkey(&signing_key.verification_key());
-        let record = LogRecord::new_at_timestamp(
+        let record = SignedLogEntry::new_at_timestamp(
             session_id,
-            LogMessage::Init(Box::new(InitLogMessage::OIAttestationUnsigned {
+            LogMessage::Init(Box::new(InitLogMessage::OIAttestation {
                 attestation: NitroAttestation::new(vec![1, 2, 3]),
                 signing_public_key: signing_key.verification_key(),
             })),
@@ -1054,7 +1063,7 @@ mod tests {
 
     async fn assert_log_read_rejects_relocation(relocated_key: &str) {
         let signing_key = GuardianSignKeyPair::from([13u8; 32]);
-        let record = LogRecord::new_at_timestamp(
+        let record = SignedLogEntry::new_at_timestamp(
             "session".into(),
             LogMessage::Heartbeat(HeartbeatLogMessage::new(42)),
             &signing_key,
@@ -1094,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn signed_log_rejects_cross_prefix_relocation() {
         assert_log_read_rejects_relocation(
-            "withdraw/2023/11/14/22/session-00000000000000000042.json",
+            "withdraw/2023/11/14/22/00000000000000000042-widabc.json",
         )
         .await;
     }

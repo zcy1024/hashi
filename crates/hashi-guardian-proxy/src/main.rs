@@ -3,15 +3,23 @@
 
 use anyhow::Context;
 use anyhow::Result;
-use hashi_guardian_proxy::cache::CachingGuardianGrpc;
 use hashi_guardian_proxy::config::Config;
 use hashi_guardian_proxy::forward::Forwarding;
-use hashi_guardian_proxy::info;
+use hashi_guardian_proxy::kp::relay::Relay;
+use hashi_guardian_proxy::kp::roster::RosterCache;
+use hashi_guardian_proxy::log_store::S3LogStore;
 use hashi_guardian_proxy::metrics::ProxyMetrics;
-use hashi_guardian_proxy::relay::Relay;
+use hashi_guardian_proxy::node::cache::CachingGuardianGrpc;
+use hashi_guardian_proxy::node::handoffs::HandoffGate;
+use hashi_guardian_proxy::node::member_auth::MemberGate;
+use hashi_guardian_proxy::node::members::ChainSource;
+use hashi_guardian_proxy::node::members::MemberAllowlist;
+use hashi_guardian_proxy::node::widlog::WidLogIndex;
+use hashi_guardian_proxy::public::info;
 use hashi_guardian_proxy::remote_write;
-use hashi_guardian_proxy::roster::RosterCache;
-use hashi_guardian_proxy::widlog::S3LogStore;
+use hashi_guardian_proxy::tls;
+use hashi_guardian_proxy::tls::ServerCert;
+use hashi_types::guardian::time::now_timestamp_secs;
 use hashi_types::proto::guardian_relay_service_server::GuardianRelayServiceServer;
 use hashi_types::proto::guardian_service_client::GuardianServiceClient;
 use hashi_types::proto::guardian_service_server::GuardianServiceServer;
@@ -39,12 +47,13 @@ async fn main() -> Result<()> {
         listen = %config.listen_addr,
         log_bucket = %config.log_bucket,
         network = %config.btc_network,
+        sui_rpc = %config.sui_rpc_url,
         "Starting hashi-guardian-proxy (wid-keyed cache + node forwarder + provisioning relay)."
     );
 
-    // The wid cache's durable tier and the relay's roster source. Prove bucket
-    // access before serving: a proxy that can't read the log fails every retry
-    // closed.
+    // The source of the wid index and the roster source of the relay. Test
+    // bucket access first. A proxy that cannot read the log fails each
+    // withdrawal closed.
     let log_store = S3LogStore::connect(config.log_bucket.clone(), config.log_region.clone()).await;
     probe_with_retries(&log_store).await?;
 
@@ -74,6 +83,22 @@ async fn main() -> Result<()> {
         None => channel.clone(),
     };
 
+    // The member gate's allowlist follows the committee of the Hashi object the
+    // active guardian serves.
+    let allowlist = Arc::new(MemberAllowlist::new(metrics.clone()));
+    tokio::spawn(
+        allowlist
+            .clone()
+            .refresh_forever(ChainSource::new(channel.clone(), &config.sui_rpc_url)?),
+    );
+    let gate = Arc::new(MemberGate::new(allowlist, metrics.clone()));
+    // Its own Sui connection: lookups are request-driven, and on a shared one
+    // they could crowd out the allowlist refresh.
+    let handoffs = Arc::new(HandoffGate::new(
+        ChainSource::new(channel.clone(), &config.sui_rpc_url)?,
+        metrics.clone(),
+    ));
+
     // One roster cache, shared: the relay authorizes submissions against it and
     // a cert rotation through the forwarder invalidates it.
     let roster = Arc::new(RosterCache::new(log_store.clone()));
@@ -82,12 +107,24 @@ async fn main() -> Result<()> {
         GuardianServiceClient::new(channel.clone()),
         config.info_cache_ttl,
     );
+    // Fill the wid index before the listeners open, so a miss is definite
+    // from the first request. The tail keeps it current.
+    let widlog = Arc::new(WidLogIndex::new(
+        log_store,
+        metrics.clone(),
+        now_timestamp_secs(),
+    ));
+    widlog
+        .tick(now_timestamp_secs())
+        .await
+        .context("backfill the wid index")?;
+    info!("Wid index backfilled.");
+    tokio::spawn(widlog.clone().tail_forever());
     // KPs confirm a ceremony to the guardian they are provisioning, so that
     // RPC follows the relay's backend.
     let guardian_svc = CachingGuardianGrpc::new(
-        Forwarding::new(channel, relay_channel, roster),
-        log_store,
-        config.btc_network,
+        Forwarding::new(channel, relay_channel, roster, handoffs),
+        widlog,
         metrics.clone(),
     );
 
@@ -106,14 +143,38 @@ async fn main() -> Result<()> {
         .set_service_status("", tonic_health::ServingStatus::Serving)
         .await;
 
-    // Serve gRPC (forwarder + relay + health) and the HTTP `/info` + `/health` on
-    // ONE port: each tonic service is mounted as an axum route-service, the plain
-    // routes merged in, one `axum::serve`. Mirrors crates/hashi/src/grpc/mod.rs.
-    let router = axum::Router::new()
-        .add_grpc_service(health_service)
-        .add_grpc_service(GuardianServiceServer::new(guardian_svc))
-        .add_grpc_service(GuardianRelayServiceServer::new(relay_svc))
-        .merge(info::router(info_state));
+    let router =
+        hashi_guardian_proxy::router(guardian_svc, relay_svc, health_service, info_state, gate);
+
+    let node_server = match config.node_tls.clone() {
+        Some(source) => {
+            let cert = ServerCert::load(&source, &metrics)
+                .await
+                .context("load the TLS certificate")?;
+            tokio::spawn(cert.clone().reload_forever(source, metrics.clone()));
+            // As the node's server does: pings find the connections a TCP load
+            // balancer dropped silently, and the age limit closes ones that never
+            // send a request, which nothing else times out.
+            let server = sui_http::Builder::new()
+                .config(
+                    sui_http::Config::default()
+                        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+                        .max_connection_age(Duration::from_secs(120))
+                        .max_connection_age_grace(Duration::from_secs(120)),
+                )
+                .tls_config(tls::server_config(cert)?)
+                .serve(config.node_listen_addr, router.clone())
+                .map_err(|e| {
+                    anyhow::anyhow!("bind node listener to {}: {e}", config.node_listen_addr)
+                })?;
+            info!("Node listener on {} (TLS).", config.node_listen_addr);
+            Some(server)
+        }
+        None => {
+            warn!("No TLS certificate is configured, so there is no node listener.");
+            None
+        }
+    };
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
@@ -122,47 +183,21 @@ async fn main() -> Result<()> {
         "Proxy listening on {} (gRPC + HTTP /info + /health).",
         config.listen_addr
     );
-    // If the accept loop dies, return so the supervisor restarts a clean task
+    // If either listener stops, exit so the supervisor restarts a clean task
     // rather than leaving the surface silently dead.
-    axum::serve(listener, router)
-        .await
-        .map_err(|e| anyhow::anyhow!("proxy server error: {e}"))?;
-    Ok(())
-}
-
-/// Mount a tonic gRPC service as an axum route-service at `/{ServiceName}/*`, so
-/// gRPC and plain-HTTP routes share one router. Mirrors `crates/hashi/src/grpc/mod.rs`.
-trait RouterExt {
-    fn add_grpc_service<S>(self, svc: S) -> Self
-    where
-        S: tower::Service<
-                axum::extract::Request,
-                Response: axum::response::IntoResponse,
-                Error = std::convert::Infallible,
-            > + tonic::server::NamedService
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        S::Future: Send + 'static;
-}
-
-impl RouterExt for axum::Router {
-    fn add_grpc_service<S>(self, svc: S) -> Self
-    where
-        S: tower::Service<
-                axum::extract::Request,
-                Response: axum::response::IntoResponse,
-                Error = std::convert::Infallible,
-            > + tonic::server::NamedService
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        S::Future: Send + 'static,
-    {
-        self.route_service(&format!("/{}/{{*rest}}", S::NAME), svc)
+    let node_stopped = async {
+        match &node_server {
+            Some(server) => server.wait_for_shutdown().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        served = axum::serve(listener, router) => {
+            served.map_err(|e| anyhow::anyhow!("proxy server error: {e}"))?;
+        }
+        () = node_stopped => {}
     }
+    anyhow::bail!("proxy server stopped")
 }
 
 fn lazy_channel(url: &str, config: &Config) -> Result<tonic::transport::Channel> {
@@ -189,10 +224,8 @@ async fn probe_with_retries(log_store: &S3LogStore) -> Result<()> {
     unreachable!("loop returns on success or final error")
 }
 
-/// Make any panic abort the process instead of unwinding. The wid-keyed cache
-/// uses a std `Mutex` whose `.expect("cache mutex poisoned")` assumes a
-/// poisoned lock is unreachable — true only if a panic aborts rather than
-/// unwinds past the lock guard. (Same rationale as the enclave's `main`.)
+/// Make each panic abort the process. The `.expect("wid index mutex poisoned")`
+/// in the wid index assumes that no panic unwinds past the lock guard.
 fn abort_on_panic() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

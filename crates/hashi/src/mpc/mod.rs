@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod mpc_except_signing;
+mod presig_seal;
 pub mod rpc;
 pub mod service;
 pub mod signing;
@@ -11,5 +12,6 @@ pub use mpc_except_signing::*;
 pub use service::MpcHandle;
 pub use service::MpcService;
 pub use signing::IdentityInputs;
+pub use signing::RefillRequest;
 pub use signing::SignInput;
 pub use signing::SigningManager;

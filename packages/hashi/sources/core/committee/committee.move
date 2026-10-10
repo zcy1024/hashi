@@ -7,10 +7,9 @@
 /// time. `verify_certificate` checks an aggregate BLS12-381 min-pk signature
 /// against a signers bitmap, enforces the stake threshold, and wraps the
 /// payload in a `CertifiedMessage` as proof of committee approval.
-#[allow(unused_const)]
 module hashi::committee;
 
-use hashi::config::Config;
+use hashi::config::{Self, Config};
 use sui::{
     bcs,
     bls12381::{Self, bls12381_min_pk_verify, UncompressedG1},
@@ -36,6 +35,12 @@ public struct CommitteeMember has copy, drop, store {
     public_key: Element<UncompressedG1>,
     encryption_public_key: vector<u8>,
     weight: u64,
+    /// Open-ended per-member extension slot; lets a future upgrade pin new
+    /// per-epoch member data (e.g. a key registered through
+    /// `MemberInfo.extra_fields`) onto the committee without a
+    /// `CommitteeV2` migration once the layout freezes at mainnet. Always
+    /// empty today: committee formation copies nothing into it.
+    extra_fields: Config,
 }
 
 /// This represents a BLS signing committee for a given epoch.
@@ -64,9 +69,14 @@ public struct CertifiedMessage<T> has copy, drop, store {
     stake_support: u64,
 }
 
-// ~~~~~~~ Public Functions ~~~~~~~
+// ~~~~~~~ Entry Functions ~~~~~~~
 
-public fun new_committee_signature(
+/// Build a `CommitteeSignature` inside a PTB: a struct cannot be a pure
+/// transaction input, so certificates reach the entry functions as the
+/// result of this call. Private `entry` rather than `public` so the
+/// signature stays upgradeable; the result has `drop` and `store` and is
+/// therefore never a hot argument to the entry function that consumes it.
+entry fun new_committee_signature(
     epoch: u64,
     signature: vector<u8>,
     signers_bitmap: vector<u8>,
@@ -117,6 +127,7 @@ public(package) fun new_committee_member(
         public_key,
         encryption_public_key,
         weight,
+        extra_fields: config::empty(),
     }
 }
 
@@ -173,24 +184,6 @@ public(package) fun to_vec_map(self: &Committee): VecMap<address, u64> {
     result
 }
 
-#[allow(unused_function)]
-public(package) fun verify_proposal(
-    self: &Committee,
-    signers: sui::vec_set::VecSet<address>,
-    threshold: u64,
-): u64 {
-    // Compute the total signed weight
-    let mut aggregate_weight = 0;
-    signers.keys().do_ref!(|validator_address| {
-        aggregate_weight = aggregate_weight + self.get_member_weight(validator_address);
-    });
-
-    // Check if the aggregate weight is enough to satisfy the required weight.
-    assert!(aggregate_weight >= threshold, ENotEnoughStake);
-
-    aggregate_weight
-}
-
 /// Verify an aggregate BLS signature is a certificate in the epoch, and return
 /// the total stake of the signers.
 /// The `signers_bitmap` is a bitmap of the indices of the signers in the committee.
@@ -201,7 +194,7 @@ public(package) fun verify_certificate<T>(
     intent: u16,
     message: T,
     signature: CommitteeSignature,
-    threshold: u64, //XXX threshold could be lookedup by type in the config
+    threshold: u64,
 ): CertifiedMessage<T> {
     assert!(signature.epoch == self.epoch());
 

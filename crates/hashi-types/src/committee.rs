@@ -1,6 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+mod runtime;
+pub(crate) use runtime::ActivationCommitteeRepr;
+pub use runtime::RuntimeCommittee;
+pub use runtime::fallback_encryption_public_key;
+
 use std::collections::HashMap;
 use std::fmt;
 
@@ -739,6 +744,10 @@ impl<'a, T: IntentMessage + Clone> BlsSignatureAggregator<'a, T, ReducedWeight<'
 }
 
 impl<'a, T: IntentMessage + Clone, W: WeightDomain> BlsSignatureAggregator<'a, T, W> {
+    pub fn epoch(&self) -> u64 {
+        self.committee.epoch
+    }
+
     /// Add a signature to this aggregator.
     ///
     /// Returns an error if:

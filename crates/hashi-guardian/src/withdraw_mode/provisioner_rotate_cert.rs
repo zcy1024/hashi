@@ -5,8 +5,6 @@
 //! verifies that the caller submitted its currently committed share, then
 //! appends a complete `kp-shares/` snapshot with only that share re-encrypted.
 
-use std::sync::Arc;
-
 use crate::Enclave;
 use hashi_types::guardian::crypto::decrypt_share;
 use hashi_types::guardian::crypto::encrypt_share_for_provisioner;
@@ -22,7 +20,7 @@ use hashi_types::guardian::SessionBoundRequest;
 use tracing::info;
 
 pub async fn provisioner_rotate_cert(
-    enclave: Arc<Enclave>,
+    enclave: &mut Enclave,
     signed_request: KpSigned<ProvisionerRotateCertRequest>,
 ) -> GuardianResult<GuardianSignedResponse<ProvisionerRotateCertResponse>> {
     info!("/provisioner_rotate_cert - Received request.");
@@ -34,16 +32,16 @@ pub async fn provisioner_rotate_cert(
         .verify_into_data()
         .map_err(|error| Unauthenticated(error.to_string()))?;
 
-    let live_session_id = enclave.s3_session_id();
+    let live_session_id = enclave.config.s3_session_id();
     request.validate_session(&live_session_id)?;
 
-    let mut reader = enclave.new_guardian_reader()?;
+    let mut reader = enclave.config.new_guardian_reader()?;
     let latest_state = reader.read_latest_ceremony_state().await?;
-    apply_cert_rotation(&enclave, signer_fingerprint, request, latest_state).await
+    apply_cert_rotation(enclave, signer_fingerprint, request, latest_state).await
 }
 
 async fn apply_cert_rotation(
-    enclave: &Enclave,
+    enclave: &mut Enclave,
     signer_fingerprint: String,
     request: ProvisionerRotateCertRequest,
     latest_state: CeremonyState,
@@ -80,7 +78,11 @@ async fn apply_cert_rotation(
 
     // The KP signature binds the ciphertext and the rest of this request to the
     // current session and cert sequence, so no additional HPKE AAD is needed.
-    let share = decrypt_share(&encrypted_share, enclave.encryption_secret_key(), None)?;
+    let share = decrypt_share(
+        &encrypted_share,
+        enclave.config.encryption_secret_key(),
+        None,
+    )?;
     latest_instance.commitments().verify_share(&share)?;
 
     let replacement_ciphertext = encrypt_share_for_provisioner(&share, &new_kp_pgp_cert);
@@ -116,7 +118,8 @@ mod tests {
     use crate::test_utils::mock_kp_certs_roster_with_secrets;
     use crate::test_utils::mock_logger_capturing;
     use crate::OperatorInitTestArgs;
-    use hashi_types::bitcoin::create_btc_keypair_for_test;
+    use hashi_types::bitcoin::BitcoinKeypair;
+    use hashi_types::bitcoin::BTC_LIB;
     use hashi_types::guardian::crypto::k256_sk_to_btc_xonly_pubkey;
     use hashi_types::guardian::crypto::split_and_encrypt_for_kps;
     use hashi_types::guardian::test_utils::mock_attested_kp_keypair;
@@ -125,11 +128,11 @@ mod tests {
     use hashi_types::guardian::GuardianEncryptedShare;
     use hashi_types::guardian::GuardianError::LifecycleMismatch;
     use hashi_types::guardian::LogMessageV1;
-    use hashi_types::guardian::LogRecord;
     use hashi_types::guardian::SecretSharingInstance;
     use hashi_types::guardian::SecretSharingParams;
     use hashi_types::guardian::Share;
     use hashi_types::guardian::ShareCommitments;
+    use hashi_types::guardian::SignedLogEntry;
     use hashi_types::guardian::VersionedLogMessage;
     use hashi_types::pgp::test_utils::sign_detached_in_process;
     use k256::SecretKey;
@@ -140,18 +143,18 @@ mod tests {
     const INITIAL_CERT_SEQ: u64 = 7;
 
     fn signed_rotate_request(
-        enclave: &Arc<Enclave>,
+        enclave: &Enclave,
         new_cert: AttestedKpCert,
         share: &Share,
         signer_cert: &AttestedKpCert,
         signer_secret: &str,
     ) -> KpSigned<ProvisionerRotateCertRequest> {
         let request = ProvisionerRotateCertRequest::new(
-            enclave.s3_session_id(),
+            enclave.config.s3_session_id(),
             INITIAL_CERT_SEQ,
             new_cert,
             share,
-            enclave.encryption_public_key(),
+            enclave.config.encryption_public_key(),
             &mut rand::thread_rng(),
         );
         let signature = sign_detached_in_process(signer_secret, &KpSigned::signed_bytes(&request));
@@ -159,7 +162,7 @@ mod tests {
     }
 
     async fn initialized_rotation_context() -> (
-        Arc<Enclave>,
+        Enclave,
         Vec<Share>,
         CeremonyState,
         crate::test_utils::MockKpSecretKeys,
@@ -182,15 +185,17 @@ mod tests {
         };
 
         let (logger, captures) = mock_logger_capturing();
-        let enclave = Enclave::create_operator_initialized_with(OperatorInitTestArgs {
+        let mut enclave = Enclave::create_operator_initialized_with(OperatorInitTestArgs {
             s3_logger: logger,
             ceremony_state: ceremony_state.clone(),
             ..Default::default()
-        })
-        .await;
+        });
         enclave
             .config
-            .set_btc_keypair(create_btc_keypair_for_test(&[8u8; 32]))
+            .set_btc_keypair(
+                BitcoinKeypair::from_seckey_slice(&BTC_LIB, &[8u8; 32])
+                    .expect("valid test secret key"),
+            )
             .unwrap();
 
         (
@@ -205,12 +210,19 @@ mod tests {
 
     #[tokio::test]
     async fn rotates_only_authenticated_signers_share_and_rejects_another_share() {
-        let (enclave, shares, ceremony_state, mut secret_keys, captures, cert_roster) =
+        let (mut enclave, shares, ceremony_state, mut secret_keys, captures, cert_roster) =
             initialized_rotation_context().await;
         let old_encrypted_shares = ceremony_state.encrypted_shares.clone();
         let original_commitments = ceremony_state.secret_sharing_instance.commitments().clone();
         let btc_master_pubkey = ceremony_state.btc_master_pubkey;
-        let signer_cert = cert_roster.cert_for_share(shares[0].id).unwrap();
+        let recipient = &old_encrypted_shares
+            .iter()
+            .find(|entry| entry.id == shares[0].id)
+            .unwrap()
+            .recipient_fingerprint;
+        let signer_cert = cert_roster
+            .cert_for_fingerprint(&recipient.parse().unwrap())
+            .unwrap();
         let signer_fingerprint = signer_cert.fingerprint().to_hex();
         let signer_secret = secret_keys.get(&signer_fingerprint).unwrap();
         let (new_cert, new_secret) = mock_attested_kp_keypair();
@@ -228,7 +240,7 @@ mod tests {
             .verify_into_data()
             .expect("old certificate should authenticate the request");
         let error = apply_cert_rotation(
-            &enclave,
+            &mut enclave,
             wrong_signer_fingerprint,
             wrong_share_request,
             ceremony_state.clone(),
@@ -244,12 +256,16 @@ mod tests {
         let request = signed_request
             .verify_into_data()
             .expect("old certificate should authenticate the request");
-        let signed_response =
-            apply_cert_rotation(&enclave, authenticated_fingerprint, request, ceremony_state)
-                .await
-                .expect("the committed recipient should rotate its sole certificate");
+        let signed_response = apply_cert_rotation(
+            &mut enclave,
+            authenticated_fingerprint,
+            request,
+            ceremony_state,
+        )
+        .await
+        .expect("the committed recipient should rotate its sole certificate");
         let response = signed_response
-            .verify_into_data(&enclave.signing_pubkey())
+            .verify_into_data(&enclave.config.signing_pubkey())
             .expect("rotation response should be signed by the enclave")
             .response;
 
@@ -266,11 +282,13 @@ mod tests {
 
         let captured = captures.lock().unwrap();
         assert_eq!(captured.len(), 1);
-        assert!(captured[0]
-            .0
-            .starts_with("kp-shares/00000000000000000000/00000000000000000008-"));
-        let record: LogRecord = serde_json::from_slice(&captured[0].1).unwrap();
-        let VersionedLogMessage::V1(LogMessageV1::KpShareState(persisted)) = record.message()
+        assert_eq!(
+            captured[0].0,
+            "kp-shares/00000000000000000000/00000000000000000008.json"
+        );
+        let record: SignedLogEntry = serde_json::from_slice(&captured[0].1).unwrap();
+        let VersionedLogMessage::V1(LogMessageV1::KpShareState(persisted)) =
+            record.message_unchecked()
         else {
             panic!("certificate rotation should persist a V1 KP-share snapshot");
         };
@@ -304,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_lifecycle_before_verifying_signature() {
-        let enclave = Enclave::create_with_random_keys();
+        let mut enclave = Enclave::create_with_random_keys();
         let request = ProvisionerRotateCertRequest::from_encrypted_share_for_testing(
             "mock-session".into(),
             0,
@@ -323,7 +341,7 @@ mod tests {
             "invalid signature".into(),
         );
 
-        let err = provisioner_rotate_cert(enclave, signed_request)
+        let err = provisioner_rotate_cert(&mut enclave, signed_request)
             .await
             .expect_err("wrong lifecycle should be rejected first");
 

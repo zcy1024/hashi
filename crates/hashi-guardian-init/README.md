@@ -61,7 +61,8 @@ commands both verify that proposal. Once every KP confirms, the guardian
 publishes the finalized `kp-shares/` recovery state and `ceremony/` audit log.
 
 Drives a fresh **ceremony-mode** guardian through the one-time genesis BTC key
-setup (`sharing_seq = 0`). It connects over gRPC and: `operator_init` (ceremony mode, shared deployment configuration) →
+setup (`sharing_seq = 0` in an empty deployment; interrupted attempts are skipped).
+Setup rejects an existing completed ceremony; use KP-set rotation for an established key. It connects over gRPC and: `operator_init` (ceremony mode, shared deployment configuration) →
 `setup_new_key` → verifies the response signature and shape → confirms each
 share's recipient matches its expected KP cert and its PGP-encrypted ciphertext
 targets that cert (parsed without decrypting) →
@@ -75,8 +76,9 @@ Bitcoin network, and PCR allowlist. The enclave checks its own attestation again
 
 `kp_roster.kp_pgp_cert_paths` lists one certificate per KP, in any order.
 New ceremonies assign share IDs by fingerprint order; existing assignments
-come from signed `kp-shares/` state. Each ciphertext targets its recipient's
-attested DEC key, with the primary-key fingerprint identifying the KP.
+come from signed `kp-shares/` state. Each ciphertext must contain exactly one
+OpenPGP recipient matching its KP's attested DEC key. The primary key must be
+the attested SIG key, so its fingerprint identifies both the KP and its signing key.
 
 ```bash
 cargo run -p hashi-guardian-init -- operator ceremony --config guardian-init.sample.yaml
@@ -138,11 +140,9 @@ It:
 2. Reads the latest attested ceremony from S3 and verifies its encrypted-share
    recipients against the expected KP roster and its Bitcoin network against
    the configured network.
-3. Fetches on-chain MPC master `G`, and reads the latest `committee-update/` or
-   `genesis/` record if one already exists.
-4. Builds the withdraw-mode `InitConfig` from limiter config, on-chain MPC
-   master `G`, the KP PCR allowlist, S3 bucket and retention policy, and
-   configured Bitcoin network.
+3. Reads the latest `committee-update/` or `genesis/` record if one already exists.
+4. Builds the withdraw-mode `InitConfig` from limiter config and the shared
+   deployment policy.
 5. Requires the observed serving-committee state to agree with the
    `--do-genesis` intent marker. On first deploy, the flag causes it to build an
    optional `GenesisState` from the current on-chain committee, configured Hashi
@@ -150,7 +150,9 @@ It:
    exist.
 6. Calls withdraw-mode `OperatorInit` with guardian S3 config, `InitConfig`, and
    the optional genesis state; the enclave pins all three inputs plus the latest
-   complete ceremony and KP-share state.
+   complete ceremony and KP-share state. The enclave obtains the immutable Hashi
+   object id and MPC master `G` from verified genesis, or from the supplied genesis
+   state on first deploy. Only `--do-genesis` consults on-chain state.
 7. Verifies the live and S3-logged `GuardianInfo` match the installed ceremony
    instance and stable config.
 8. Prints the config and optional genesis hashes that key provisioners must
@@ -169,6 +171,11 @@ Config: see [`guardian-init.sample.yaml`](guardian-init.sample.yaml). This
 command uses `guardian_endpoint`, `deployment`, `hashi`,
 `kp_roster`, and `limiter_config`.
 
+Lowering `max_bucket_capacity` can strand a committed batch and stop all
+withdrawals. Pause the bridge first, then keep the new cap at or above the
+outflow of every batch `hashi withdraw list` shows as Committed. Unpause once
+every node's `hashi_guardian_limiter_max_capacity` shows the new cap.
+
 ## key-provisioner provision
 
 A one-shot flow run by a key provisioner for a new guardian instance, either on
@@ -181,13 +188,13 @@ re-encrypt it. It:
    (attestation-anchored), pinning the standby session.
 2. Fetches the same session's signed `GuardianInfo` from S3 and requires it to
    match the endpoint response, then checks the enclave's config against expected
-   values — S3 bucket, limiter config, `mpc_master_g`, and that the guardian is
+   values — deployment policy, limiter config, and that the guardian is
    not already provisioner-initialized or activated.
 3. Scrapes the authoritative `ceremony/` log for the secret-sharing instance
    (commitments + N + T + sharing_seq) the new guardian was booted with, and
    confirms it matches.
-4. Recomputes the stable `InitConfig` from limiter config, on-chain MPC master
-   `G`, PCR allowlist, S3 bucket and retention policy, and network, then confirms
+4. Recomputes the stable `InitConfig` from limiter config and deployment policy,
+   then confirms
    its `config_hash` matches the enclave.
 5. Requires the observed serving-committee state to agree with the
    `--do-genesis` intent marker. With the flag, independently derives the
@@ -217,7 +224,7 @@ marker; the signed optional genesis hash remains the authorization.
 See [`guardian-init.sample.yaml`](guardian-init.sample.yaml) for the unified
 config. This command uses `kp_pgp_cert_path`, `relay_endpoint`, `hashi`,
 `kp_roster`, and `limiter_config`. The MPC committee verifying key `G` is fetched
-from on-chain Hashi state.
+from on-chain Hashi state only with `--do-genesis`.
 
 ## key-provisioner rotate-cert
 
@@ -289,10 +296,11 @@ to compare against their own. Each current KP then runs
 pinned session, each signer's share assignment, one submission per share,
 agreement with this config's `new_kp_roster` and complete deployment configuration, the dealt
 set's threshold), calls `RotateKpSet` in one batch, verifies the guardian-
-signed response (`sharing_seq + 1`, every share encrypted to the new certs)
+signed response (a greater enclave-selected `sharing_seq`, every share encrypted to the new certs)
 and its session-scoped `kp-shares/proposed/` record, then waits for every new
 KP's `key-provisioner ceremony` confirmation. The enclave publishes finalized
-`kp-shares/{seq+1}/` and `ceremony/{seq+1}` records and completes only once
+`kp-shares/{new_sharing_seq:020}/00000000000000000000.json` and
+`ceremony/{new_sharing_seq:020}.json` records and completes only once
 all `n` new KPs have confirmed, and the wait has no timeout. Interrupting it
 is safe once the batch was accepted: `wait` reads the pinned guardian's own
 proposal, verifies it against `new_kp_roster` and resumes the wait, while
@@ -350,10 +358,10 @@ the old key). Any `t` of the remaining KPs replace the whole set instead:
 2. Agree on the new set: `n`, `t` and one cert per KP (a fresh YubiKey for the
    affected KP, or a different person). It goes in `new_kp_roster`;
    `kp_roster` stays the dealt set. Steps 3 to 6 verify against the ceremony
-   EIF: `current_build` is its PCR0 under the `<sha>-ceremony` revision a
-   ceremony enclave reports (its own allowlist entry beside the same-commit
-   withdraw build), with the build that dealt the current shares in
-   `prev_builds`. The operator and every KP render from one config.
+   session: `current_build` is the approved revision label/PCR pair, with
+   older builds that dealt the current shares in `prev_builds`. Ceremony and
+   withdraw sessions use the same EIF. The operator and every KP render from
+   one config.
 3. Operator: bring up a fresh ceremony-mode guardian on the standby slot,
    against the same bucket, then `operator rotate-kp-set init`.
 4. Any `t` current KPs: `key-provisioner rotate-kp-set`, each sending the
@@ -362,11 +370,8 @@ the old key). Any `t` of the remaining KPs replace the whole set instead:
    new KPs (`wait` resumes if interrupted).
 6. Every new KP: `key-provisioner ceremony`, with `kp_roster` set to the new
    set.
-7. The withdraw EIF has a different PCR0 at the same commit, so re-render:
-   `current_build` becomes the withdraw EIF (revision `<sha>`) and the
-   ceremony EIF (`<sha>-ceremony`), which wrote the logs everyone reads, moves
-   to `prev_builds`. Then replace the standby slot with a withdraw-mode
-   guardian: `operator provision` (no `--do-genesis`) and
+7. Replace the standby slot with a fresh guardian using the same EIF and build
+   mapping. `operator provision` selects withdraw mode (no `--do-genesis`), and
    `key-provisioner provision` by the new KPs run while the old guardian still
    serves. Switch traffic to the new guardian first, while that can still be
    undone: the proxy keeps serving already-signed withdrawals from its cache,
@@ -413,8 +418,8 @@ cargo run -p hashi-guardian-init -- operator activate --config guardian-init.sam
 ```
 
 Config: see [`guardian-init.sample.yaml`](guardian-init.sample.yaml). This
-command uses `guardian_endpoint`, `deployment`, `hashi`,
-`kp_roster`, and `limiter_config`.
+command uses `guardian_endpoint`, `deployment`,
+`kp_roster`, and `limiter_config`. Activation does not query Sui.
 
 ## tools
 

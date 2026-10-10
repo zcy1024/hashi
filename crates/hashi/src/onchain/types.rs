@@ -16,8 +16,8 @@ use sui_sdk_types::Address;
 use sui_sdk_types::TypeTag;
 
 use crate::grpc::Client;
-use hashi_types::committee::Committee;
 use hashi_types::committee::EncryptionPublicKey;
+use hashi_types::committee::RuntimeCommittee;
 use hashi_types::committee::SignedMessage;
 use hashi_types::guardian::CommitteeTransitionRequest;
 use hashi_types::move_types;
@@ -101,17 +101,11 @@ impl Tob {
     }
 }
 
-/// One mirrored `EpochCertsV1`/`StampedEpochCertsV1` bucket. The dealer
-/// submissions live in an on-chain `LinkedTable` whose insertion order
-/// is the TOB order, so the mirror keeps each node's links and walks
-/// them on read.
+/// One mirrored `EpochCertsV1` bucket. The dealer submissions live in
+/// an on-chain `LinkedTable` whose insertion order is the TOB order, so
+/// the mirror keeps each node's links and walks them on read.
 #[derive(Debug)]
 pub struct TobBucket {
-    /// The bucket's on-chain layout family (bare or stamped), fixed at
-    /// bucket creation. Nodes are stored uniformly in stamped form; a
-    /// bare bucket's submissions carry `timestamp_ms: 0`, which never
-    /// trips a nonce accumulation window's cutoff.
-    pub layout: super::TobCertLayout,
     /// UID of the bucket's `LinkedTable` — the parent of its dealer
     /// submission node Fields.
     pub certs_id: Address,
@@ -124,10 +118,9 @@ pub struct TobBucket {
     /// then look internally consistent while missing the tail — or the
     /// entire list.
     pub size: u64,
-    pub nodes: BTreeMap<
-        Address,
-        move_types::LinkedTableNode<Address, move_types::StampedDealerSubmissionV1>,
-    >,
+    pub nodes:
+        BTreeMap<Address, move_types::LinkedTableNode<Address, move_types::DealerSubmissionV1>>,
+    pub seal: Option<move_types::PresigSealV1>,
 }
 
 /// A mirror walk that did not cover the bucket's full on-chain census —
@@ -153,7 +146,7 @@ impl TobBucket {
     /// on-chain submission, and the replay brings the Field up to match.
     pub fn complete_certs_in_order(
         &self,
-    ) -> Result<Vec<(Address, &move_types::StampedDealerSubmissionV1)>, IncompleteTobWalk> {
+    ) -> Result<Vec<(Address, &move_types::DealerSubmissionV1)>, IncompleteTobWalk> {
         let certs = self.certs_in_order();
         if (certs.len() as u64) < self.size {
             return Err(IncompleteTobWalk {
@@ -168,7 +161,7 @@ impl TobBucket {
     /// the TOB guarantees. Bounded by the node count, so a link pointing
     /// at a missing node (a mirror gap) terminates the walk early rather
     /// than looping; callers get the longest consistent prefix.
-    pub fn certs_in_order(&self) -> Vec<(Address, &move_types::StampedDealerSubmissionV1)> {
+    pub fn certs_in_order(&self) -> Vec<(Address, &move_types::DealerSubmissionV1)> {
         let mut ordered = Vec::with_capacity(self.nodes.len());
         let mut current = self.head;
         while let Some(dealer) = current
@@ -203,7 +196,7 @@ pub struct CommitteeSet {
 
     /// Id of the `Bag` containing the committee's per epoch
     committees_id: Address,
-    committees: BTreeMap<u64, Committee>,
+    committees: BTreeMap<u64, RuntimeCommittee>,
     /// The verbatim on-chain committees, kept alongside the enriched
     /// view. Move's `submit_committee_handoff` verifies the handoff
     /// cert over a `CommitteeTransitionRequest` built from the stored
@@ -295,7 +288,7 @@ impl CommitteeSet {
         self.committees_id
     }
 
-    pub fn committees(&self) -> &BTreeMap<u64, Committee> {
+    pub fn committees(&self) -> &BTreeMap<u64, RuntimeCommittee> {
         &self.committees
     }
 
@@ -309,7 +302,8 @@ impl CommitteeSet {
         &mut self.committee_handoffs
     }
 
-    pub fn committees_mut(&mut self) -> &mut BTreeMap<u64, Committee> {
+    #[cfg(test)]
+    pub fn committees_mut(&mut self) -> &mut BTreeMap<u64, RuntimeCommittee> {
         &mut self.committees
     }
 
@@ -319,11 +313,18 @@ impl CommitteeSet {
         self.raw_committees.get(&epoch)
     }
 
-    pub fn raw_committees_mut(&mut self) -> &mut BTreeMap<u64, move_types::Committee> {
-        &mut self.raw_committees
+    pub fn insert_onchain_committee(&mut self, epoch: u64, committee: move_types::Committee) {
+        self.committees
+            .insert(epoch, super::convert_move_committee(committee.clone()));
+        self.raw_committees.insert(epoch, committee);
     }
 
-    pub fn current_committee(&self) -> Option<&Committee> {
+    pub fn remove_committee(&mut self, epoch: u64) {
+        self.committees.remove(&epoch);
+        self.raw_committees.remove(&epoch);
+    }
+
+    pub fn current_committee(&self) -> Option<&RuntimeCommittee> {
         self.committees().get(&self.epoch())
     }
 
@@ -339,7 +340,7 @@ impl CommitteeSet {
         self.pending_epoch_change
     }
 
-    pub fn previous_committee_for_target(&self, target: u64) -> Option<(u64, &Committee)> {
+    pub fn previous_committee_for_target(&self, target: u64) -> Option<(u64, &RuntimeCommittee)> {
         if self.pending_epoch_change().is_some() {
             let prev_ep = self.epoch();
             self.committees().get(&prev_ep).map(|c| (prev_ep, c))
@@ -498,26 +499,33 @@ impl CommitteeSet {
         self
     }
 
-    /// Install committees, deriving the raw view by round-tripping the
-    /// enriched one — exact when every member's encryption key is a
-    /// valid group element, which holds for the synthetic committees
-    /// tests build. The chain-fed paths (scrape and apply) install the
-    /// decoded on-chain committees via [`Self::set_raw_committees`] or
-    /// [`Self::raw_committees_mut`] instead of relying on this.
-    pub fn set_committees(&mut self, committees: BTreeMap<u64, Committee>) -> &mut Self {
+    /// Derives the raw view by re-encoding `committees` (see `raw_committees`).
+    #[cfg(test)]
+    pub fn set_committees(
+        &mut self,
+        committees: BTreeMap<u64, hashi_types::committee::Committee>,
+    ) -> &mut Self {
         self.raw_committees = committees
             .iter()
             .map(|(epoch, committee)| (*epoch, move_types::Committee::from(committee)))
             .collect();
-        self.committees = committees;
+        self.committees = committees
+            .into_iter()
+            .map(|(epoch, committee)| (epoch, committee.into()))
+            .collect();
         self
     }
 
-    pub fn set_raw_committees(
+    /// Install the decoded on-chain committees and derive the runtime views from them.
+    pub fn set_onchain_committees(
         &mut self,
-        raw_committees: BTreeMap<u64, move_types::Committee>,
+        committees: BTreeMap<u64, move_types::Committee>,
     ) -> &mut Self {
-        self.raw_committees = raw_committees;
+        self.committees = committees
+            .iter()
+            .map(|(epoch, committee)| (*epoch, super::convert_move_committee(committee.clone())))
+            .collect();
+        self.raw_committees = committees;
         self
     }
 
@@ -693,7 +701,6 @@ pub enum ProposalType {
     DisableVersion,
     Upgrade,
     EmergencyPause,
-    UpdateGuardian,
     IgnoreMember,
     Unknown(String),
 }
@@ -722,7 +729,6 @@ impl ProposalType {
             ProposalType::DisableVersion => "disable_version",
             ProposalType::Upgrade => "upgrade",
             ProposalType::EmergencyPause => "emergency_pause",
-            ProposalType::UpdateGuardian => "update_guardian",
             ProposalType::IgnoreMember => "ignore_member",
             ProposalType::Unknown(_) => "unknown",
         }
@@ -737,7 +743,6 @@ impl ProposalType {
             "disable_version",
             "upgrade",
             "emergency_pause",
-            "update_guardian",
             "ignore_member",
             "unknown",
         ]
@@ -752,7 +757,7 @@ pub struct Config {
 }
 
 // This constant mirrors the value in btc_config.move and must be kept in sync.
-const DUST_RELAY_MIN_VALUE: u64 = 546;
+pub(crate) const DUST_RELAY_MIN_VALUE: u64 = 546;
 
 pub use hashi_types::committee::DEFAULT_MPC_MAX_FAULTY_IN_BASIS_POINTS;
 pub use hashi_types::committee::DEFAULT_MPC_WEIGHT_REDUCTION_ALLOWED_DELTA;
@@ -824,6 +829,13 @@ impl Config {
 
     pub fn guardian_url(&self) -> Option<&str> {
         match self.config.get("guardian_url") {
+            Some(ConfigValue::String(v)) => Some(v.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn guardian_node_url(&self) -> Option<&str> {
+        match self.config.get("guardian_node_url") {
             Some(ConfigValue::String(v)) => Some(v.as_str()),
             _ => None,
         }
@@ -1053,6 +1065,7 @@ impl Coin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hashi_types::committee::Committee;
 
     fn config_with(entries: &[(&str, ConfigValue)]) -> Config {
         Config {

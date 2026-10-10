@@ -31,6 +31,7 @@ pub mod upgrade_flow;
 
 pub use bitcoin_node::BitcoinNodeBuilder;
 pub use bitcoin_node::BitcoinNodeHandle;
+use hashi::config::ComplaintResponsePolicy;
 pub use hashi_network::HashiNetwork;
 pub use hashi_network::HashiNetworkBuilder;
 pub use hashi_network::HashiNodeHandle;
@@ -123,8 +124,10 @@ impl TestNetworks {
 /// committee forms, so `build()` does not finalize it.
 #[derive(Clone)]
 pub struct ExternalGuardian {
-    /// Endpoint the hashi nodes reach the guardian at (typically its proxy).
+    /// The guardian's public endpoint (typically its proxy).
     pub url: String,
+    /// Endpoint the hashi nodes reach the guardian at.
+    pub node_url: String,
     /// The guardian's x-only BTC master pubkey, printed by `operator ceremony`.
     pub btc_pubkey: hashi_types::bitcoin::BitcoinPubkey,
 }
@@ -261,6 +264,11 @@ impl TestNetworksBuilder {
         self
     }
 
+    pub fn with_complaint_response_policy(mut self, policy: ComplaintResponsePolicy) -> Self {
+        self.hashi_builder = self.hashi_builder.with_complaint_response_policy(policy);
+        self
+    }
+
     pub fn with_full_voting_power(mut self) -> Self {
         self.hashi_builder = self.hashi_builder.with_full_voting_power();
         self
@@ -327,10 +335,12 @@ impl TestNetworksBuilder {
             Some(external) => {
                 let guardian_config = hashi::publish::GuardianConfig {
                     url: external.url.clone(),
+                    node_url: external.node_url.clone(),
                     btc_public_key: external.btc_pubkey.serialize().to_vec(),
                 };
                 tracing::info!(
                     endpoint = %external.url,
+                    node_endpoint = %external.node_url,
                     "using external guardian (dockerized replica); provisioner-init runs out-of-band"
                 );
                 (guardian_config, None)
@@ -338,9 +348,12 @@ impl TestNetworksBuilder {
             None => {
                 let harness =
                     guardian_harness::GuardianHarness::start(bitcoin::Network::Regtest).await?;
-                let guardian_btc_pubkey = harness.ensure_btc_pubkey()?;
+                let guardian_btc_pubkey = harness.ensure_btc_pubkey().await?;
                 let guardian_config = hashi::publish::GuardianConfig {
-                    url: harness.endpoint().to_string(),
+                    // The harness has no public endpoint, and an unroutable one
+                    // proves the nodes dial `node_url`.
+                    url: "http://guardian.invalid".to_string(),
+                    node_url: harness.endpoint().to_string(),
                     btc_public_key: guardian_btc_pubkey.serialize().to_vec(),
                 };
                 tracing::info!(
@@ -387,7 +400,7 @@ impl TestNetworksBuilder {
 
         tracing::info!("rpc url: {}", test_networks.sui_network().rpc_url);
 
-        // The launch tx writes guardian_url with no event; nodes booted
+        // The launch tx writes guardian_node_url with no event; nodes booted
         // pre-launch learn it from the object mirror applying the root
         // write. Gate BEFORE the override proposals so a broken mirror
         // path can't hide behind their config-refreshing writes.
@@ -849,7 +862,7 @@ mod tests {
     use fastcrypto_tbls::threshold_schnorr::Parameters;
     use fastcrypto_tbls::threshold_schnorr::S;
     use fastcrypto_tbls::threshold_schnorr::avss;
-    use fastcrypto_tbls::threshold_schnorr::batch_avss;
+    use fastcrypto_tbls::threshold_schnorr::batch_avss_avid;
     use fastcrypto_tbls::threshold_schnorr::presigning::Presignatures;
     use fastcrypto_tbls::types::ShareIndex;
 
@@ -862,6 +875,8 @@ mod tests {
     const DKG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
     const ROTATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(480);
     const SIGNING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const SEAL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    const MOCK_DEALER_SET_DIGEST: [u8; 32] = [7; 32];
 
     fn get_mpc_key(nodes: &[HashiNodeHandle]) -> G {
         nodes[0].hashi().mpc_handle().unwrap().public_key().unwrap()
@@ -983,15 +998,14 @@ mod tests {
         batch_size_per_weight: u16,
         params: Parameters,
     ) -> Presignatures {
-        let receiver_outputs: Vec<batch_avss::ReceiverOutput> = nonces_for_dealer
+        let receiver_outputs: Vec<batch_avss_avid::ReceiverOutput> = nonces_for_dealer
             .iter()
             .map(|dealer| {
-                let shares: Vec<batch_avss::ShareBatch> = share_ids
+                let shares: Vec<batch_avss_avid::ShareBatch> = share_ids
                     .iter()
                     .map(|&sid| {
                         let share_idx = u16::from(sid) as usize - 1;
-                        batch_avss::ShareBatch {
-                            index: sid,
+                        batch_avss_avid::ShareBatch {
                             batch: (0..batch_size_per_weight as usize)
                                 .map(|l| dealer.nonce_shares[l][share_idx])
                                 .collect(),
@@ -999,13 +1013,13 @@ mod tests {
                         }
                     })
                     .collect();
-                batch_avss::ReceiverOutput {
-                    my_shares: batch_avss::SharesForNode { shares },
+                batch_avss_avid::ReceiverOutput {
+                    my_shares: batch_avss_avid::SharesForNode { shares },
                     public_keys: dealer.public_keys.clone(),
                 }
             })
             .collect();
-        Presignatures::new(receiver_outputs, batch_size_per_weight, params, true).unwrap()
+        Presignatures::new(receiver_outputs, batch_size_per_weight, params).unwrap()
     }
 
     fn mock_shares(
@@ -1112,14 +1126,15 @@ mod tests {
                     .map(|&sid| shares_source[u16::from(sid) as usize - 1].clone())
                     .collect(),
             };
+            let params = Parameters {
+                t,
+                f: cfg.max_faulty as u16,
+            };
             let presignatures = mock_presignatures(
                 &nonces_for_dealer,
                 &info.share_ids,
                 batch_size_per_weight,
-                Parameters {
-                    t,
-                    f: cfg.max_faulty as u16,
-                },
+                params,
             );
             let committee = {
                 let mpc_mgr = node.hashi().mpc_manager().unwrap();
@@ -1127,15 +1142,16 @@ mod tests {
                 mgr.committee.clone()
             };
             let epoch = committee.epoch();
-            let (refill_tx, _) = tokio::sync::watch::channel(0u32);
+            let (refill_tx, _) = tokio::sync::watch::channel(hashi::mpc::RefillRequest::default());
             let signing_manager = hashi::mpc::SigningManager::new(
                 info.address,
                 committee,
-                t,
+                params,
                 key_shares,
                 vk,
                 share_owners.clone(),
                 presignatures,
+                MOCK_DEALER_SET_DIGEST,
                 0,
                 0,
                 hashi::constants::PRESIG_REFILL_DIVISOR,
@@ -1170,6 +1186,7 @@ mod tests {
                 message.to_vec(),
                 derivation_address,
             )],
+            None,
         )
         .await;
         per_input.pop().expect("one input requested")
@@ -1182,6 +1199,7 @@ mod tests {
         nodes: &[HashiNodeHandle],
         epoch: u64,
         inputs: &[SignInputSpec],
+        seals: Option<&std::collections::BTreeMap<u32, hashi_types::move_types::PresigSealV1>>,
     ) -> Vec<
         Vec<
             hashi::mpc::types::SigningResult<
@@ -1189,7 +1207,7 @@ mod tests {
             >,
         >,
     > {
-        let beacon_value = {
+        let message_delta = {
             let mut hasher = fastcrypto::hash::Blake2b256::default();
             for (signing_id, _, _, _) in inputs {
                 hasher.update(signing_id.as_bytes());
@@ -1210,34 +1228,57 @@ mod tests {
                     hashi::metrics::MPC_LABEL_SIGNING,
                 )
                 .with_max_owned_shares(signing_manager.max_owned_count());
-                let beacon = beacon_value;
                 let metrics = node.hashi().metrics.clone();
-                let requests: Vec<hashi::mpc::SignInput> = inputs
-                    .iter()
-                    .map(|(sid, pidx, msg, deriv)| hashi::mpc::SignInput {
-                        signing_id: *sid,
-                        message: msg.clone(),
-                        global_presig_index: *pidx,
-                        derivation_address: *deriv,
-                    })
-                    .collect();
+                let requests = || -> Vec<hashi::mpc::SignInput> {
+                    inputs
+                        .iter()
+                        .map(|(sid, pidx, msg, deriv)| hashi::mpc::SignInput {
+                            signing_id: *sid,
+                            message: msg.clone(),
+                            global_presig_index: *pidx,
+                            derivation_address: *deriv,
+                            message_delta,
+                        })
+                        .collect()
+                };
                 let order = order.clone();
                 async move {
-                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-                    signing_manager
-                        .sign(
-                            &p2p_channel,
-                            requests,
-                            &beacon,
-                            SIGNING_TIMEOUT,
-                            &metrics,
-                            tx,
-                        )
-                        .await;
-                    let mut by_id = std::collections::HashMap::new();
-                    while let Some((sid, res)) = rx.recv().await {
-                        by_id.insert(sid, res);
-                    }
+                    let seal_deadline = tokio::time::Instant::now() + SEAL_WAIT_TIMEOUT;
+                    let mut by_id = loop {
+                        let chain_seals;
+                        let seals = match seals {
+                            Some(seals) => seals,
+                            None => {
+                                chain_seals = node.hashi().onchain_state().presig_seals(epoch);
+                                &chain_seals
+                            }
+                        };
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                        signing_manager
+                            .sign(
+                                &p2p_channel,
+                                requests(),
+                                seals,
+                                SIGNING_TIMEOUT,
+                                &metrics,
+                                tx,
+                            )
+                            .await;
+                        let mut by_id = std::collections::HashMap::new();
+                        while let Some((sid, res)) = rx.recv().await {
+                            by_id.insert(sid, res);
+                        }
+                        let unsealed = by_id.values().any(|res| {
+                            matches!(
+                                res,
+                                Err(hashi::mpc::types::SigningError::PresigBatchNotSealed { .. })
+                            )
+                        });
+                        if !unsealed || tokio::time::Instant::now() >= seal_deadline {
+                            break by_id;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    };
                     order
                         .into_iter()
                         .map(|sid| {
@@ -1332,7 +1373,16 @@ mod tests {
                 )
             })
             .collect();
-        let per_input = sign_batch_on_all_nodes(nodes, epoch, &inputs).await;
+        let mock_seals = (!corrupt_node_indices.is_empty()).then(|| {
+            std::collections::BTreeMap::from([(
+                0,
+                hashi_types::move_types::PresigSealV1 {
+                    randomness: vec![9; 32],
+                    dealer_set_digest: MOCK_DEALER_SET_DIGEST.to_vec(),
+                },
+            )])
+        });
+        let per_input = sign_batch_on_all_nodes(nodes, epoch, &inputs, mock_seals.as_ref()).await;
         assert_eq!(per_input.len(), inputs.len());
         for input_results in per_input {
             assert_all_signatures_match(input_results);
@@ -2125,6 +2175,7 @@ mod tests {
             .await
             .expect("Node 0 should recover MPC key after restart");
         force_rotate_and_assert_key_agreement(&mut test_networks, epoch + 1).await;
+        crate::test_helpers::assert_no_member_refusals(&test_networks);
 
         Ok(())
     }
@@ -2175,12 +2226,118 @@ mod tests {
             .register_and_start_pending_node(client)
             .await?;
 
+        // The guardian proxy admits the committee, not every registered
+        // member: the new member only once the rotation seats it.
+        let sui = test_networks.sui_network.client.clone();
+        let hashi_object_id = test_networks.hashi_network().ids().hashi_object_id;
+        let proxy_allowlist =
+            || hashi_guardian_proxy::node::members::read_snapshot(sui.clone(), hashi_object_id);
+        assert_eq!(
+            proxy_allowlist().await?.members,
+            tls_keys(&test_networks.hashi_network().nodes()[..INITIAL_NODES])?
+        );
+        // The proxy forwards a committee handoff only once the chain stores
+        // it, which is when the rotation completes.
+        use hashi_guardian_proxy::node::handoffs::HandoffGate;
+        use hashi_guardian_proxy::node::members::ChainSource;
+        use hashi_types::proto;
+        let guardian = test_networks
+            .guardian_harness
+            .as_ref()
+            .context("no guardian harness")?
+            .endpoint()
+            .to_string();
+        let handoff_metrics =
+            std::sync::Arc::new(hashi_guardian_proxy::metrics::ProxyMetrics::new());
+        let handoff_gate = HandoffGate::new(
+            ChainSource::new(
+                tonic::transport::Endpoint::from_shared(guardian)?.connect_lazy(),
+                &test_networks.sui_network.rpc_url,
+            )?,
+            handoff_metrics.clone(),
+        );
+
         // Force epoch change → key rotation 19→20.
         test_networks.sui_network.force_close_epoch().await?;
+
+        // Mid-rotation the new member is only in the pending committee, which
+        // the proxy admits too.
+        let node = &test_networks.hashi_network().nodes()[0];
+        tokio::time::timeout(ROTATION_TIMEOUT, async {
+            while node
+                .hashi()
+                .onchain_state()
+                .pending_epoch_change()
+                .is_none()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .context("no reconfig started")?;
+        assert_eq!(
+            proxy_allowlist().await?.members,
+            tls_keys(test_networks.hashi_network().nodes())?
+        );
+        // A handoff out of the current epoch is not stored while the rotation
+        // is pending, so the proxy refuses it.
+        let early = proto::SignedCommitteeTransition {
+            data: Some(proto::CommitteeTransition {
+                new_committee: Some(proto::Committee {
+                    epoch: Some(initial_epoch + 1),
+                    ..Default::default()
+                }),
+            }),
+            committee_signature: Some(proto::CommitteeSignature {
+                epoch: Some(initial_epoch),
+                ..Default::default()
+            }),
+        };
+        handoff_gate.admit(&[early]).await.unwrap_err();
+        assert_eq!(
+            handoff_metrics
+                .handoff_refused
+                .with_label_values(&["not_on_chain"])
+                .get(),
+            1
+        );
+
         wait_for_rotation(test_networks.hashi_network().nodes(), initial_epoch + 1).await;
         assert_nodes_agree_on_mpc_key(test_networks.hashi_network().nodes()).await;
 
+        assert_eq!(
+            proxy_allowlist().await?.members,
+            tls_keys(test_networks.hashi_network().nodes())?
+        );
+        // The handoff a node pushes for the completed rotation is admitted.
+        let pushed = test_networks.hashi_network().nodes()[0]
+            .hashi()
+            .onchain_state()
+            .committee_handoff(initial_epoch)
+            .context("node 0 holds no handoff out of the initial epoch")?;
+        let pushed =
+            hashi_types::guardian::proto_conversions::signed_committee_transition_to_pb(&pushed);
+        handoff_gate
+            .admit(&[pushed])
+            .await
+            .map_err(|status| anyhow::anyhow!("the proxy refused a node's handoff: {status}"))?;
+        crate::test_helpers::assert_no_member_refusals(&test_networks);
+
         Ok(())
+    }
+
+    fn tls_keys(nodes: &[HashiNodeHandle]) -> Result<std::collections::HashSet<[u8; 32]>> {
+        nodes
+            .iter()
+            .map(|node| {
+                Ok(node
+                    .hashi()
+                    .config
+                    .tls_private_key()?
+                    .verifying_key()
+                    .to_bytes())
+            })
+            .collect()
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2239,6 +2396,7 @@ mod tests {
         test_networks.sui_network.force_close_epoch().await?;
         wait_for_rotation(test_networks.hashi_network().nodes(), initial_epoch + 2).await;
         assert_nodes_agree_on_mpc_key(test_networks.hashi_network().nodes()).await;
+        crate::test_helpers::assert_no_member_refusals(&test_networks);
 
         Ok(())
     }
@@ -2535,7 +2693,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_second_rotation_retrieves_missing_previous_rotation_message() -> Result<()> {
+    async fn test_second_rotation_after_losing_a_previous_rotation_message() -> Result<()> {
         const TEST_NUM_NODES: usize = 4;
 
         tracing_subscriber::fmt()
@@ -2585,7 +2743,6 @@ mod tests {
         }
 
         // Start node 0 and trigger a second rotation.
-        // prepare_previous_output should retrieve the missing messages from peers.
         test_networks.hashi_network_mut().nodes_mut()[0]
             .start()
             .await?;
@@ -2594,6 +2751,7 @@ mod tests {
             .await
             .expect("Node 0 should recover MPC key after restart");
         force_rotate_and_assert_key_agreement(&mut test_networks, epoch + 1).await;
+        crate::test_helpers::assert_no_member_refusals(&test_networks);
 
         Ok(())
     }
@@ -2813,6 +2971,137 @@ mod tests {
         Ok(())
     }
 
+    /// The victim receives corrupt shares from every other dealer, and every
+    /// peer starts with the default policy, so its complaints are verified but
+    /// withheld and it cannot finish the DKG. Two responders then allow-list
+    /// the corrupting dealers and restart; the third is left untouched with
+    /// the default policy, and the victim is restarted only if
+    /// `restart_victim`. Every node, restarted or not, must end up with the
+    /// key, with the victim's share recovered through the complaint flow.
+    ///
+    /// The victim is the last node because building the network waits for
+    /// node 0's key.
+    async fn run_complaint_recovery_after_allowlist_update(restart_victim: bool) -> Result<()> {
+        use hashi::config::AllowedDealer;
+
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            )
+            .try_init()
+            .ok();
+
+        const VICTIM: usize = 3;
+        const RESTARTED_RESPONDERS: [usize; 2] = [0, 1];
+        const UNTOUCHED_RESPONDER: usize = 2;
+        let withheld =
+            |node: &HashiNodeHandle| node.hashi().metrics.mpc_complaints_withheld_total.get();
+
+        let mut test_networks = fault_tolerant_builder()
+            .with_corrupt_shares_target(VICTIM)
+            .with_complaint_response_policy(ComplaintResponsePolicy::AllowList { dealers: vec![] })
+            .build()
+            .await?;
+
+        // 1. The victim's complaints reach its peers and are withheld.
+        let deadline = tokio::time::Instant::now() + DKG_TIMEOUT;
+        loop {
+            let nodes = test_networks.hashi_network().nodes();
+            if RESTARTED_RESPONDERS
+                .iter()
+                .all(|&i| withheld(&nodes[i]) > 0)
+            {
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "no withheld complaint observed on nodes {RESTARTED_RESPONDERS:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let nodes = test_networks.hashi_network().nodes();
+        assert!(
+            nodes[VICTIM].hashi().signing_verifying_key().is_none(),
+            "the victim must not get the key while its complaints are withheld"
+        );
+
+        // 2. Allow-list every corrupting dealer for the DKG epoch on the
+        //    restarted responders.
+        let epoch = nodes[RESTARTED_RESPONDERS[0]]
+            .hashi()
+            .mpc_manager()
+            .expect("responder has an MPC manager")
+            .read()
+            .unwrap()
+            .mpc_config
+            .epoch;
+        let dealers: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != VICTIM)
+            .map(|(_, node)| AllowedDealer {
+                epoch,
+                dealer: node.validator_address(),
+            })
+            .collect();
+        let mut restarted = RESTARTED_RESPONDERS.to_vec();
+        if restart_victim {
+            restarted.push(VICTIM);
+        }
+        for &i in &restarted {
+            let node = &mut test_networks.hashi_network_mut().nodes_mut()[i];
+            if i != VICTIM {
+                node.config_mut().complaint_response_policy =
+                    Some(ComplaintResponsePolicy::AllowList {
+                        dealers: dealers.clone(),
+                    });
+            }
+            node.restart().await?;
+        }
+
+        // 3. Every node ends up with the key, the victim through complaint
+        //    responses from the restarted responders.
+        let nodes = test_networks.hashi_network().nodes();
+        let results =
+            futures::future::join_all(nodes.iter().map(|node| node.wait_for_mpc_key(DKG_TIMEOUT)))
+                .await;
+        for (i, result) in results.into_iter().enumerate() {
+            result.unwrap_or_else(|e| panic!("Node {i} did not get the MPC key: {e}"));
+        }
+        assert!(
+            withheld(&nodes[UNTOUCHED_RESPONDER]) > 0,
+            "the untouched responder kept the default policy and must have withheld the \
+             victim's complaints"
+        );
+
+        // 4. The recovered share signs consistently with everyone else's.
+        let epoch = nodes[0].hashi().onchain_state().epoch();
+        wait_for_signing_manager(nodes, epoch, std::time::Duration::from_secs(120)).await?;
+        let results = sign_on_all_nodes(
+            nodes,
+            b"allowlist recovery",
+            epoch,
+            sui_sdk_types::Address::ZERO,
+            0,
+            None,
+        )
+        .await;
+        assert_all_signatures_match(results);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_complaint_recovery_after_allowlist_update() -> Result<()> {
+        run_complaint_recovery_after_allowlist_update(false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_complaint_recovery_after_allowlist_update_and_victim_restart() -> Result<()> {
+        run_complaint_recovery_after_allowlist_update(true).await
+    }
+
     async fn build_and_rotate_once(builder: TestNetworksBuilder) -> Result<TestNetworks> {
         let mut test_networks = builder.build().await?;
         let initial_epoch = {
@@ -3026,7 +3315,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let results = sign_batch_on_all_nodes(nodes, epoch, &inputs).await;
+            let results = sign_batch_on_all_nodes(nodes, epoch, &inputs, None).await;
             for node_results in &results {
                 for result in node_results {
                     result.as_ref().expect("drain signing failed");
@@ -3061,7 +3350,7 @@ mod tests {
                 )
             })
             .collect();
-        let results = sign_batch_on_all_nodes(nodes, epoch, &inputs).await;
+        let results = sign_batch_on_all_nodes(nodes, epoch, &inputs, None).await;
         for node_results in &results {
             for result in node_results {
                 result

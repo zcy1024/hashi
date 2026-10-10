@@ -6,11 +6,14 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::deposits::UnapprovedDepositError;
 use crate::onchain::types::DepositRequest;
 use crate::onchain::types::OutputUtxo;
 use crate::onchain::types::Utxo;
 use crate::onchain::types::UtxoId;
 use crate::withdrawals::MpcInputSignaturesMessage;
+use crate::withdrawals::WithdrawalAlreadyFinalized;
+use crate::withdrawals::WithdrawalApprovalError;
 use crate::withdrawals::WithdrawalRequestApproval;
 use crate::withdrawals::WithdrawalTxCommitment;
 use crate::withdrawals::WithdrawalTxSigning;
@@ -39,6 +42,7 @@ use hashi_types::proto::bridge_service_server::BridgeService;
 use sui_sdk_types::Address;
 
 use super::HttpService;
+use super::peer_limit::CallerTaskSlot;
 
 #[tonic::async_trait]
 impl BridgeService for HttpService {
@@ -75,7 +79,7 @@ impl BridgeService for HttpService {
             .inner
             .validate_and_sign_deposit_confirmation(&deposit_request)
             .await
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(deposit_refusal_status)?;
         tracing::info!(
             utxo_txid = %deposit_request.utxo.id.txid,
             utxo_vout = deposit_request.utxo.id.vout,
@@ -107,7 +111,7 @@ impl BridgeService for HttpService {
             .inner
             .validate_and_sign_withdrawal_request_approval(&approval)
             .await
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(withdrawal_approval_refusal_status)?;
         tracing::info!("Signed withdrawal request approval");
         Ok(Response::new(SignWithdrawalRequestApprovalResponse {
             member_signature: Some(member_signature),
@@ -215,6 +219,7 @@ impl BridgeService for HttpService {
     ) -> Result<Response<Self::SignWithdrawalTransactionStream>, Status> {
         let caller = authenticate_caller(&request)?;
         tracing::Span::current().record("caller", tracing::field::display(&caller));
+        let slot = self.admit_withdrawal_signing(caller)?;
         let req = request.get_ref();
         let withdrawal_txn_id = Address::from_bytes(&req.withdrawal_txn_id)
             .map_err(|e| Status::invalid_argument(format!("invalid withdrawal_txn_id: {e}")))?;
@@ -228,6 +233,7 @@ impl BridgeService for HttpService {
         let (tx, rx) = tokio::sync::mpsc::channel(concurrency);
         let inner = self.inner.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(e) = inner
                 .validate_and_sign_withdrawal_tx(
                     &withdrawal_txn_id,
@@ -271,7 +277,8 @@ impl BridgeService for HttpService {
         let member_signature = self
             .inner
             .validate_and_sign_withdrawal_tx_signing(&message, expected_limiter_seq, timestamp_secs)
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .await
+            .map_err(withdrawal_signing_refusal_status)?;
         tracing::info!("Signed withdrawal tx signing");
         Ok(Response::new(SignWithdrawalTxSigningResponse {
             member_signature: Some(member_signature),
@@ -298,7 +305,7 @@ impl BridgeService for HttpService {
         let member_signature = self
             .inner
             .validate_and_sign_mpc_input_signatures(&message)
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(withdrawal_signing_refusal_status)?;
         tracing::info!("Signed MPC input signatures chunk");
         Ok(Response::new(SignMpcInputSignaturesResponse {
             member_signature: Some(member_signature),
@@ -331,6 +338,68 @@ impl BridgeService for HttpService {
         Ok(Response::new(SignWithdrawalConfirmationResponse {
             member_signature: Some(member_signature),
         }))
+    }
+}
+
+const SIGNING_TASK_LIMIT_MSG: &str = "per-caller withdrawal signing limit reached";
+
+impl HttpService {
+    fn admit_withdrawal_signing(&self, caller: Address) -> Result<CallerTaskSlot, Status> {
+        let in_committee = self
+            .inner
+            .onchain_state()
+            .state()
+            .hashi()
+            .committees
+            .current_committee()
+            .is_some_and(|committee| committee.index_of(&caller).is_some());
+        let caller_label = caller.to_string();
+        let refused = |reason: &str| {
+            self.inner
+                .metrics
+                .withdrawal_signing_refused_total
+                .with_label_values(&[caller_label.as_str(), reason])
+                .inc()
+        };
+        if !in_committee {
+            refused("committee");
+            return Err(Status::permission_denied(
+                "caller is not in the current committee",
+            ));
+        }
+        let limit = self.inner.config.withdrawal_signing_per_caller_limit();
+        self.signing_tasks.try_admit(caller, limit).ok_or_else(|| {
+            refused("cap");
+            Status::unavailable(SIGNING_TASK_LIMIT_MSG)
+        })
+    }
+}
+
+/// `AlreadyExists` tells the leader another leader already landed this epoch's
+/// approval, so it can drop the deposit instead of retrying it.
+pub(crate) fn deposit_refusal_status(err: UnapprovedDepositError) -> Status {
+    match err {
+        UnapprovedDepositError::AlreadyApprovedThisEpoch => Status::already_exists(err.to_string()),
+        err => Status::failed_precondition(err.to_string()),
+    }
+}
+
+/// `AlreadyExists` tells the leader the request is already approved or
+/// committed, so it can stop collecting signatures for it.
+pub(crate) fn withdrawal_approval_refusal_status(err: WithdrawalApprovalError) -> Status {
+    match err {
+        WithdrawalApprovalError::AlreadyApproved(_) => Status::already_exists(err.to_string()),
+        err => Status::failed_precondition(err.to_string()),
+    }
+}
+
+/// `AlreadyExists` tells the leader the withdrawal is already finalized, so it
+/// can stop collecting signatures for it.
+pub(crate) fn withdrawal_signing_refusal_status(err: anyhow::Error) -> Status {
+    if err.is::<WithdrawalAlreadyFinalized>() {
+        Status::already_exists(err.to_string())
+    } else {
+        Status::failed_precondition(err.to_string())
     }
 }
 

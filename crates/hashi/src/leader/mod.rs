@@ -27,7 +27,10 @@ use crate::withdrawals::WithdrawalCommitmentErrorKind;
 use fastcrypto::bls12381::min_pk::BLS12381Signature;
 use fastcrypto::traits::ToFromBytes;
 use futures::future::OptionFuture;
+use hashi_types::committee::BlsSignatureAggregator;
 use hashi_types::committee::MemberSignature;
+use hashi_types::committee::certificate_threshold;
+use hashi_types::intent::IntentMessage;
 use hashi_types::proto::bridge_service_client::BridgeServiceClient;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -232,43 +235,28 @@ impl LeaderService {
         }
     }
 
-    /// Invoke a peer's bridge-service signing RPC, retrying on transient
-    /// transport failures. `call` is handed a freshly-fetched client each
-    /// attempt so the retry reconnects (tonic reconnects lazily) rather than
-    /// reusing the connection the peer just tore down. Returns `None` once
-    /// attempts are exhausted or on a non-transport error.
+    /// [`retry_peer_call`] against the peer's bridge-service client, logging
+    /// the final error. Returns `None` once attempts are exhausted or on a
+    /// non-transport error.
     async fn call_peer_with_retry<Resp, F, Fut>(
         inner: &Arc<Hashi>,
         validator: Address,
         what: &str,
-        mut call: F,
+        call: F,
     ) -> Option<tonic::Response<Resp>>
     where
         F: FnMut(BridgeServiceClient<BoxedChannel>) -> Fut,
         Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
     {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 1..=MAX_ATTEMPTS {
-            let Some(client) = inner.onchain_state().bridge_service_client(&validator) else {
-                error!("Cannot find bridge-service client for validator: {validator:?}");
-                return None;
-            };
-            match call(client).await {
-                Ok(response) => return Some(response),
-                Err(status) if attempt < MAX_ATTEMPTS && is_retriable_transport(&status) => {
-                    warn!(
-                        "Failed to get {what} from {validator} (attempt {attempt}/{MAX_ATTEMPTS}): \
-                         {status}; retrying on a fresh connection"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt))).await;
-                }
-                Err(status) => {
-                    error!("Failed to get {what} from {validator}: {status}");
-                    return None;
-                }
-            }
-        }
-        None
+        retry_peer_call(
+            validator,
+            what,
+            || inner.onchain_state().bridge_service_client(&validator),
+            call,
+        )
+        .await
+        .inspect_err(|status| error!("Failed to get {what} from {validator}: {status}"))
+        .ok()
     }
 
     /// Start the leader service and return a `Service` for lifecycle management.
@@ -338,6 +326,8 @@ impl LeaderService {
                         self.check_prune_tob_certs(checkpoint_timestamp_ms);
                     } else {
                         trace!("We are not the leader node");
+                        // Deposit tasks outlive the leader's turn, but not a halt.
+                        self.check_halt_deposit_processing();
                     }
                 }
                 wait_result = deposit_work_rx.changed() => {
@@ -567,12 +557,16 @@ impl LeaderService {
     /// the cached `is_leader`.
     fn update_leadership(&mut self, checkpoint_height: u64) -> bool {
         let is_leader = Self::node_is_leader(&self.inner, checkpoint_height);
+        self.set_leadership(is_leader);
+        is_leader
+    }
+
+    fn set_leadership(&mut self, is_leader: bool) {
         self.inner.metrics.is_leader.set(i64::from(is_leader));
         if self.is_leader && !is_leader {
-            self.stop_deposit_processing();
+            self.stop_scheduling_deposits();
         }
         self.is_leader = is_leader;
-        is_leader
     }
 }
 
@@ -597,13 +591,128 @@ fn parse_member_signature(
     Ok(MemberSignature::new(epoch, address, signature))
 }
 
+/// Invoke a peer's signing RPC, retrying on transient transport failures, and
+/// hand back the peer's final status otherwise. A retry goes out on a new
+/// connection because the peer's shared tonic channel reconnects lazily once
+/// the old one is torn down.
+async fn retry_peer_call<C, Resp, F, Fut>(
+    validator: Address,
+    what: &str,
+    mut client: impl FnMut() -> Option<C>,
+    mut call: F,
+) -> Result<tonic::Response<Resp>, tonic::Status>
+where
+    F: FnMut(C) -> Fut,
+    Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+{
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        let Some(client) = client() else {
+            return Err(tonic::Status::unavailable(format!(
+                "no bridge-service client for validator {validator}"
+            )));
+        };
+        match call(client).await {
+            Err(status) if attempt < MAX_ATTEMPTS && is_retriable_transport(&status) => {
+                warn!(
+                    "Failed to get {what} from {validator} (attempt {attempt}/{MAX_ATTEMPTS}): \
+                     {status}; retrying on a fresh connection"
+                );
+                tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+enum NoSignature {
+    AlreadyApproved,
+    Failed,
+}
+
+/// Peers refuse a request their mirror shows already approved, or a withdrawal
+/// it shows finalized, with `AlreadyExists` (`deposit_refusal_status`,
+/// `withdrawal_approval_refusal_status`, `withdrawal_signing_refusal_status`).
+fn is_already_approved_refusal(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::AlreadyExists
+}
+
+enum NoQuorum {
+    AlreadyApproved,
+    StaleCommittee { epoch: u64, peer_epoch: u64 },
+    Short { weight: u64, required_weight: u64 },
+}
+
+/// Add each member's signature to `aggregator` until it reaches a certificate
+/// quorum, stopping early once members reporting the request already approved,
+/// or signing at a newer epoch than the aggregator's committee, rule a quorum out.
+async fn collect_signatures<T: IntentMessage + Clone>(
+    sig_tasks: &mut JoinSet<(u64, Result<MemberSignature, NoSignature>)>,
+    aggregator: &mut BlsSignatureAggregator<'_, T>,
+    total_weight: u64,
+) -> Result<(), NoQuorum> {
+    let required_weight = certificate_threshold(total_weight);
+    // Past `total - required`, quorum is out of reach, and that is more weight than
+    // faulty members can hold, so what those members report is true.
+    let quorum_slack = total_weight.saturating_sub(required_weight);
+    let mut already_approved_weight = 0;
+    let mut newer_epoch_weight = 0;
+    while let Some(result) = sig_tasks.join_next().await {
+        let Ok((weight, reply)) = result else {
+            continue;
+        };
+        match reply {
+            Ok(sig) if sig.epoch() > aggregator.epoch() => {
+                debug!(
+                    "{} signed at epoch {}, ahead of committee epoch {}",
+                    sig.address(),
+                    sig.epoch(),
+                    aggregator.epoch()
+                );
+                newer_epoch_weight += weight;
+                if newer_epoch_weight > quorum_slack {
+                    return Err(NoQuorum::StaleCommittee {
+                        epoch: aggregator.epoch(),
+                        peer_epoch: sig.epoch(),
+                    });
+                }
+            }
+            Ok(sig) => {
+                if let Err(e) = aggregator.add_signature(sig) {
+                    error!("Failed to add member signature: {e}");
+                }
+            }
+            Err(NoSignature::AlreadyApproved) => {
+                already_approved_weight += weight;
+                if already_approved_weight > quorum_slack {
+                    return Err(NoQuorum::AlreadyApproved);
+                }
+            }
+            Err(NoSignature::Failed) => {}
+        }
+        if aggregator.weight() >= required_weight {
+            break;
+        }
+    }
+
+    if aggregator.weight() < required_weight {
+        return Err(NoQuorum::Short {
+            weight: aggregator.weight(),
+            required_weight,
+        });
+    }
+    Ok(())
+}
+
 /// Whether a failed peer RPC is worth retrying. Under sustained load a peer's
 /// HTTP/2 server tears the whole multiplexed connection down — `GoAway`
 /// (surfaced as `Internal`), broken pipe (`Unknown`), or the usual
 /// `Unavailable` — failing every in-flight request to that peer at once. The
 /// peer signing RPCs are idempotent, so retrying these transport-class codes is
 /// safe and lets the request land on a fresh connection.
-fn is_retriable_transport(status: &tonic::Status) -> bool {
+pub(crate) fn is_retriable_transport(status: &tonic::Status) -> bool {
     matches!(
         status.code(),
         tonic::Code::Unavailable
@@ -616,9 +725,265 @@ fn is_retriable_transport(status: &tonic::Status) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::NoQuorum;
+    use super::NoSignature;
+    use super::collect_signatures;
+    use super::is_already_approved_refusal;
     use super::is_retriable_transport;
+    use super::retry_peer_call;
+    use crate::withdrawals::WithdrawalAlreadyFinalized;
+    use crate::withdrawals::WithdrawalApprovalError;
+    use crate::withdrawals::WithdrawalRequestApproval;
+    use hashi_types::committee::Bls12381PrivateKey;
+    use hashi_types::committee::BlsSignatureAggregator;
+    use hashi_types::committee::Committee;
+    use hashi_types::committee::CommitteeMember;
+    use hashi_types::committee::EncryptionPrivateKey;
+    use hashi_types::committee::MemberSignature;
+    use sui_sdk_types::Address;
+    use tokio::task::JoinSet;
     use tonic::Code;
+    use tonic::Response;
     use tonic::Status;
+
+    #[test]
+    fn tells_withdrawal_already_approved_refusals_from_other_refusals() {
+        let refusal = crate::grpc::bridge_service::withdrawal_approval_refusal_status;
+        assert!(is_already_approved_refusal(&refusal(
+            WithdrawalApprovalError::AlreadyApproved(anyhow::anyhow!("already committed"))
+        )));
+        for err in [
+            WithdrawalApprovalError::NeverRetry(anyhow::anyhow!("not found in queue")),
+            WithdrawalApprovalError::AmlServiceError(anyhow::anyhow!("TRM unavailable")),
+        ] {
+            assert!(!is_already_approved_refusal(&refusal(err)));
+        }
+        // Older peers send the same refusal as `failed_precondition`.
+        assert!(!is_already_approved_refusal(&Status::failed_precondition(
+            "Never retry: Withdrawal request 0x1 is already approved"
+        )));
+    }
+
+    #[test]
+    fn tells_withdrawal_already_finalized_refusals_from_other_refusals() {
+        let refusal = crate::grpc::bridge_service::withdrawal_signing_refusal_status;
+        assert!(is_already_approved_refusal(&refusal(
+            WithdrawalAlreadyFinalized(Address::ZERO).into()
+        )));
+        assert!(!is_already_approved_refusal(&refusal(anyhow::anyhow!(
+            "Limiter rejected withdrawal 0x1: insufficient tokens"
+        ))));
+        // Older peers send the same refusal as `failed_precondition`.
+        assert!(!is_already_approved_refusal(&Status::failed_precondition(
+            WithdrawalAlreadyFinalized(Address::ZERO).to_string()
+        )));
+    }
+
+    fn aggregator(committee: &Committee) -> BlsSignatureAggregator<'_, WithdrawalRequestApproval> {
+        let message = WithdrawalRequestApproval {
+            request_id: Address::ZERO,
+        };
+        BlsSignatureAggregator::new(Address::ZERO, committee, message)
+    }
+
+    #[tokio::test]
+    async fn stops_collecting_once_already_approved_weight_rules_out_quorum() {
+        let committee = Committee::new(vec![], 0, 0, 5_000);
+        let mut aggregator = aggregator(&committee);
+        let mut sig_tasks = JoinSet::new();
+        sig_tasks.spawn(async { (3_334, Err(NoSignature::AlreadyApproved)) });
+        sig_tasks.spawn(std::future::pending());
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_signatures(&mut sig_tasks, &mut aggregator, 10_000),
+        )
+        .await
+        .expect("should stop without waiting for the member that never answers");
+
+        assert!(matches!(result, Err(NoQuorum::AlreadyApproved)));
+    }
+
+    #[tokio::test]
+    async fn keeps_collecting_while_already_approved_weight_leaves_quorum_reachable() {
+        let committee = Committee::new(vec![], 0, 0, 5_000);
+        let mut aggregator = aggregator(&committee);
+        let mut sig_tasks = JoinSet::new();
+        sig_tasks.spawn(async { (3_333, Err(NoSignature::AlreadyApproved)) });
+        sig_tasks.spawn(async { (6_667, Err(NoSignature::Failed)) });
+
+        let result = collect_signatures(&mut sig_tasks, &mut aggregator, 10_000).await;
+
+        assert!(matches!(
+            result,
+            Err(NoQuorum::Short {
+                weight: 0,
+                required_weight: 6_667,
+            })
+        ));
+    }
+
+    fn signature_at(epoch: u64) -> MemberSignature {
+        let message = WithdrawalRequestApproval {
+            request_id: Address::ZERO,
+        };
+        Bls12381PrivateKey::generate(&mut rand::thread_rng()).sign(
+            Address::ZERO,
+            epoch,
+            Address::ZERO,
+            &message,
+        )
+    }
+
+    #[tokio::test]
+    async fn stops_collecting_once_newer_epoch_weight_rules_out_quorum() {
+        let committee = Committee::new(vec![], 1, 0, 5_000);
+        let mut aggregator = aggregator(&committee);
+        let mut sig_tasks = JoinSet::new();
+        sig_tasks.spawn(async { (3_334, Ok(signature_at(2))) });
+        sig_tasks.spawn(std::future::pending());
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_signatures(&mut sig_tasks, &mut aggregator, 10_000),
+        )
+        .await
+        .expect("should stop without waiting for the member that never answers");
+
+        assert!(matches!(
+            result,
+            Err(NoQuorum::StaleCommittee {
+                epoch: 1,
+                peer_epoch: 2,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn keeps_collecting_while_newer_epoch_weight_leaves_quorum_reachable() {
+        let committee = Committee::new(vec![], 1, 0, 5_000);
+        let mut aggregator = aggregator(&committee);
+        let mut sig_tasks = JoinSet::new();
+        sig_tasks.spawn(async { (3_333, Ok(signature_at(2))) });
+        sig_tasks.spawn(async { (6_667, Err(NoSignature::Failed)) });
+
+        let result = collect_signatures(&mut sig_tasks, &mut aggregator, 10_000).await;
+
+        assert!(matches!(
+            result,
+            Err(NoQuorum::Short {
+                weight: 0,
+                required_weight: 6_667,
+            })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaches_quorum_past_newer_epoch_signatures() {
+        let key = Bls12381PrivateKey::generate(&mut rand::thread_rng());
+        let encryption_key = EncryptionPrivateKey::new(&mut rand::thread_rng()).public_key();
+        let member = CommitteeMember::new(Address::ZERO, key.public_key(), encryption_key, 6_667);
+        let committee = Committee::new(vec![member], 1, 0, 5_000);
+        let mut aggregator = aggregator(&committee);
+        let message = WithdrawalRequestApproval {
+            request_id: Address::ZERO,
+        };
+        let signature = key.sign(Address::ZERO, 1, Address::ZERO, &message);
+        let mut sig_tasks = JoinSet::new();
+        sig_tasks.spawn(async { (3_333, Ok(signature_at(2))) });
+        // Answers last, so the newer-epoch signature is counted first.
+        sig_tasks.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            (6_667, Ok(signature))
+        });
+
+        let result = collect_signatures(&mut sig_tasks, &mut aggregator, 10_000).await;
+
+        assert!(matches!(result, Ok(())));
+        assert_eq!(aggregator.weight(), 6_667);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keeps_waiting_past_older_epoch_signatures() {
+        let committee = Committee::new(vec![], 1, 0, 5_000);
+        let mut aggregator = aggregator(&committee);
+        let mut sig_tasks = JoinSet::new();
+        sig_tasks.spawn(async { (6_667, Ok(signature_at(0))) });
+        sig_tasks.spawn(std::future::pending());
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_signatures(&mut sig_tasks, &mut aggregator, 10_000),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a stale member's signature must not end the round"
+        );
+    }
+
+    /// Runs `retry_peer_call` against a peer that answers attempt `n` (from 1)
+    /// with `reply(n)`; returns the result and how many clients were fetched.
+    async fn call_peer(
+        reply: impl Fn(u32) -> Result<Response<()>, Status>,
+    ) -> (Result<Response<()>, Status>, u32) {
+        let mut clients = 0;
+        let mut attempts = 0;
+        let result = retry_peer_call(
+            Address::ZERO,
+            "test signature",
+            || {
+                clients += 1;
+                Some(())
+            },
+            |()| {
+                attempts += 1;
+                std::future::ready(reply(attempts))
+            },
+        )
+        .await;
+        (result, clients)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_transport_errors_on_a_fresh_client() {
+        let (result, clients) = call_peer(|attempt| match attempt {
+            1 => Err(Status::internal("h2 protocol error: http2 error")),
+            2 => Err(Status::cancelled("operation was canceled")),
+            _ => Ok(Response::new(())),
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(clients, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hands_back_a_refusal_without_retrying() {
+        let (result, clients) =
+            call_peer(|_| Err(Status::already_exists("already approved"))).await;
+        assert_eq!(result.unwrap_err().code(), Code::AlreadyExists);
+        assert_eq!(clients, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hands_back_the_last_transport_error_once_attempts_run_out() {
+        let (result, clients) = call_peer(|_| Err(Status::unavailable("tls handshake eof"))).await;
+        assert_eq!(result.unwrap_err().code(), Code::Unavailable);
+        assert_eq!(clients, 3);
+    }
+
+    #[tokio::test]
+    async fn fails_without_calling_when_the_peer_has_no_client() {
+        let result: Result<Response<()>, Status> = retry_peer_call(
+            Address::ZERO,
+            "test signature",
+            || None::<()>,
+            |()| async { unreachable!("no client, so nothing to call") },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code(), Code::Unavailable);
+    }
 
     #[test]
     fn classifies_transport_errors_as_retriable() {

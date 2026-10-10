@@ -60,9 +60,8 @@ groups:
         annotations:
           summary: "task loop {{ $labels.task }} wedged"
           description: >-
-            The {{ $labels.task }} loop has not iterated in 10 minutes; all
-            heartbeat-labeled loops iterate at least every 15 seconds. A
-            task inside the process has panicked or deadlocked.
+            The {{ $labels.task }} loop has not recorded a heartbeat in 10
+            minutes. It has deadlocked or is stuck; check its logs.
 
       - alert: HashiReconfigNotTracking
         expr: changes(hashi_epoch[3h]) == 0
@@ -116,3 +115,39 @@ groups:
             This node owned share indices in the previous committee but entered
             the rotation with none to reshare, so its weight did not reach the
             new key.
+
+      - alert: HashiComplaintWithheld
+        expr: increase(hashi_mpc_complaints_withheld_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "withheld the response to a verified MPC complaint"
+          description: >-
+            A peer sent a complaint that verified, so some dealer sent it a
+            corrupt share, and the dealer is outside this node's
+            complaint-response-policy, so the peer cannot recover its share
+            until operators coordinate a fix. Honest nodes never trigger this.
+            Never add a complaint-response-policy entry on your own: one wrong
+            entry can leak your shares.
+
+      - alert: HashiWithdrawalFailsBitcoinScripts
+        expr: increase(hashi_withdrawal_bitcoin_check_script_failures_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "bitcoind says a signed withdrawal is invalid"
+          description: >-
+            If other operators see it too, withdrawals are broken: raise it in
+            the operator channel. Otherwise check this node's bitcoind.
+
+      - alert: HashiWithdrawalCheckBlind
+        expr: hashi_withdrawal_bitcoin_check_blind == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "withdrawal check is blind"
+          description: >-
+            This node's bitcoind cannot check withdrawals, so the node signs
+            them unchecked. Usually testmempoolaccept is not allowed on the RPC
+            endpoint; see the error log.

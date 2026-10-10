@@ -1,11 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The versioned `LogMessage` family the enclave emits. The `LogRecord` wrapper
+//! The versioned `LogMessage` family the enclave emits. The `SignedLogEntry` wrapper
 //! that carries these to S3 lives in `super::log_record`.
 
 use super::config::S3ObjectLockPolicy;
-use super::log_layout::ObjectKeyPattern;
 use super::log_messages::CeremonyLogMessage;
 use super::log_messages::CeremonyProposalLogMessage;
 use super::log_messages::CommitteeUpdateLogMessage;
@@ -19,7 +18,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::time::Duration;
 
-/// The wire message stored in a [`crate::guardian::log::LogRecord`]. Its version is serialized
+/// The wire message stored in a [`crate::guardian::log::SignedLogEntry`]. Its version is serialized
 /// as the record's sibling `schema_version` field rather than as an additional
 /// JSON enum layer.
 ///
@@ -96,13 +95,7 @@ impl LogType {
     }
 }
 
-trait LogMessageSchema {
-    fn log_type(&self) -> LogType;
-
-    fn object_key_pattern(&self, session_id: &str, timestamp_ms: UnixMillis) -> ObjectKeyPattern;
-}
-
-impl LogMessageSchema for LogMessageV1 {
+impl LogMessageV1 {
     fn log_type(&self) -> LogType {
         match self {
             Self::Heartbeat(..) => LogType::Heartbeat,
@@ -116,17 +109,17 @@ impl LogMessageSchema for LogMessageV1 {
         }
     }
 
-    fn object_key_pattern(&self, session_id: &str, timestamp_ms: UnixMillis) -> ObjectKeyPattern {
-        match self {
-            Self::Heartbeat(message) => message.object_key_pattern(session_id, timestamp_ms),
-            Self::Init(message) => message.object_key_pattern(session_id),
-            Self::Withdrawal(message) => message.object_key_pattern(session_id, timestamp_ms),
-            Self::Ceremony(message) => message.object_key_pattern(session_id),
-            Self::KpShareState(message) => message.object_key_pattern(session_id),
-            Self::CommitteeUpdate(message) => message.object_key_pattern(session_id),
-            Self::Genesis(message) => message.object_key_pattern(),
-            Self::CeremonyProposal(message) => message.object_key_pattern(session_id),
-        }
+    fn object_key(&self, session_id: &str, timestamp_ms: UnixMillis) -> anyhow::Result<String> {
+        Ok(match self {
+            Self::Heartbeat(message) => message.object_key(session_id, timestamp_ms)?,
+            Self::Init(message) => message.object_key(session_id),
+            Self::Withdrawal(message) => message.object_key(timestamp_ms)?,
+            Self::Ceremony(message) => message.object_key(),
+            Self::KpShareState(message) => message.object_key(),
+            Self::CommitteeUpdate(message) => message.object_key(),
+            Self::Genesis(_) => GenesisLogMessage::object_key(),
+            Self::CeremonyProposal(_) => CeremonyProposalLogMessage::object_key(session_id),
+        })
     }
 }
 
@@ -147,10 +140,26 @@ impl VersionedLogMessage {
         }
     }
 
+    /// Return a reference to the init message, or `None` for another message type.
+    pub fn as_init(&self) -> Option<&InitLogMessage> {
+        match self {
+            Self::V1(LogMessageV1::Init(message)) => Some(message.as_ref()),
+            Self::V1(_) => None,
+        }
+    }
+
     /// Consume an init payload, or return `None` for another message kind.
     pub fn into_init(self) -> Option<Box<InitLogMessage>> {
         match self {
             Self::V1(LogMessageV1::Init(message)) => Some(message),
+            Self::V1(_) => None,
+        }
+    }
+
+    /// Return a reference to the withdrawal message, or `None` for another message type.
+    pub fn as_withdrawal(&self) -> Option<&WithdrawalLogMessage> {
+        match self {
+            Self::V1(LogMessageV1::Withdrawal(message)) => Some(message.as_ref()),
             Self::V1(_) => None,
         }
     }
@@ -203,31 +212,19 @@ impl VersionedLogMessage {
         }
     }
 
-    pub fn as_attestation_log(&self) -> Option<&InitLogMessage> {
-        let init = match self {
-            Self::V1(LogMessageV1::Init(init)) => init.as_ref(),
-            Self::V1(_) => return None,
-        };
-        matches!(init, InitLogMessage::OIAttestationUnsigned { .. }).then_some(init)
-    }
-
-    pub fn is_unsigned(&self) -> bool {
-        self.as_attestation_log().is_some()
-    }
-
     pub fn log_type(&self) -> LogType {
         match self {
             Self::V1(message) => message.log_type(),
         }
     }
 
-    pub(super) fn object_key_pattern(
+    pub(super) fn object_key(
         &self,
         session_id: &str,
         timestamp_ms: UnixMillis,
-    ) -> ObjectKeyPattern {
+    ) -> anyhow::Result<String> {
         match self {
-            Self::V1(message) => message.object_key_pattern(session_id, timestamp_ms),
+            Self::V1(message) => message.object_key(session_id, timestamp_ms),
         }
     }
 }

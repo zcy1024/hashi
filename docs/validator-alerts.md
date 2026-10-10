@@ -21,13 +21,16 @@ Two principles shape this list:
 | BTC not synced          | `hashi_kyoto_synced == 0` for 15m                                     | Brief resyncs are normal after restarts; sustained unsync is not.                                                                                                                                                         |
 | No BTC peers            | `hashi_kyoto_connected_peers < 1` for 10m                             | No peers means no blocks, ahead of the tip going stale.                                                                                                                                                                   |
 | Sui mirror stale        | `time() - (hashi_latest_checkpoint_timestamp_ms / 1000) > 120` for 5m | The state watcher applies checkpoints continuously. Two minutes without an applied checkpoint means the watcher, mirror, or fullnode RPC is wedged — the node acts on stale bridge state while looking healthy elsewhere. |
-| Task wedged             | `time() - hashi_task_last_iteration_timestamp_seconds > 600`          | Each labeled task loop (`state_watcher`, `leader_loop`, `mpc_service`) iterates at least every 15s. A stale heartbeat catches a panicked or deadlocked task inside an otherwise-alive process.                            |
+| Task wedged             | `time() - hashi_task_last_iteration_timestamp_seconds > 600`          | Each labeled task loop (`state_watcher`, `leader_loop`, `mpc_service`) records a heartbeat at least every 15s when idle, and `mpc_service` also records them while it waits for presignature certificates. A stale heartbeat catches a task that is deadlocked, blocked on a call that never returns, or stuck retrying a failed DKG or key rotation, inside an otherwise-alive process. |
 | Reconfig not tracking   | `changes(hashi_epoch[3h]) == 0`                                       | Testnet reconfigures roughly every 40 minutes. If the committee epoch stops moving, either your node stopped following reconfig or the fleet itself stalled — check the operator channel before assuming local fault.     |
 | Low gas                 | `hashi_sui_balance < 1e9`                                             | Below 1 SUI the operator wallet is close to unable to submit. Refill.                                                                                                                                                     |
 | Binary behind chain     | `hashi_package_version_unsupported == 1`                              | The chain moved to a package version this binary does not implement; autonomous writes are halted. Upgrade the binary immediately.                                                                                        |
 | Database poisoned       | `hashi_db_poisoned == 1`                                              | fjall refuses every write after a failed flush or fsync (usually a full disk) until the process restarts, while reads and signing carry on looking healthy. Free the disk, then restart.                                  |
 | Crash looping           | `changes(process_start_time_seconds{job="<your-node>"}[1h]) > 3`      | Uses the standard process exporter if you run one; any restart-count source works.                                                                                                                                        |
 | Previous shares missing | `increase(hashi_mpc_rotation_previous_shares_missing_total[1h]) > 0`  | The node owed shares to a rotation and had none, so its weight did not reach the new key.                                                                                                                                 |
+| Complaint withheld      | `increase(hashi_mpc_complaints_withheld_total[1h]) > 0` | A peer's complaint verified, so some dealer sent it a corrupt share, and the dealer is not in `complaint-response-policy`, so the peer cannot recover its share until operators coordinate a fix. Honest nodes never trigger this. Never add a `complaint-response-policy` entry on your own: one wrong entry can leak your shares. |
+| Withdrawal fails bitcoind | `increase(hashi_withdrawal_bitcoin_check_script_failures_total[1h]) > 0` | Your bitcoind says a signed withdrawal is invalid. If other operators see it too, withdrawals are broken: raise it in the operator channel. If only you see it, check your bitcoind. |
+| Withdrawal check blind  | `hashi_withdrawal_bitcoin_check_blind == 1` for 10m | An hourly probe found that your bitcoind cannot check withdrawals, so your node signs them unchecked. Usually `testmempoolaccept` is not allowed on your RPC endpoint; see the error log. `-1` means no pool UTXO has been probed yet. |
 
 Dashboard-worthy but **not** alerts:
 
@@ -37,8 +40,6 @@ Dashboard-worthy but **not** alerts:
   upgrade progress is counted before the on-chain upgrade flips `active`.
 - `hashi_mpc_presig_batch_repair_total` — a nonce batch the allocation cursor
   outran, and what this node did about it, by `outcome`.
-- `hashi_mpc_nonce_dealer_signer_set_replay_total` — repeat dealer rounds for a
-  batch an earlier round already fixed a signer set for, by `outcome`.
 - `hashi_is_leader` — leadership rotates; useful context when reading other
   metrics, meaningless to alert on.
 - `hashi_db_keyspace_disk_bytes` — live table bytes per keyspace. Each one
@@ -47,6 +48,10 @@ Dashboard-worthy but **not** alerts:
 - `hashi_deposit_outpoint_confirmations{status="not_found"}` — expected for
   unbroadcast transactions. It is suspicious only when your node reports it
   while peers report confirmations for the same deposits.
+- `hashi_withdrawal_bitcoin_check_total{result="unavailable"}` and
+  `hashi_withdrawal_bitcoin_check_latency_seconds` — finalize checks that got
+  no answer in time, and how long answers take. A steady share of
+  `unavailable` means the check is not running; `rejected_other` is normal.
 
 ## What NOT to alert on
 
@@ -71,7 +76,9 @@ Dashboard-worthy but **not** alerts:
 | `hashi_deposit_outpoint_confirmations` | node |
 | `hashi_latest_checkpoint_*`, `hashi_task_last_iteration_timestamp_seconds` | node |
 | `hashi_sui_balance`, `hashi_package_version_*`, `hashi_is_leader` | node |
+| `hashi_withdrawal_commitment_left_out_total` | node (counts only while leading) |
 | `hashi_db_*` | node |
+| `hashi_withdrawal_bitcoin_check_*` | node |
 | `hashi_presig_pool_remaining`, `hashi_num_consumed_presigs` | bridge |
-| `hashi_deposit_queue_size`, `hashi_withdrawal_queue_*`, `hashi_utxo_pool_*` | bridge |
+| `hashi_deposit_queue_size`, `hashi_withdrawal_queue_*`, `hashi_withdrawal_oldest_unsigned_age_seconds`, `hashi_utxo_pool_*` | bridge |
 | `hashi_paused`, `hashi_reconfig_in_progress`, `hashi_epoch`, `hashi_sui_epoch` | bridge (visible per node) |

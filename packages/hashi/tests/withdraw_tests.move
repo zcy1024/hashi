@@ -103,6 +103,183 @@ fun test_cancel_withdrawal_cooldown_not_elapsed() {
     std::unit_test::destroy(hashi);
 }
 
+// ======== Request and cancel entries ========
+
+const P2WPKH_PROGRAM: vector<u8> = x"0101010101010101010101010101010101010101";
+const P2TR_PROGRAM: vector<u8> =
+    x"0202020202020202020202020202020202020202020202020202020202020202";
+
+/// Calls the `request_withdrawal` entry with a fresh `btc_amount` balance and
+/// returns the id of the request it created, read from the
+/// `WithdrawalRequested` event it emitted.
+fun request_via_entry(
+    hashi: &mut hashi::hashi::Hashi,
+    clock: &clock::Clock,
+    btc_amount: u64,
+    bitcoin_address: vector<u8>,
+    ctx: &mut TxContext,
+): address {
+    let btc = sui::balance::create_for_testing<BTC>(btc_amount);
+    hashi::withdraw::request_withdrawal(hashi, clock, btc, bitcoin_address, ctx);
+    let events = sui::event::events_by_type<withdrawal_queue::WithdrawalRequested>();
+    events[events.length() - 1].withdrawal_requested_request_id()
+}
+
+fun withdrawal_minimum(hashi: &hashi::hashi::Hashi): u64 {
+    hashi::btc_config::bitcoin_withdrawal_minimum(hashi.config())
+}
+
+#[test]
+fun test_request_withdrawal_records_request_at_minimum() {
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 0);
+    let voters = vector[VOTER1, VOTER2, VOTER3];
+    let mut hashi = test_utils::create_hashi_with_committee(voters, ctx);
+    let clock = clock::create_for_testing(ctx);
+    let amount = withdrawal_minimum(&hashi);
+
+    let request_id = request_via_entry(&mut hashi, &clock, amount, P2WPKH_PROGRAM, ctx);
+
+    let queue = hashi.bitcoin().withdrawal_queue();
+    assert!(queue.request_in_requests(request_id));
+    let request = queue.borrow_request(request_id);
+    assert!(request.request_sender() == REQUESTER);
+    assert!(request.request_btc_amount() == amount);
+    assert!(request.request_bitcoin_address() == &P2WPKH_PROGRAM);
+    assert!(!request.is_approved());
+    assert!(!request.is_committed());
+    assert!(hashi.bitcoin().user_has_request(REQUESTER, request_id));
+
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+}
+
+#[test]
+fun test_request_withdrawal_indexes_every_request_of_a_sender() {
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 0);
+    let voters = vector[VOTER1, VOTER2, VOTER3];
+    let mut hashi = test_utils::create_hashi_with_committee(voters, ctx);
+    let clock = clock::create_for_testing(ctx);
+    let amount = withdrawal_minimum(&hashi);
+
+    // The first request creates the sender's index entry; the second (to a
+    // P2TR program) must land in the same entry rather than abort on it.
+    let id1 = request_via_entry(&mut hashi, &clock, amount, P2WPKH_PROGRAM, ctx);
+    let id2 = request_via_entry(&mut hashi, &clock, amount + 1, P2TR_PROGRAM, ctx);
+
+    assert!(id1 != id2);
+    let queue = hashi.bitcoin().withdrawal_queue();
+    assert!(queue.request_in_requests(id1));
+    assert!(queue.request_in_requests(id2));
+    assert!(queue.borrow_request(id2).request_bitcoin_address() == &P2TR_PROGRAM);
+    assert!(hashi.bitcoin().user_has_request(REQUESTER, id1));
+    assert!(hashi.bitcoin().user_has_request(REQUESTER, id2));
+
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+}
+
+#[test]
+fun test_cancel_withdrawal_deletes_request_and_unindexes_it() {
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 0);
+    let voters = vector[VOTER1, VOTER2, VOTER3];
+    let mut hashi = test_utils::create_hashi_with_committee(voters, ctx);
+    let mut clock = clock::create_for_testing(ctx);
+    let amount = withdrawal_minimum(&hashi);
+    let id1 = request_via_entry(&mut hashi, &clock, amount, P2WPKH_PROGRAM, ctx);
+    let id2 = request_via_entry(&mut hashi, &clock, amount + 1, P2TR_PROGRAM, ctx);
+    clock.set_for_testing(hashi::btc_config::withdrawal_cancellation_cooldown_ms(hashi.config()));
+
+    let refund = hashi::withdraw::cancel_withdrawal(&mut hashi, id1, &clock, ctx);
+
+    // Cancelled requests are deleted outright, never archived, and only the
+    // cancelled one leaves the sender's index.
+    assert!(refund.value() == amount);
+    let queue = hashi.bitcoin().withdrawal_queue();
+    assert!(!queue.request_in_requests(id1));
+    assert!(!queue.request_in_processed(id1));
+    assert!(!hashi.bitcoin().user_has_request(REQUESTER, id1));
+    assert!(hashi.bitcoin().user_has_request(REQUESTER, id2));
+
+    // Cancelling the sender's last request drops their index entry entirely.
+    let refund2 = hashi::withdraw::cancel_withdrawal(&mut hashi, id2, &clock, ctx);
+    assert!(refund2.value() == amount + 1);
+    assert!(!hashi.bitcoin().has_user_requests(REQUESTER));
+
+    refund.destroy_for_testing();
+    refund2.destroy_for_testing();
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+}
+
+#[test]
+#[expected_failure(abort_code = hashi::withdraw::EBelowMinimumWithdrawal)]
+fun test_request_withdrawal_below_minimum_aborts() {
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 0);
+    let voters = vector[VOTER1, VOTER2, VOTER3];
+    let mut hashi = test_utils::create_hashi_with_committee(voters, ctx);
+    let clock = clock::create_for_testing(ctx);
+    let btc = sui::balance::create_for_testing<BTC>(withdrawal_minimum(&hashi) - 1);
+
+    hashi::withdraw::request_withdrawal(&mut hashi, &clock, btc, P2WPKH_PROGRAM, ctx);
+
+    // Clean up (shouldn't be reached due to expected failure)
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+}
+
+#[test]
+#[expected_failure(abort_code = hashi::withdraw::EInvalidBitcoinAddress)]
+fun test_request_withdrawal_rejects_empty_address() {
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 0);
+    let voters = vector[VOTER1, VOTER2, VOTER3];
+    let mut hashi = test_utils::create_hashi_with_committee(voters, ctx);
+    let clock = clock::create_for_testing(ctx);
+    let btc = sui::balance::create_for_testing<BTC>(withdrawal_minimum(&hashi));
+
+    hashi::withdraw::request_withdrawal(&mut hashi, &clock, btc, vector[], ctx);
+
+    // Clean up (shouldn't be reached due to expected failure)
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+}
+
+/// A full P2WPKH scriptPubKey (`OP_0 OP_PUSHBYTES_20 <program>`) instead of
+/// the bare witness program is the likeliest integrator mistake.
+#[test]
+#[expected_failure(abort_code = hashi::withdraw::EInvalidBitcoinAddress)]
+fun test_request_withdrawal_rejects_script_pubkey() {
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 0);
+    let voters = vector[VOTER1, VOTER2, VOTER3];
+    let mut hashi = test_utils::create_hashi_with_committee(voters, ctx);
+    let clock = clock::create_for_testing(ctx);
+    let btc = sui::balance::create_for_testing<BTC>(withdrawal_minimum(&hashi));
+    let mut script_pubkey = x"0014";
+    script_pubkey.append(P2WPKH_PROGRAM);
+
+    hashi::withdraw::request_withdrawal(&mut hashi, &clock, btc, script_pubkey, ctx);
+
+    // Clean up (shouldn't be reached due to expected failure)
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+}
+
+#[test]
+#[expected_failure(abort_code = hashi::hashi::ESystemPaused)]
+fun test_request_withdrawal_while_paused_aborts() {
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 0);
+    let voters = vector[VOTER1, VOTER2, VOTER3];
+    let mut hashi = test_utils::create_hashi_with_committee(voters, ctx);
+    let clock = clock::create_for_testing(ctx);
+    let btc = sui::balance::create_for_testing<BTC>(withdrawal_minimum(&hashi));
+    hashi.config_mut().set_paused(true);
+
+    hashi::withdraw::request_withdrawal(&mut hashi, &clock, btc, P2WPKH_PROGRAM, ctx);
+
+    // Clean up (shouldn't be reached due to expected failure)
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+}
+
 // ======== Certificate-based tests ========
 
 /// Helper: build the signing message bytes for a certificate.
@@ -286,7 +463,7 @@ fun dummy_queue_cert(): hashi::committee::CommitteeSignature {
     hashi::committee::new_committee_signature(0, vector[], vector[])
 }
 
-/// Create, approve, commit (v2 in-place), fully sign and finalize a
+/// Create, approve, commit in place, fully sign and finalize a
 /// single-request withdrawal whose input UTXO is seeded in the pool.
 /// Returns (request_id, txn_id).
 fun setup_fully_signed_txn(
@@ -294,10 +471,23 @@ fun setup_fully_signed_txn(
     clock: &clock::Clock,
     ctx: &mut TxContext,
 ): (address, address) {
+    let (id, txn_id) = setup_committed_txn(hashi, clock, @0xBEEF, ctx);
+    let queue = hashi.bitcoin_mut().withdrawal_queue_mut();
+    queue.record_input_signatures(txn_id, vector[0], vector[x"DEADBEEF"]);
+    queue.finalize_withdrawal_txn(txn_id, vector[x"AAAAAAAA"], clock);
+    (id, txn_id)
+}
+
+fun setup_committed_txn(
+    hashi: &mut hashi::hashi::Hashi,
+    clock: &clock::Clock,
+    input_txid: address,
+    ctx: &mut TxContext,
+): (address, address) {
     let id = setup_withdrawal_request(hashi, clock, 10_000, ctx);
     hashi.bitcoin_mut().withdrawal_queue_mut().approve_withdrawal(id, dummy_queue_cert(), clock);
 
-    let input_id = utxo::utxo_id(@0xBEEF, 0);
+    let input_id = utxo::utxo_id(input_txid, 0);
     let input = utxo::utxo(input_id, 1_000_000, option::none());
     hashi.bitcoin_mut().utxo_pool_mut().insert_active(input);
 
@@ -314,10 +504,6 @@ fun setup_fully_signed_txn(
     let btc = hashi.bitcoin_mut().withdrawal_queue_mut().commit_requests(&txn);
     btc.destroy_for_testing();
     hashi.bitcoin_mut().withdrawal_queue_mut().insert_withdrawal_txn(txn);
-
-    let queue = hashi.bitcoin_mut().withdrawal_queue_mut();
-    queue.record_input_signatures(txn_id, vector[0], vector[x"DEADBEEF"]);
-    queue.finalize_withdrawal_txn(txn_id, vector[x"AAAAAAAA"], clock);
     (id, txn_id)
 }
 
@@ -427,38 +613,28 @@ fun test_archive_entry_batch_mixed() {
 
 #[test]
 #[expected_failure(abort_code = hashi::withdraw::ECannotCancelProcessingWithdrawal)]
-fun test_cancel_pre_upgrade_processed_request() {
+fun test_cancel_archived_request() {
     let epoch = 0u64;
     let ctx = &mut test_utils::new_tx_context(REQUESTER, epoch);
     let voters = vector[VOTER1, VOTER2, VOTER3];
     let mut hashi = test_utils::create_hashi_with_committee(voters, ctx);
     let mut clock = clock::create_for_testing(ctx);
 
-    // Simulate a request committed before the deferred-archival upgrade: it
-    // sits in `processed`, so the cancellation gate must trip via the
-    // fallback bag check rather than the in-place txn-link check.
-    let id = setup_withdrawal_request(&mut hashi, &clock, 10_000, ctx);
-    hashi.bitcoin_mut().withdrawal_queue_mut().approve_withdrawal(id, dummy_queue_cert(), &clock);
-    let input = utxo::utxo(utxo::utxo_id(@0xBEEF, 0), 1_000_000, option::none());
-    let txn = withdrawal_queue::new_withdrawal_txn_for_testing(
-        vector[id],
-        vector[input],
-        vector[withdrawal_queue::output_utxo(1, x"00")],
-        vector[],
-        @0xBEEF,
-        &clock,
-        ctx,
-    );
-    let btc = hashi.bitcoin_mut().withdrawal_queue_mut().commit_requests_v1_style_for_testing(&txn);
+    // An archived request has left `requests` for `processed`, so the
+    // cancellation gate must trip via the fallback bag check rather than the
+    // in-place txn-link check.
+    let (id, txn_id) = setup_fully_signed_txn(&mut hashi, &clock, ctx);
+    confirm_via_entry(&mut hashi, txn_id, &clock);
+    hashi::withdraw::archive_confirmed_withdrawals(&mut hashi, vector[txn_id]);
+    assert!(!hashi.bitcoin().withdrawal_queue().request_in_requests(id));
+    assert!(hashi.bitcoin().withdrawal_queue().request_in_processed(id));
 
     let one_hour_ms = 1000 * 60 * 60;
     clock.set_for_testing(one_hour_ms);
     let refund = hashi::withdraw::cancel_withdrawal(&mut hashi, id, &clock, ctx);
 
-    // Cleanup — not reached.
+    // Cleanup, not reached.
     refund.destroy_for_testing();
-    btc.destroy_for_testing();
-    std::unit_test::destroy(txn);
     clock.destroy_for_testing();
     std::unit_test::destroy(hashi);
 }
@@ -506,4 +682,149 @@ fun test_archive_runs_while_paused() {
 
     clock.destroy_for_testing();
     std::unit_test::destroy(hashi);
+}
+
+// ======== Presig reallocation ========
+
+/// Inserts a txn with `num_inputs` inputs whose signing batch is on epoch 0
+/// with presigs `0`, `1`, and so on, and returns its ID.
+fun insert_epoch_zero_txn(
+    hashi: &mut hashi::hashi::Hashi,
+    num_inputs: u64,
+    clock: &clock::Clock,
+    ctx: &mut TxContext,
+): address {
+    let inputs = vector::tabulate!(num_inputs, |i| {
+        utxo::utxo(utxo::utxo_id(@0xCAFE, i as u32), 1_000_000, option::none())
+    });
+    let txn = withdrawal_queue::new_withdrawal_txn_for_testing(
+        vector[],
+        inputs,
+        vector[withdrawal_queue::output_utxo(1, x"00")],
+        vector[],
+        @0xCAFE,
+        clock,
+        ctx,
+    );
+    let txn_id = txn.withdrawal_txn_id();
+    hashi.bitcoin_mut().withdrawal_queue_mut().insert_withdrawal_txn(txn);
+    txn_id
+}
+
+fun new_random(): (sui::test_scenario::Scenario, sui::random::Random) {
+    let mut scenario = sui::test_scenario::begin(@0x0);
+    sui::random::create_for_testing(scenario.ctx());
+    scenario.next_tx(@0x0);
+    let mut random = scenario.take_shared<sui::random::Random>();
+    random.update_randomness_state_for_testing(
+        0,
+        x"1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F",
+        scenario.ctx(),
+    );
+    (scenario, random)
+}
+
+fun destroy_random(scenario: sui::test_scenario::Scenario, random: sui::random::Random) {
+    sui::test_scenario::return_shared(random);
+    scenario.end();
+}
+
+#[test]
+fun test_reallocate_presigs_assigns_fresh_presigs_to_pending_inputs() {
+    // The committee is on epoch 1, so the epoch-0 batch is stale.
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 1);
+    let mut hashi = test_utils::create_hashi_with_committee(vector[VOTER1, VOTER2, VOTER3], ctx);
+    let clock = clock::create_for_testing(ctx);
+    let (scenario, random) = new_random();
+    let txn_id = insert_epoch_zero_txn(&mut hashi, 3, &clock, ctx);
+    hashi
+        .bitcoin_mut()
+        .withdrawal_queue_mut()
+        .record_input_signatures(txn_id, vector[1], vector[x"11"]);
+    // Earlier withdrawals this epoch already consumed presigs 0 through 4.
+    let _ = hashi.allocate_presigs(5);
+
+    hashi::withdraw::reallocate_presigs(&mut hashi, txn_id, &random, ctx);
+
+    let queue = hashi.bitcoin().withdrawal_queue();
+    let signing = queue.withdrawal_txn_signing_for_testing(txn_id);
+    assert!(signing.epoch() == 1);
+    assert!(signing.pending_index(0) == option::some(5));
+    assert!(signing.is_signed(1));
+    assert!(signing.pending_index(2) == option::some(6));
+
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+    destroy_random(scenario, random);
+}
+
+#[test]
+fun test_reallocate_presigs_with_every_input_signed_only_moves_epoch() {
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 1);
+    let mut hashi = test_utils::create_hashi_with_committee(vector[VOTER1, VOTER2, VOTER3], ctx);
+    let clock = clock::create_for_testing(ctx);
+    let (scenario, random) = new_random();
+    let txn_id = insert_epoch_zero_txn(&mut hashi, 2, &clock, ctx);
+    hashi
+        .bitcoin_mut()
+        .withdrawal_queue_mut()
+        .record_input_signatures(txn_id, vector[0, 1], vector[x"00", x"11"]);
+    let randomness = hashi.bitcoin().withdrawal_queue().withdrawal_txn_randomness(txn_id);
+
+    hashi::withdraw::reallocate_presigs(&mut hashi, txn_id, &random, ctx);
+
+    let queue = hashi.bitcoin().withdrawal_queue();
+    assert!(queue.withdrawal_txn_signing_epoch(txn_id) == 1);
+    assert!(queue.withdrawal_txn_mpc_signatures(txn_id) == vector[x"00", x"11"]);
+    assert!(queue.withdrawal_txn_randomness(txn_id) == randomness);
+    // Nothing was pending, so the next reallocation still starts at 0.
+    let other_txn_id = insert_epoch_zero_txn(&mut hashi, 1, &clock, ctx);
+    hashi::withdraw::reallocate_presigs(&mut hashi, other_txn_id, &random, ctx);
+    let queue = hashi.bitcoin().withdrawal_queue();
+    let signing = queue.withdrawal_txn_signing_for_testing(other_txn_id);
+    assert!(signing.pending_index(0) == option::some(0));
+
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+    destroy_random(scenario, random);
+}
+
+#[test]
+#[expected_failure(abort_code = hashi::mpc_signing::ENotStale)]
+fun test_reallocate_presigs_twice_in_one_epoch_aborts() {
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 1);
+    let mut hashi = test_utils::create_hashi_with_committee(vector[VOTER1, VOTER2, VOTER3], ctx);
+    let clock = clock::create_for_testing(ctx);
+    let (scenario, random) = new_random();
+    let txn_id = insert_epoch_zero_txn(&mut hashi, 1, &clock, ctx);
+
+    hashi::withdraw::reallocate_presigs(&mut hashi, txn_id, &random, ctx);
+    hashi::withdraw::reallocate_presigs(&mut hashi, txn_id, &random, ctx);
+
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+    destroy_random(scenario, random);
+}
+
+#[test]
+fun test_reallocate_presigs_redraws_randomness() {
+    let ctx = &mut test_utils::new_tx_context(REQUESTER, 1);
+    let mut hashi = test_utils::create_hashi_with_committee(vector[VOTER1, VOTER2, VOTER3], ctx);
+    let clock = clock::create_for_testing(ctx);
+    let (scenario, random) = new_random();
+    let (_, first) = setup_committed_txn(&mut hashi, &clock, @0xBEEF, ctx);
+    let (_, second) = setup_committed_txn(&mut hashi, &clock, @0xCAFE, ctx);
+
+    hashi::withdraw::reallocate_presigs(&mut hashi, first, &random, ctx);
+    hashi::withdraw::reallocate_presigs(&mut hashi, second, &random, ctx);
+
+    let queue = hashi.bitcoin().withdrawal_queue();
+    let drawn = queue.withdrawal_txn_randomness(first);
+    assert!(queue.withdrawal_txn_signing_epoch(first) == 1);
+    assert!(drawn.length() == 32);
+    assert!(drawn != queue.withdrawal_txn_randomness(second));
+
+    clock.destroy_for_testing();
+    std::unit_test::destroy(hashi);
+    destroy_random(scenario, random);
 }

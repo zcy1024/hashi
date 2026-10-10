@@ -1504,11 +1504,13 @@ pub mod guardian_relay_service_client {
         /// backend when one is configured, else the active guardian (first deploy).
         /// KP tooling pins its session from this instead of the node-facing
         /// GetGuardianInfo, which always answers for the ACTIVE guardian.
+        /// Always includes a fresh attestation for KP verification; never cached.
+        /// Apply the same access policy as GuardianService/GetAttestedGuardianInfo.
         pub async fn get_provisioning_target_info(
             &mut self,
             request: impl tonic::IntoRequest<super::GetProvisioningTargetInfoRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::GetGuardianInfoResponse>,
+            tonic::Response<super::GetAttestedGuardianInfoResponse>,
             tonic::Status,
         > {
             self.inner
@@ -1559,11 +1561,13 @@ pub mod guardian_relay_service_server {
         /// backend when one is configured, else the active guardian (first deploy).
         /// KP tooling pins its session from this instead of the node-facing
         /// GetGuardianInfo, which always answers for the ACTIVE guardian.
+        /// Always includes a fresh attestation for KP verification; never cached.
+        /// Apply the same access policy as GuardianService/GetAttestedGuardianInfo.
         async fn get_provisioning_target_info(
             &self,
             request: tonic::Request<super::GetProvisioningTargetInfoRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::GetGuardianInfoResponse>,
+            tonic::Response<super::GetAttestedGuardianInfoResponse>,
             tonic::Status,
         >;
     }
@@ -1713,7 +1717,7 @@ pub mod guardian_relay_service_server {
                     > tonic::server::UnaryService<
                         super::GetProvisioningTargetInfoRequest,
                     > for GetProvisioningTargetInfoSvc<T> {
-                        type Response = super::GetGuardianInfoResponse;
+                        type Response = super::GetAttestedGuardianInfoResponse;
                         type Future = BoxFuture<
                             tonic::Response<Self::Response>,
                             tonic::Status,
@@ -1799,16 +1803,23 @@ pub mod guardian_relay_service_server {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetGuardianInfoRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetAttestedGuardianInfoRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetGuardianInfoResponse {
-    /// AWS Nitro attestation document.
+    #[prost(message, optional, tag = "1")]
+    pub info: ::core::option::Option<GuardianInfoData>,
+    /// Milliseconds since Unix epoch when the state was read.
+    #[prost(uint64, optional, tag = "2")]
+    pub timestamp_ms: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetAttestedGuardianInfoResponse {
+    /// Required AWS Nitro attestation document.
     #[prost(bytes = "bytes", optional, tag = "1")]
     pub attestation: ::core::option::Option<::prost::bytes::Bytes>,
-    /// Guardian signing public key (Ed25519, 32 bytes).
-    #[prost(bytes = "bytes", optional, tag = "2")]
-    pub signing_pub_key: ::core::option::Option<::prost::bytes::Bytes>,
     /// Signed guardian info (includes server version, encryption pubkey, and optional S3/bucket info).
-    #[prost(message, optional, tag = "3")]
+    #[prost(message, optional, tag = "2")]
     pub signed_info: ::core::option::Option<SignedGuardianInfo>,
 }
 /// Guardian-signed wrapper around `GuardianInfoData`.
@@ -1826,60 +1837,63 @@ pub struct SignedGuardianInfo {
 /// Information about the guardian enclave.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GuardianInfoData {
+    /// Guardian signing public key (Ed25519, 32 bytes).
+    #[prost(bytes = "bytes", optional, tag = "1")]
+    pub signing_pub_key: ::core::option::Option<::prost::bytes::Bytes>,
     /// Secret-sharing instance (if set).
-    #[prost(message, optional, tag = "1")]
+    #[prost(message, optional, tag = "2")]
     pub secret_sharing_instance: ::core::option::Option<SecretSharingInstance>,
     /// Installed deployment summary; absent before operator initialization.
-    #[prost(message, optional, tag = "2")]
+    #[prost(message, optional, tag = "3")]
     pub deployment_info: ::core::option::Option<DeploymentConfigSummary>,
     /// Guardian encryption public key (32 bytes).
-    #[prost(bytes = "bytes", optional, tag = "3")]
+    #[prost(bytes = "bytes", optional, tag = "4")]
     pub encryption_pubkey: ::core::option::Option<::prost::bytes::Bytes>,
     /// X-only Bitcoin pubkey of the enclave's BTC signing key (32 bytes).
     /// Absent before `provisioner_init` has set the keypair.
-    #[prost(bytes = "bytes", optional, tag = "4")]
+    #[prost(bytes = "bytes", optional, tag = "5")]
     pub enclave_btc_pubkey: ::core::option::Option<::prost::bytes::Bytes>,
     /// Digest of the operator-supplied InitConfig (32 bytes, if set).
-    #[prost(bytes = "bytes", optional, tag = "5")]
+    #[prost(bytes = "bytes", optional, tag = "6")]
     pub config_hash: ::core::option::Option<::prost::bytes::Bytes>,
     /// Current rate limiter state (if initialized).
-    #[prost(message, optional, tag = "6")]
+    #[prost(message, optional, tag = "7")]
     pub limiter_state: ::core::option::Option<LimiterState>,
     /// Immutable limiter configuration (if initialized).
-    #[prost(message, optional, tag = "7")]
+    #[prost(message, optional, tag = "8")]
     pub limiter_config: ::core::option::Option<LimiterConfig>,
     /// Current committee epoch (if initialized). Drives `UpdateCommittee` catch-up.
-    #[prost(uint64, optional, tag = "8")]
+    #[prost(uint64, optional, tag = "9")]
     pub current_committee_epoch: ::core::option::Option<u64>,
     /// MPC committee verifying key `G` as `bcs(G)` (the derivation master, NOT the
     /// guardian's own BTC key). Set after operator_init.
-    #[prost(bytes = "bytes", optional, tag = "9")]
+    #[prost(bytes = "bytes", optional, tag = "10")]
     pub mpc_master_g: ::core::option::Option<::prost::bytes::Bytes>,
     /// Digest of the optional GenesisState pinned during operator_init.
-    #[prost(bytes = "bytes", optional, tag = "12")]
+    #[prost(bytes = "bytes", optional, tag = "13")]
     pub genesis_state_hash: ::core::option::Option<::prost::bytes::Bytes>,
     /// The Hashi shared-object id (32 bytes) this guardian serves (set after
     /// operator_init). Certificates verified by this enclave are bound to it.
-    #[prost(bytes = "bytes", optional, tag = "13")]
+    #[prost(bytes = "bytes", optional, tag = "14")]
     pub hashi_object_id: ::core::option::Option<::prost::bytes::Bytes>,
-    /// Signed enclave mode and its current lifecycle stage.
-    #[prost(oneof = "guardian_info_data::Lifecycle", tags = "10, 11")]
+    /// Enclave mode and stage; absent until operator initialization commits.
+    #[prost(oneof = "guardian_info_data::Lifecycle", tags = "11, 12")]
     pub lifecycle: ::core::option::Option<guardian_info_data::Lifecycle>,
 }
 /// Nested message and enum types in `GuardianInfoData`.
 pub mod guardian_info_data {
-    /// Signed enclave mode and its current lifecycle stage.
+    /// Enclave mode and stage; absent until operator initialization commits.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Lifecycle {
-        #[prost(enumeration = "super::CeremonyStage", tag = "10")]
+        #[prost(enumeration = "super::CeremonyStage", tag = "11")]
         Ceremony(i32),
-        #[prost(enumeration = "super::WithdrawStage", tag = "11")]
+        #[prost(enumeration = "super::WithdrawStage", tag = "12")]
         Withdraw(i32),
     }
 }
 /// Public description of the current BTC key's secret-sharing scheme.
 /// `commitments.len() == num_shares` and `2 <= threshold <= num_shares`.
-/// `sharing_seq` versions instances: 0 at setup, +1 per rotation.
+/// `sharing_seq` versions instances; it increases across rotations and may skip abandoned attempts.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SecretSharingInstance {
     #[prost(message, repeated, tag = "1")]
@@ -2153,11 +2167,6 @@ pub struct InitConfig {
     pub deployment: ::core::option::Option<DeploymentConfig>,
     #[prost(message, optional, tag = "2")]
     pub limiter_config: ::core::option::Option<LimiterConfig>,
-    /// Compressed MPC public key (33 bytes).
-    #[prost(bytes = "bytes", optional, tag = "3")]
-    pub hashi_btc_master_pubkey: ::core::option::Option<::prost::bytes::Bytes>,
-    #[prost(bytes = "bytes", optional, tag = "4")]
-    pub hashi_object_id: ::core::option::Option<::prost::bytes::Bytes>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LimiterState {
@@ -2351,10 +2360,9 @@ pub struct UpdateCommitteeResponse {
 #[repr(i32)]
 pub enum CeremonyStage {
     Unspecified = 0,
-    Uninitialized = 1,
-    OperatorInitialized = 2,
-    AwaitingKeyProvisionerConfirmations = 3,
-    Completed = 4,
+    OperatorInitialized = 1,
+    AwaitingKeyProvisionerConfirmations = 2,
+    Completed = 3,
 }
 impl CeremonyStage {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2364,7 +2372,6 @@ impl CeremonyStage {
     pub fn as_str_name(&self) -> &'static str {
         match self {
             Self::Unspecified => "CEREMONY_STAGE_UNSPECIFIED",
-            Self::Uninitialized => "CEREMONY_STAGE_UNINITIALIZED",
             Self::OperatorInitialized => "CEREMONY_STAGE_OPERATOR_INITIALIZED",
             Self::AwaitingKeyProvisionerConfirmations => {
                 "CEREMONY_STAGE_AWAITING_KEY_PROVISIONER_CONFIRMATIONS"
@@ -2376,7 +2383,6 @@ impl CeremonyStage {
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
             "CEREMONY_STAGE_UNSPECIFIED" => Some(Self::Unspecified),
-            "CEREMONY_STAGE_UNINITIALIZED" => Some(Self::Uninitialized),
             "CEREMONY_STAGE_OPERATOR_INITIALIZED" => Some(Self::OperatorInitialized),
             "CEREMONY_STAGE_AWAITING_KEY_PROVISIONER_CONFIRMATIONS" => {
                 Some(Self::AwaitingKeyProvisionerConfirmations)
@@ -2390,10 +2396,9 @@ impl CeremonyStage {
 #[repr(i32)]
 pub enum WithdrawStage {
     Unspecified = 0,
-    Uninitialized = 1,
-    OperatorInitialized = 2,
-    ProvisionerInitialized = 3,
-    Activated = 4,
+    OperatorInitialized = 1,
+    ProvisionerInitialized = 2,
+    Activated = 3,
 }
 impl WithdrawStage {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2403,7 +2408,6 @@ impl WithdrawStage {
     pub fn as_str_name(&self) -> &'static str {
         match self {
             Self::Unspecified => "WITHDRAW_STAGE_UNSPECIFIED",
-            Self::Uninitialized => "WITHDRAW_STAGE_UNINITIALIZED",
             Self::OperatorInitialized => "WITHDRAW_STAGE_OPERATOR_INITIALIZED",
             Self::ProvisionerInitialized => "WITHDRAW_STAGE_PROVISIONER_INITIALIZED",
             Self::Activated => "WITHDRAW_STAGE_ACTIVATED",
@@ -2413,7 +2417,6 @@ impl WithdrawStage {
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
             "WITHDRAW_STAGE_UNSPECIFIED" => Some(Self::Unspecified),
-            "WITHDRAW_STAGE_UNINITIALIZED" => Some(Self::Uninitialized),
             "WITHDRAW_STAGE_OPERATOR_INITIALIZED" => Some(Self::OperatorInitialized),
             "WITHDRAW_STAGE_PROVISIONER_INITIALIZED" => {
                 Some(Self::ProvisionerInitialized)
@@ -2578,7 +2581,7 @@ pub mod guardian_service_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
-        /// Query the service for general information about its current state.
+        /// Query self-reported guardian state without a signature or attestation. May be cached.
         pub async fn get_guardian_info(
             &mut self,
             request: impl tonic::IntoRequest<super::GetGuardianInfoRequest>,
@@ -2604,6 +2607,37 @@ pub mod guardian_service_client {
                     GrpcMethod::new(
                         "sui.hashi.v1alpha.GuardianService",
                         "GetGuardianInfo",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// KP/operator query: generate a fresh attestation alongside signed guardian info.
+        /// Never cached. Access can be restricted independently of GetGuardianInfo.
+        pub async fn get_attested_guardian_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetAttestedGuardianInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetAttestedGuardianInfoResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sui.hashi.v1alpha.GuardianService/GetAttestedGuardianInfo",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "sui.hashi.v1alpha.GuardianService",
+                        "GetAttestedGuardianInfo",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -2920,12 +2954,21 @@ pub mod guardian_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with GuardianServiceServer.
     #[async_trait]
     pub trait GuardianService: std::marker::Send + std::marker::Sync + 'static {
-        /// Query the service for general information about its current state.
+        /// Query self-reported guardian state without a signature or attestation. May be cached.
         async fn get_guardian_info(
             &self,
             request: tonic::Request<super::GetGuardianInfoRequest>,
         ) -> std::result::Result<
             tonic::Response<super::GetGuardianInfoResponse>,
+            tonic::Status,
+        >;
+        /// KP/operator query: generate a fresh attestation alongside signed guardian info.
+        /// Never cached. Access can be restricted independently of GetGuardianInfo.
+        async fn get_attested_guardian_info(
+            &self,
+            request: tonic::Request<super::GetAttestedGuardianInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetAttestedGuardianInfoResponse>,
             tonic::Status,
         >;
         /// Ceremony mode only: generate a new BTC key and distribute encrypted shares.
@@ -3122,6 +3165,57 @@ pub mod guardian_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetGuardianInfoSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sui.hashi.v1alpha.GuardianService/GetAttestedGuardianInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetAttestedGuardianInfoSvc<T: GuardianService>(pub Arc<T>);
+                    impl<
+                        T: GuardianService,
+                    > tonic::server::UnaryService<super::GetAttestedGuardianInfoRequest>
+                    for GetAttestedGuardianInfoSvc<T> {
+                        type Response = super::GetAttestedGuardianInfoResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::GetAttestedGuardianInfoRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as GuardianService>::get_attested_guardian_info(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetAttestedGuardianInfoSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -3690,6 +3784,9 @@ pub struct AvidNonceDispersal {
     /// The confirm certificate bound to this dispersal.
     #[prost(message, optional, tag = "2")]
     pub confirm_cert: ::core::option::Option<::sui_rpc::proto::sui::rpc::v2::Bcs>,
+    /// Round-1 message for a non-confirmer, so it can still vote in round 2.
+    #[prost(message, optional, tag = "3")]
+    pub optimistic_message: ::core::option::Option<::sui_rpc::proto::sui::rpc::v2::Bcs>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AvidNonceEcho {
@@ -3845,6 +3942,21 @@ pub struct GetReconfigCompletionSignatureRequest {
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetReconfigCompletionSignatureResponse {
     /// The validator's BLS signature on the reconfig completion message.
+    #[prost(bytes = "bytes", optional, tag = "1")]
+    pub signature: ::core::option::Option<::prost::bytes::Bytes>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetPresigDealerSetSignatureRequest {
+    /// The epoch of the presig batch.
+    #[prost(uint64, optional, tag = "1")]
+    pub epoch: ::core::option::Option<u64>,
+    /// The presig batch index within the epoch.
+    #[prost(uint32, optional, tag = "2")]
+    pub batch_index: ::core::option::Option<u32>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetPresigDealerSetSignatureResponse {
+    /// The validator's BLS signature on the presig batch's dealer set message.
     #[prost(bytes = "bytes", optional, tag = "1")]
     pub signature: ::core::option::Option<::prost::bytes::Bytes>,
 }
@@ -4135,6 +4247,36 @@ pub mod mpc_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Get a validator's signature attesting that a presig batch's dealer set is final.
+        pub async fn get_presig_dealer_set_signature(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetPresigDealerSetSignatureRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetPresigDealerSetSignatureResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sui.hashi.v1alpha.MpcService/GetPresigDealerSetSignature",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "sui.hashi.v1alpha.MpcService",
+                        "GetPresigDealerSetSignature",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Pull partial signatures from another party.
         pub async fn get_partial_signatures(
             &mut self,
@@ -4218,6 +4360,14 @@ pub mod mpc_service_server {
             request: tonic::Request<super::GetReconfigCompletionSignatureRequest>,
         ) -> std::result::Result<
             tonic::Response<super::GetReconfigCompletionSignatureResponse>,
+            tonic::Status,
+        >;
+        /// Get a validator's signature attesting that a presig batch's dealer set is final.
+        async fn get_presig_dealer_set_signature(
+            &self,
+            request: tonic::Request<super::GetPresigDealerSetSignatureRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetPresigDealerSetSignatureResponse>,
             tonic::Status,
         >;
         /// Pull partial signatures from another party.
@@ -4538,6 +4688,58 @@ pub mod mpc_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/sui.hashi.v1alpha.MpcService/GetPresigDealerSetSignature" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetPresigDealerSetSignatureSvc<T: MpcService>(pub Arc<T>);
+                    impl<
+                        T: MpcService,
+                    > tonic::server::UnaryService<
+                        super::GetPresigDealerSetSignatureRequest,
+                    > for GetPresigDealerSetSignatureSvc<T> {
+                        type Response = super::GetPresigDealerSetSignatureResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::GetPresigDealerSetSignatureRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MpcService>::get_presig_dealer_set_signature(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetPresigDealerSetSignatureSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/sui.hashi.v1alpha.MpcService/GetPartialSignatures" => {
                     #[allow(non_camel_case_types)]
                     struct GetPartialSignaturesSvc<T: MpcService>(pub Arc<T>);
@@ -4649,6 +4851,11 @@ pub struct CommitteeMember {
     pub encryption_public_key: ::core::option::Option<::prost::bytes::Bytes>,
     #[prost(uint64, optional, tag = "4")]
     pub weight: ::core::option::Option<u64>,
+    /// BCS-encoded VecMap\<String, config_value::Value>: the member's on-chain
+    /// extension slot, empty today. Carried verbatim, like Committee.config, so
+    /// the committee's signed BCS bytes survive this hop without reconstruction.
+    #[prost(bytes = "bytes", optional, tag = "5")]
+    pub extra_fields: ::core::option::Option<::prost::bytes::Bytes>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MemberSignature {

@@ -14,6 +14,7 @@ use crate::constants::SUI_MAINNET_CHAIN_ID;
 
 const DEFAULT_WITHDRAWAL_SIGNING_CONCURRENCY: usize = 25;
 const DEFAULT_MPC_SIGNING_CHUNK_SIZE: usize = 64;
+const DEFAULT_WITHDRAWAL_SIGNING_PER_CALLER_LIMIT: usize = 4;
 /// Tonic's 4 MiB default is too small to scrape a large on-chain state or
 /// receive large MPC round messages.
 pub(crate) const DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
@@ -63,7 +64,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_url: Option<String>,
 
-    /// Configure the address to listen on for http metrics
+    /// Configure the address to listen on for http metrics, which also serves
+    /// `/health` for liveness probes.
     ///
     /// Defaults to `127.0.0.1:9180` if not specified.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,8 +125,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trm_api_key: Option<String>,
 
-    /// URL of the `hashi-guardian` gRPC endpoint. When not set, the guardian
-    /// integration is bypassed.
+    /// The guardian's node endpoint, used only when the chain has no
+    /// `guardian_node_url` at startup; the node keeps it until restarted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guardian_endpoint: Option<String>,
 
@@ -175,13 +177,15 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub withdrawal_max_batch_size: Option<usize>,
 
-    /// Max number of withdrawal-tx inputs whose MPC signatures the signer
-    /// will collect in parallel within a single `sign_withdrawal_transaction`
-    /// RPC.
+    /// Capacity of the channel carrying one `sign_withdrawal_transaction`
+    /// stream's signatures to the caller.
     ///
     /// Defaults to 25.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub withdrawal_signing_concurrency: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withdrawal_signing_per_caller_limit: Option<usize>,
 
     /// Number of per-input MPC signatures the leader writes to chain in one
     /// `commit_input_signatures` PTB — the on-chain write batch size `M`. Trades
@@ -224,6 +228,18 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_corrupt_shares_for: Option<Address>,
 
+    /// Which complaints this node answers with its recovery shares.
+    /// Complaints are still verified and logged, and withheld ones counted in
+    /// `hashi_mpc_complaints_withheld_total`; this only decides whether the
+    /// response is returned.
+    ///
+    /// Defaults to an empty allow-list, i.e. no complaint is answered.
+    ///
+    /// Allow-listing a dealer is a coordinated decision:
+    /// a wrong entry can leak private shares to the dealer.    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complaint_response_policy: Option<ComplaintResponsePolicy>,
+
     /// Configure pushing Prometheus metrics out to a sui-proxy instance. When
     /// unset, the push task is not started and the only metrics surface is the
     /// local scrape endpoint at `metrics_http_address`.
@@ -259,6 +275,40 @@ pub enum ForceRunAsLeader {
     Never,
 }
 
+/// Which complaints a node answers with its recovery shares.
+#[derive(Clone, Debug, PartialEq, Eq, serde_derive::Deserialize, serde_derive::Serialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ComplaintResponsePolicy {
+    /// Answer every complaint that verifies.
+    AllowAll,
+    /// Answer only complaints about messages from these dealers.
+    AllowList { dealers: Vec<AllowedDealer> },
+}
+
+/// A dealer whose messages in `epoch` this node answers complaints about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde_derive::Deserialize, serde_derive::Serialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AllowedDealer {
+    pub epoch: u64,
+    pub dealer: Address,
+}
+
+/// The default policy: an empty allow-list, answering no complaint.
+static DENY_ALL_COMPLAINTS: ComplaintResponsePolicy = ComplaintResponsePolicy::AllowList {
+    dealers: Vec::new(),
+};
+
+impl ComplaintResponsePolicy {
+    pub fn allows(&self, epoch: u64, dealer: &Address) -> bool {
+        match self {
+            Self::AllowAll => true,
+            Self::AllowList { dealers } => dealers
+                .iter()
+                .any(|allowed| allowed.epoch == epoch && allowed.dealer == *dealer),
+        }
+    }
+}
+
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
@@ -291,6 +341,10 @@ impl Config {
         anyhow::ensure!(
             config.grpc_per_peer_inflight_limit != Some(0),
             "grpc_per_peer_inflight_limit must be at least 1"
+        );
+        anyhow::ensure!(
+            config.withdrawal_signing_per_caller_limit != Some(0),
+            "withdrawal_signing_per_caller_limit must be at least 1"
         );
         anyhow::ensure!(
             config
@@ -431,6 +485,12 @@ impl Config {
         self.force_run_as_leader.clone().unwrap_or_default()
     }
 
+    pub fn complaint_response_policy(&self) -> &ComplaintResponsePolicy {
+        self.complaint_response_policy
+            .as_ref()
+            .unwrap_or(&DENY_ALL_COMPLAINTS)
+    }
+
     pub fn test_weight_divisor(&self) -> u16 {
         self.test_weight_divisor.unwrap_or(1)
     }
@@ -471,6 +531,11 @@ impl Config {
         self.withdrawal_signing_concurrency
             .unwrap_or(DEFAULT_WITHDRAWAL_SIGNING_CONCURRENCY)
             .max(1)
+    }
+
+    pub fn withdrawal_signing_per_caller_limit(&self) -> usize {
+        self.withdrawal_signing_per_caller_limit
+            .unwrap_or(DEFAULT_WITHDRAWAL_SIGNING_PER_CALLER_LIMIT)
     }
 
     pub fn mpc_signing_chunk_size(&self) -> usize {
@@ -533,11 +598,13 @@ impl Config {
             withdrawal_batching_delay_ms: None,
             withdrawal_max_batch_size: None,
             withdrawal_signing_concurrency: None,
+            withdrawal_signing_per_caller_limit: None,
             mpc_signing_chunk_size: None,
             max_mempool_chain_depth: None,
             withdrawal_fee_conf_target: None,
             withdrawal_min_fee_rate_sat_vb: None,
             test_corrupt_shares_for: None,
+            complaint_response_policy: None,
             metrics_push: None,
         };
 
@@ -757,5 +824,61 @@ mod tests {
         let mut config = Config::new_for_testing();
         config.withdrawal_max_batch_size = Some(70);
         assert_eq!(config.withdrawal_max_batch_size(), 70);
+    }
+
+    #[test]
+    fn test_complaint_response_policy_defaults_to_deny_all() {
+        let config = Config::new_for_testing();
+        assert_eq!(
+            config.complaint_response_policy(),
+            &ComplaintResponsePolicy::AllowList { dealers: vec![] }
+        );
+        assert!(
+            !config
+                .complaint_response_policy()
+                .allows(1, &Address::new([1; 32]))
+        );
+    }
+
+    #[test]
+    fn test_complaint_response_policy_allows() {
+        let dealer = Address::new([1; 32]);
+        let other = Address::new([2; 32]);
+        assert!(ComplaintResponsePolicy::AllowAll.allows(7, &dealer));
+
+        let list = ComplaintResponsePolicy::AllowList {
+            dealers: vec![AllowedDealer { epoch: 7, dealer }],
+        };
+        assert!(list.allows(7, &dealer));
+        assert!(!list.allows(8, &dealer));
+        assert!(!list.allows(7, &other));
+    }
+
+    #[test]
+    fn test_complaint_response_policy_toml() {
+        let dealer = Address::new([1; 32]);
+        let parse = |toml: &str| -> ComplaintResponsePolicy {
+            #[derive(serde_derive::Deserialize)]
+            #[serde(rename_all = "kebab-case")]
+            struct Wrapper {
+                complaint_response_policy: ComplaintResponsePolicy,
+            }
+            toml::from_str::<Wrapper>(toml)
+                .unwrap()
+                .complaint_response_policy
+        };
+        assert_eq!(
+            parse(r#"complaint-response-policy = "allow-all""#),
+            ComplaintResponsePolicy::AllowAll
+        );
+        assert_eq!(
+            parse(&format!(
+                "[complaint-response-policy.allow-list]\n\
+                 dealers = [{{ epoch = 7, dealer = \"{dealer}\" }}]\n"
+            )),
+            ComplaintResponsePolicy::AllowList {
+                dealers: vec![AllowedDealer { epoch: 7, dealer }],
+            }
+        );
     }
 }

@@ -107,7 +107,10 @@ stderr: {}",
 /// every deposit address is a 2-of-2 (mpc, guardian) taproot leaf, so a
 /// guardian-less deploy can't produce spendable deposits.
 pub struct GuardianConfig {
+    /// Public endpoint: `/info`, the key-provisioner relay.
     pub url: String,
+    /// Endpoint nodes call, presenting their registered TLS key.
+    pub node_url: String,
     /// X-only BTC pubkey of the enclave (32 bytes).
     pub btc_public_key: Vec<u8>,
 }
@@ -118,6 +121,38 @@ pub struct GuardianConfig {
 pub struct BitcoinConfigOverrides {
     pub confirmation_threshold: Option<u64>,
     pub deposit_time_delay_ms: Option<u64>,
+}
+
+impl BitcoinConfigOverrides {
+    // Move's `init_defaults`, the floor for a Sui mainnet launch.
+    const MAINNET_MIN_CONFIRMATION_THRESHOLD: u64 = 6;
+    const MAINNET_MIN_DEPOSIT_TIME_DELAY_MS: u64 = 10 * 60 * 1_000;
+
+    /// Refuse Sui mainnet overrides below the defaults: fewer confirmations let
+    /// a reorg mint against a deposit that no longer exists, and a shorter
+    /// delay shrinks the window to pause before a bad mint.
+    pub fn check_for_sui_chain(&self, sui_chain_id: &str) -> Result<()> {
+        if sui_chain_id != crate::constants::SUI_MAINNET_CHAIN_ID {
+            return Ok(());
+        }
+        if let Some(threshold) = self.confirmation_threshold {
+            anyhow::ensure!(
+                threshold >= Self::MAINNET_MIN_CONFIRMATION_THRESHOLD,
+                "refusing bitcoin_confirmation_threshold {threshold} on Sui mainnet: \
+                 it must be at least {}",
+                Self::MAINNET_MIN_CONFIRMATION_THRESHOLD
+            );
+        }
+        if let Some(delay_ms) = self.deposit_time_delay_ms {
+            anyhow::ensure!(
+                delay_ms >= Self::MAINNET_MIN_DEPOSIT_TIME_DELAY_MS,
+                "refusing bitcoin_deposit_time_delay_ms {delay_ms} on Sui mainnet: \
+                 it must be at least {}",
+                Self::MAINNET_MIN_DEPOSIT_TIME_DELAY_MS
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Result of [`publish_package`].
@@ -221,7 +256,9 @@ pub async fn publish_package(
 /// `sui_chain_id` is the chain the transaction will land on, as reported by
 /// the fullnode (`sui_rpc_client::fetch_sui_chain_id`); the builder refuses a
 /// Bitcoin chain that the protocol never pairs with it
-/// (`constants::check_sui_bitcoin_chain_pairing`) before touching the network.
+/// (`constants::check_sui_bitcoin_chain_pairing`) and overrides that chain
+/// doesn't allow ([`BitcoinConfigOverrides::check_for_sui_chain`]) before
+/// touching the network.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_finish_publish_tx(
     client: &mut Client,
@@ -239,6 +276,7 @@ pub async fn build_finish_publish_tx(
         "unrecognized bitcoin chain id: {bitcoin_chain_id}"
     );
     crate::constants::check_sui_bitcoin_chain_pairing(sui_chain_id, bitcoin_chain_id)?;
+    bitcoin_overrides.check_for_sui_chain(sui_chain_id)?;
     let block_hash = BlockHash::from_str(bitcoin_chain_id)?;
     let bitcoin_chain_id_addr = Address::new(*block_hash.as_byte_array());
 
@@ -253,6 +291,7 @@ pub async fn build_finish_publish_tx(
     let upgrade_cap_arg = builder.object(ObjectInput::new(upgrade_cap_id).as_owned());
     let bitcoin_chain_id_arg = builder.pure(&bitcoin_chain_id_addr);
     let guardian_url_arg = builder.pure(&guardian.url.as_str());
+    let guardian_node_url_arg = builder.pure(&guardian.node_url.as_str());
     let guardian_btc_public_key_arg = builder.pure(&guardian.btc_public_key.as_slice());
     let confirmation_threshold_arg = builder.pure(&bitcoin_overrides.confirmation_threshold);
     let deposit_time_delay_ms_arg = builder.pure(&bitcoin_overrides.deposit_time_delay_ms);
@@ -273,6 +312,7 @@ pub async fn build_finish_publish_tx(
             upgrade_cap_arg,
             bitcoin_chain_id_arg,
             guardian_url_arg,
+            guardian_node_url_arg,
             guardian_btc_public_key_arg,
             confirmation_threshold_arg,
             deposit_time_delay_ms_arg,
@@ -374,4 +414,82 @@ pub async fn find_upgrade_cap(
         "no UpgradeCap for package {package_id} owned by {owner}; it may already be \
          registered on-chain (launch already done) or held by a different address"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::BITCOIN_MAINNET_CHAIN_ID;
+    use crate::constants::SUI_MAINNET_CHAIN_ID;
+    use crate::constants::SUI_TESTNET_CHAIN_ID;
+
+    fn overrides(
+        confirmation_threshold: Option<u64>,
+        deposit_time_delay_ms: Option<u64>,
+    ) -> BitcoinConfigOverrides {
+        BitcoinConfigOverrides {
+            confirmation_threshold,
+            deposit_time_delay_ms,
+        }
+    }
+
+    #[test]
+    fn sui_mainnet_refuses_overrides_below_the_defaults() {
+        for (threshold, delay_ms) in [(Some(5), None), (None, Some(599_999)), (Some(2), Some(0))] {
+            let err = overrides(threshold, delay_ms)
+                .check_for_sui_chain(SUI_MAINNET_CHAIN_ID)
+                .unwrap_err();
+            assert!(err.to_string().contains("on Sui mainnet"), "{err}");
+        }
+    }
+
+    #[test]
+    fn sui_mainnet_accepts_the_defaults_or_higher() {
+        for (threshold, delay_ms) in [
+            (None, None),
+            (Some(6), Some(600_000)),
+            (Some(12), Some(3_600_000)),
+        ] {
+            overrides(threshold, delay_ms)
+                .check_for_sui_chain(SUI_MAINNET_CHAIN_ID)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn other_sui_chains_accept_any_override() {
+        overrides(Some(0), Some(0))
+            .check_for_sui_chain(SUI_TESTNET_CHAIN_ID)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_tx_refuses_a_zero_deposit_delay_on_sui_mainnet() {
+        let mut client = Client::new("http://127.0.0.1:1").unwrap();
+        let ids = HashiIds {
+            package_id: Address::ZERO,
+            hashi_object_id: Address::ZERO,
+        };
+        let guardian = GuardianConfig {
+            url: "http://guardian.invalid".to_owned(),
+            node_url: "http://node.guardian.invalid".to_owned(),
+            btc_public_key: vec![0; 32],
+        };
+        let err = build_finish_publish_tx(
+            &mut client,
+            Address::ZERO,
+            &ids,
+            Address::ZERO,
+            BITCOIN_MAINNET_CHAIN_ID,
+            SUI_MAINNET_CHAIN_ID,
+            &guardian,
+            &overrides(None, Some(0)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("bitcoin_deposit_time_delay_ms"),
+            "{err}"
+        );
+    }
 }

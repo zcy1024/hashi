@@ -33,9 +33,11 @@ use crate::metrics::MPC_LABEL_NONCE_GENERATION;
 use crate::metrics::Metrics;
 use crate::mpc::MpcManager;
 use crate::mpc::MpcOutput;
+use crate::mpc::RefillRequest;
 use crate::mpc::SigningManager;
 use crate::mpc::mpc_except_signing::VerifiedNonceCerts;
 use crate::mpc::mpc_except_signing::spawn_blocking;
+use crate::mpc::presig_seal;
 use crate::mpc::rpc::RpcP2PChannel;
 use crate::mpc::signing::IdentityInputs;
 use crate::mpc::types::CertificateV1;
@@ -50,9 +52,8 @@ use fastcrypto_tbls::threshold_schnorr::G;
 use fastcrypto_tbls::threshold_schnorr::Parameters;
 use fastcrypto_tbls::threshold_schnorr::presigning::Presignatures;
 use hashi_types::committee::BLS12381Signature;
-use hashi_types::committee::BlsSignatureAggregator;
-use hashi_types::committee::Committee;
 use hashi_types::committee::CommitteeSignature;
+use hashi_types::committee::RuntimeCommittee;
 use hashi_types::committee::certificate_threshold;
 use hashi_types::move_types;
 use hashi_types::move_types::ReconfigCompletionMessage;
@@ -70,7 +71,6 @@ const NONCE_WINDOW_WAIT_SLACK: Duration = Duration::from_secs(30);
 const MAX_KEY_REREGISTRATION_BUMPS: u32 = 3;
 const NONCE_RECEIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const NONCE_WAIT_TOTAL_BUDGET: Duration = Duration::from_secs(600);
-const USE_LEGACY_PRESIG_DERIVATION: bool = false;
 /// Move `hashi::reconfig` abort constants, matched by their clever-error
 /// constant names (the `#[error]` abort code encodes a source line, so the
 /// numeric code is not stable). Together they tell the benign "another node
@@ -121,8 +121,8 @@ impl MpcHandle {
 pub struct MpcService {
     inner: Arc<Hashi>,
     key_ready_tx: watch::Sender<Option<G>>,
-    refill_tx: Arc<watch::Sender<u32>>,
-    refill_rx: watch::Receiver<u32>,
+    refill_tx: Arc<watch::Sender<RefillRequest>>,
+    refill_rx: watch::Receiver<RefillRequest>,
     reconciling: Arc<tokio::sync::Mutex<()>>,
     next_batch_repair: Mutex<Option<(u64, u32, tokio::time::Instant)>>,
     /// Earliest next attempt to restore the current epoch's `MpcManager`
@@ -130,6 +130,7 @@ pub struct MpcService {
     next_manager_restore: Mutex<Option<(u64, tokio::time::Instant)>>,
     backup_handle: crate::backup::BackupHandle,
     replacement_keys_target_epoch: Mutex<Option<u64>>,
+    presig_seal_tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,7 +185,7 @@ enum Backup {
 impl MpcService {
     pub fn new(hashi: Arc<Hashi>, backup_handle: crate::backup::BackupHandle) -> (Self, MpcHandle) {
         let (key_ready_tx, key_ready_rx) = watch::channel(None);
-        let (refill_tx, refill_rx) = watch::channel(0u32);
+        let (refill_tx, refill_rx) = watch::channel(RefillRequest::default());
         let service = Self {
             inner: hashi,
             key_ready_tx,
@@ -195,6 +196,7 @@ impl MpcService {
             next_manager_restore: Mutex::new(None),
             backup_handle,
             replacement_keys_target_epoch: Mutex::new(None),
+            presig_seal_tasks: Mutex::new(tokio::task::JoinSet::new()),
         };
         let handle = MpcHandle { key_ready_rx };
         (service, handle)
@@ -315,26 +317,27 @@ impl MpcService {
                     self.sync_if_stale().await;
                 }
                 Ok(()) = self.refill_rx.changed() => {
-                    let next_batch = *self.refill_rx.borrow();
-                    self.refill_with_retries(next_batch).await;
+                    let request = *self.refill_rx.borrow();
+                    self.refill_with_retries(request).await;
                 }
             }
         }
     }
 
-    async fn refill_with_retries(&self, next_batch: u32) {
+    async fn refill_with_retries(&self, request: RefillRequest) {
         for attempt in 1..=MAX_PROTOCOL_ATTEMPTS {
             if let Err(e) = self.bail_if_reconfig_pending() {
                 info!("presignature refill stopped: {e}");
                 return;
             }
-            match self.refill_presignatures(next_batch).await {
+            match self.refill_presignatures(request).await {
                 Ok(()) => break,
                 Err(e) => {
                     error!(
                         "Presignature refill attempt {attempt}/{MAX_PROTOCOL_ATTEMPTS} failed: {e}"
                     );
-                    if attempt < MAX_PROTOCOL_ATTEMPTS {
+                    if attempt < MAX_PROTOCOL_ATTEMPTS && self.get_pending_epoch_change().is_none()
+                    {
                         tokio::time::sleep(RETRY_INTERVAL).await;
                     }
                 }
@@ -742,7 +745,7 @@ impl MpcService {
         &self,
         epoch: u64,
         batch_index: u32,
-    ) -> anyhow::Result<(Committee, Presignatures, u16)> {
+    ) -> anyhow::Result<(RuntimeCommittee, Presignatures, u16, Parameters, [u8; 32])> {
         let onchain_state = self.inner.onchain_state().clone();
         let committee = onchain_state
             .state()
@@ -806,6 +809,14 @@ impl MpcService {
         if !admitted.floor_reached() {
             return Err(admitted.below_floor_error(batch_index, metrics).into());
         }
+        let dealer_set_digest = admitted.dealer_set_digest();
+        presig_seal::start(
+            &self.inner,
+            &self.presig_seal_tasks,
+            epoch,
+            batch_index,
+            dealer_set_digest,
+        );
         let nonce_result = MpcManager::run_avid_nonce_party_phase(
             &mpc_manager,
             batch_index,
@@ -840,13 +851,8 @@ impl MpcService {
             .mpc_presig_conversion_duration_seconds
             .with_label_values(&[MPC_LABEL_NONCE_GENERATION])
             .start_timer();
-        let presignatures = Presignatures::new(
-            outcome.outputs,
-            batch_size_per_weight,
-            params,
-            USE_LEGACY_PRESIG_DERIVATION,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create presignatures: {e}"))?;
+        let presignatures = Presignatures::new(outcome.outputs, batch_size_per_weight, params)
+            .map_err(|e| anyhow::anyhow!("Failed to create presignatures: {e}"))?;
         drop(_timer);
         let served_implies = presig_count(served_weight as usize, params, batch_size_per_weight);
         if presignatures.len() != served_implies {
@@ -865,22 +871,32 @@ impl MpcService {
             "nonce batch {batch_index} for epoch {epoch}: {} presigs from the admitted set",
             presignatures.len(),
         );
-        Ok((committee, presignatures, batch_size_per_weight))
+        Ok((
+            committee,
+            presignatures,
+            batch_size_per_weight,
+            params,
+            dealer_set_digest,
+        ))
     }
 
     async fn prepare_signing(&self, epoch: u64, output: &MpcOutput) -> anyhow::Result<()> {
-        let (committee, presignatures, batch_size_per_weight) =
+        let (committee, presignatures, batch_size_per_weight, params, dealer_set_digest) =
             self.generate_presignatures(epoch, 0).await?;
         let address = self.inner.config.validator_address()?;
         let share_owners = self.share_owners_for_epoch(epoch)?;
         let (signing_manager, _identity) = SigningManager::new(
             address,
             committee,
-            output.threshold,
+            Parameters {
+                t: output.threshold,
+                f: params.f,
+            },
             output.key_shares.clone(),
             output.public_key,
             share_owners,
             presignatures,
+            dealer_set_digest,
             0, // batch_index
             0, // batch_start_index
             PRESIG_REFILL_DIVISOR,
@@ -1026,11 +1042,11 @@ impl MpcService {
                 pending.iter().any(|&p| p >= start && p < end)
             })
             .unwrap_or_else(|| boundaries.len().saturating_sub(1));
-        let mut retained: Vec<(Presignatures, u32, u64)> = Vec::new();
+        let mut retained: Vec<(Presignatures, u32, u64, [u8; 32])> = Vec::new();
         // TODO(IOP-529): Avoid the double cert-fetch in presig recovery.
         for &(bidx, start, size) in boundaries.iter().skip(first_pending) {
             self.bail_if_reconfig_pending()?;
-            let presigs = self
+            let (presigs, dealer_set_digest) = self
                 .recover_presignatures_from_certs(
                     &mpc_manager,
                     epoch,
@@ -1044,7 +1060,7 @@ impl MpcService {
                 "batch {bidx} boundary size {size} (Phase 1) != reconstructed len {} (Phase 2)",
                 presigs.len(),
             );
-            retained.push((presigs, bidx, start));
+            retained.push((presigs, bidx, start, dealer_set_digest));
         }
         anyhow::ensure!(
             self.inner.onchain_state().epoch() == epoch,
@@ -1066,7 +1082,10 @@ impl MpcService {
         let (signing_manager, _identities) = SigningManager::new_recovered(
             address,
             committee,
-            output.threshold,
+            Parameters {
+                t: output.threshold,
+                f: params.f,
+            },
             output.key_shares.clone(),
             output.public_key,
             share_owners,
@@ -1521,34 +1540,28 @@ impl MpcService {
         );
     }
 
-    async fn refill_presignatures(&self, batch_index: u32) -> anyhow::Result<()> {
+    async fn refill_presignatures(&self, request: RefillRequest) -> anyhow::Result<()> {
         let epoch = self.inner.onchain_state().epoch();
-        let signing_manager = self
-            .inner
-            .signing_manager_for(epoch)
-            .ok_or_else(|| anyhow::anyhow!("SigningManager not available for epoch {epoch}"))?;
-        // Refill requests arrive via a coalescing channel that outlives
-        // manager rebuilds and epoch changes, so a replayed value can name a
-        // batch that is already installed, already staged, or not contiguous
-        // with the installed range. Only the immediately-next batch is
-        // actionable; anything else is skipped before spending generation
-        // work, and the trigger paths re-request the right index on demand.
-        let expected = signing_manager.batch_index() + 1;
-        if batch_index != expected {
+        let Some(signing_manager) = self.inner.signing_manager_for(epoch) else {
+            if request.epoch == epoch {
+                anyhow::bail!("SigningManager not available for epoch {epoch}");
+            }
             info!(
-                "Skipping presignature refill for batch {batch_index}: \
-                 the next installable batch is {expected}"
+                "Skipping presignature refill for batch {} of epoch {}: \
+                 the current epoch is {epoch}",
+                request.batch_index, request.epoch,
+            );
+            return Ok(());
+        };
+        if let Some(reason) = signing_manager.refill_skip_reason(request) {
+            info!(
+                "Skipping presignature refill for batch {} of epoch {}: {reason}",
+                request.batch_index, request.epoch,
             );
             return Ok(());
         }
-        if signing_manager.prefetched_batch_index() == Some(batch_index) {
-            info!(
-                "Skipping presignature refill for batch {batch_index}: \
-                 it is already staged for installation"
-            );
-            return Ok(());
-        }
-        let (_, presignatures, batch_size_per_weight) =
+        let batch_index = request.batch_index;
+        let (_, presignatures, batch_size_per_weight, _, dealer_set_digest) =
             self.generate_presignatures(epoch, batch_index).await?;
         if self.inner.onchain_state().epoch() != epoch {
             return Err(anyhow::anyhow!("Epoch changed during presignature refill"));
@@ -1556,6 +1569,7 @@ impl MpcService {
         signing_manager.set_next_batch(
             batch_index,
             presignatures,
+            dealer_set_digest,
             self.identity_inputs(epoch, batch_size_per_weight),
         );
         Ok(())
@@ -1569,7 +1583,7 @@ impl MpcService {
         wait_for_floor: bool,
         metrics: &crate::metrics::Metrics,
     ) -> anyhow::Result<(
-        VerifiedNonceCerts<move_types::StampedDealerSubmissionV1>,
+        VerifiedNonceCerts<move_types::DealerSubmissionV1>,
         Option<u64>,
     )> {
         let mut wait_deadline = tokio::time::Instant::now() + NONCE_RECEIVE_IDLE_TIMEOUT;
@@ -1596,13 +1610,14 @@ impl MpcService {
             Ok(())
         };
         loop {
+            metrics.task_heartbeat("mpc_service");
             bail_if_superseded()?;
             let certs = match onchain_state.tob_certs(
                 epoch,
                 Some(batch_index),
                 move_types::ProtocolType::NonceGeneration,
             ) {
-                Ok(certs) => certs.map(|(_, certs)| certs).unwrap_or_default(),
+                Ok(certs) => certs.unwrap_or_default(),
                 Err(e) if crate::onchain::is_inconsistent_listing(&e) => {
                     if tokio::time::Instant::now() >= wait_deadline {
                         return Err(e);
@@ -1696,7 +1711,7 @@ impl MpcService {
         batch_index: u32,
         batch_size_per_weight: u16,
         params: Parameters,
-    ) -> anyhow::Result<Presignatures> {
+    ) -> anyhow::Result<(Presignatures, [u8; 32])> {
         let onchain_state = self.inner.onchain_state().clone();
         let p2p_channel = RpcP2PChannel::new(
             self.inner.onchain_state().clone(),
@@ -1717,7 +1732,7 @@ impl MpcService {
                 "No nonce gen certificates on TOB for epoch {epoch} batch {batch_index}"
             ));
         }
-        let (outputs, served_weight) = {
+        let (outputs, served_weight, dealer_set_digest) = {
             let avid_certs = nonce_certificates(&certs, epoch, batch_index);
             let admitted = mpc_manager
                 .read()
@@ -1728,6 +1743,14 @@ impl MpcService {
                     .below_floor_error(batch_index, &self.inner.metrics)
                     .into());
             }
+            let dealer_set_digest = admitted.dealer_set_digest();
+            presig_seal::start(
+                &self.inner,
+                &self.presig_seal_tasks,
+                epoch,
+                batch_index,
+                dealer_set_digest,
+            );
             let outcome = MpcManager::run_avid_nonce_party_phase(
                 mpc_manager,
                 batch_index,
@@ -1746,7 +1769,7 @@ impl MpcService {
                     outcome.local_skips,
                 );
             }
-            (outcome.outputs, admitted.weight)
+            (outcome.outputs, admitted.weight, dealer_set_digest)
         };
         if outputs.is_empty() {
             return Err(anyhow::anyhow!(
@@ -1754,13 +1777,8 @@ impl MpcService {
             ));
         }
         let dealer_count = outputs.len();
-        let presignatures = Presignatures::new(
-            outputs,
-            batch_size_per_weight,
-            params,
-            USE_LEGACY_PRESIG_DERIVATION,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create presignatures: {e}"))?;
+        let presignatures = Presignatures::new(outputs, batch_size_per_weight, params)
+            .map_err(|e| anyhow::anyhow!("Failed to create presignatures: {e}"))?;
         let metrics = &self.inner.metrics;
         let served_implies = presig_count(served_weight as usize, params, batch_size_per_weight);
         if presignatures.len() != served_implies {
@@ -1774,7 +1792,7 @@ impl MpcService {
         }
         metrics.mpc_nonce_batch_index.set(batch_index as i64);
         metrics.mpc_nonce_batch_dealers.set(dealer_count as i64);
-        Ok(presignatures)
+        Ok((presignatures, dealer_set_digest))
     }
 
     async fn try_submit_start_reconfig(&self, sui_epoch: u64) {
@@ -2161,11 +2179,12 @@ impl MpcService {
             .mpc_manager()
             .ok_or_else(|| anyhow::anyhow!("MpcManager not initialized for key rotation"))?;
         let previous_epoch = mpc_manager.read().unwrap().previous_epoch;
-        let onchain_mpc_key = hex::encode(onchain_state.mpc_public_key());
+        let onchain_mpc_key = onchain_state.mpc_public_key();
         let onchain_epoch = onchain_state.epoch();
         info!(
             "run_key_rotation: target_epoch={target_epoch}, previous_epoch={previous_epoch}, \
-             onchain_epoch={onchain_epoch}, onchain_mpc_key={onchain_mpc_key}",
+             onchain_epoch={onchain_epoch}, onchain_mpc_key={}",
+            hex::encode(&onchain_mpc_key),
         );
         let role = {
             let mgr = mpc_manager.read().unwrap();
@@ -2207,6 +2226,7 @@ impl MpcService {
         let output = MpcManager::run_key_rotation(
             &mpc_manager,
             &previous_certs,
+            &onchain_mpc_key,
             &p2p_channel,
             &mut tob_channel,
             &self.inner.metrics,
@@ -2386,7 +2406,7 @@ impl MpcService {
         &self,
         epoch: u64,
         mpc_public_key: &[u8],
-        committee: &Committee,
+        committee: &RuntimeCommittee,
     ) -> anyhow::Result<hashi_types::committee::SignedMessage<ReconfigCompletionMessage>> {
         let message = ReconfigCompletionMessage {
             epoch,
@@ -2399,9 +2419,8 @@ impl MpcService {
             .expect("own signature must be stored before collecting");
         let my_sig =
             BLS12381Signature::from_bytes(&my_sig_bytes).expect("stored signature must be valid");
-        let mut aggregator = BlsSignatureAggregator::new(
+        let mut aggregator = committee.signature_aggregator(
             self.inner.config.hashi_ids().hashi_object_id,
-            committee,
             message.clone(),
         );
         aggregator
@@ -2519,19 +2538,19 @@ pub(crate) async fn verify_fetched_certificates(
 
 /// Live, boundary sizing and replay admit the same dealers only if they
 /// convert the served certs identically.
-fn nonce_certificates(
-    certs: &VerifiedNonceCerts<move_types::StampedDealerSubmissionV1>,
+pub(crate) fn nonce_certificates(
+    certs: &VerifiedNonceCerts<move_types::DealerSubmissionV1>,
     epoch: u64,
     batch_index: u32,
 ) -> VerifiedNonceCerts<CertificateV1> {
-    certs.filter_map(|dealer, stamped| {
-        let cert = stamped.to_dealer_certificate(epoch).ok()?;
+    certs.filter_map(|dealer, submission| {
+        let cert = submission.to_dealer_certificate(epoch).ok()?;
         Some((
             *dealer,
             CertificateV1::NonceGeneration {
                 batch_index,
                 cert,
-                timestamp_ms: stamped.timestamp_ms,
+                timestamp_ms: submission.timestamp_ms,
             },
         ))
     })
@@ -2669,23 +2688,19 @@ mod presig_count_tests {
         use fastcrypto::groups::GroupElement;
         use fastcrypto::groups::Scalar;
         use fastcrypto_tbls::threshold_schnorr::S;
-        use fastcrypto_tbls::threshold_schnorr::batch_avss;
-        use fastcrypto_tbls::types::ShareIndex;
+        use fastcrypto_tbls::threshold_schnorr::batch_avss_avid;
 
         use super::G;
         use super::Presignatures;
-        use super::USE_LEGACY_PRESIG_DERIVATION;
 
         let mut rng = rand::thread_rng();
         let params = Parameters { t: 3, f: 1 };
         let batch_size_per_weight = 2u16;
         let total_weight = 5usize;
-        let index = ShareIndex::new(1).unwrap();
-        let outputs: Vec<batch_avss::ReceiverOutput> = (0..total_weight)
-            .map(|_| batch_avss::ReceiverOutput {
-                my_shares: batch_avss::SharesForNode {
-                    shares: vec![batch_avss::ShareBatch {
-                        index,
+        let outputs: Vec<batch_avss_avid::ReceiverOutput> = (0..total_weight)
+            .map(|_| batch_avss_avid::ReceiverOutput {
+                my_shares: batch_avss_avid::SharesForNode {
+                    shares: vec![batch_avss_avid::ShareBatch {
                         batch: (0..batch_size_per_weight)
                             .map(|_| S::rand(&mut rng))
                             .collect(),
@@ -2700,14 +2715,9 @@ mod presig_count_tests {
 
         let expected = presig_count(total_weight, params, batch_size_per_weight);
         assert_eq!(
-            Presignatures::new(
-                outputs,
-                batch_size_per_weight,
-                params,
-                USE_LEGACY_PRESIG_DERIVATION
-            )
-            .unwrap()
-            .len(),
+            Presignatures::new(outputs, batch_size_per_weight, params,)
+                .unwrap()
+                .len(),
             expected
         );
         assert_ne!(

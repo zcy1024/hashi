@@ -56,7 +56,8 @@ pub enum Verdict {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrmError {
-    /// Timeouts, transport failures, rate limiting and TRM server errors.
+    /// Timeouts, transport failures, rate limiting, TRM server errors and a
+    /// refused API key.
     #[error("{0}")]
     Transient(anyhow::Error),
     #[error("{0}")]
@@ -301,8 +302,16 @@ impl TrmClient {
                 "TRM returned {status}: {}",
                 body.chars().take(512).collect::<String>()
             );
+            // A refused key or client (401, 403) says nothing about the request,
+            // so it retries like an outage instead of parking the request.
             return Err(
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                if matches!(
+                    status,
+                    reqwest::StatusCode::TOO_MANY_REQUESTS
+                        | reqwest::StatusCode::UNAUTHORIZED
+                        | reqwest::StatusCode::FORBIDDEN
+                ) || status.is_server_error()
+                {
                     TrmError::Transient(error)
                 } else {
                     TrmError::Permanent(error)
@@ -923,12 +932,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_rate_limits_and_server_errors_are_transient() {
+    async fn only_rate_limits_server_errors_and_a_refused_key_are_transient() {
         for (status, body, transient) in [
             (StatusCode::TOO_MANY_REQUESTS, json!({}), true),
             (StatusCode::SERVICE_UNAVAILABLE, json!({}), true),
+            (StatusCode::UNAUTHORIZED, json!({}), true),
+            (StatusCode::FORBIDDEN, json!({}), true),
             (StatusCode::BAD_REQUEST, json!({}), false),
-            (StatusCode::UNAUTHORIZED, json!({}), false),
             (StatusCode::CREATED, json!({ "results": [] }), false),
             (StatusCode::CREATED, json!([]), false),
             (
@@ -1116,6 +1126,18 @@ mod tests {
         )
     }
 
+    /// A mainnet payment whose only sender is on OFAC's SDN list.
+    fn live_sanctioned_deposit(request_id: Address, recipient: Address) -> DepositScreening {
+        let mut request = deposit_request(Some(recipient));
+        request.id = request_id;
+        request.utxo.id.txid = "c7a1239e6abe9c4b7e29ad8ec5be9523000b27208d34ddaa89b0391c68ccf008"
+            .parse()
+            .unwrap();
+        request.utxo.amount = 197_113;
+        request.created_timestamp_ms = 1_516_954_773_000;
+        DepositScreening::new(&request, "3FHPJFzsT5FfBqbhENPkoSrWjxPucm1sTt".to_owned())
+    }
+
     async fn screen_live_deposit(deposit: &DepositScreening) -> Verdict {
         let client = live_client();
         tokio::time::timeout(Duration::from_secs(300), async {
@@ -1168,6 +1190,15 @@ mod tests {
         assert!(matches!(
             screen_live_deposit(&to_exploiter).await,
             Verdict::Rejected(reason) if reason.contains(CETUS_EXPLOITER)
+        ));
+
+        // TRM alerts on a transfer only when a Transaction Monitoring rule
+        // matches it, so this fails on an account that has no rules.
+        let from_sanctioned =
+            live_sanctioned_deposit(Address::new([0x22; 32]), Address::new([1; 32]));
+        assert!(matches!(
+            screen_live_deposit(&from_sanctioned).await,
+            Verdict::Rejected(reason) if reason.contains("raised an alert")
         ));
     }
 }
